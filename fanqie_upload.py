@@ -49,6 +49,7 @@ CONFIG_FILE = SCRIPT_DIR / "config.json"
 # 页面路径
 BOOK_MANAGE_URL = f"{BASE_URL}/main/writer/book-manage"
 NEW_CHAPTER_URL_TPL = BASE_URL + "/main/writer/{book_id}/publish/?enter_from=newchapter_1"
+CHAPTER_MANAGE_URL_TPL = BASE_URL + "/main/writer/chapter-manage/{book_id}"
 
 # 默认配置
 DEFAULT_CONFIG = {
@@ -447,6 +448,222 @@ async def save_draft(page):
     except PWTimeout:
         pass
     await page.wait_for_timeout(1000)
+
+
+async def dismiss_edit_hint(page):
+    """关闭编辑已发布章节时的提示弹窗: '请在发布时间前30分钟提交修改内容'。"""
+    try:
+        hint = page.locator("text=请在发布时间前30分钟提交修改内容")
+        if await hint.count() > 0:
+            btn = page.locator("button", has_text="我知道了")
+            if await btn.count() > 0:
+                await btn.first.click()
+                await page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+
+async def clear_editor(page):
+    """清空编辑器中的标题和正文内容（修改模式用）。"""
+    await page.evaluate("""() => {
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype, 'value'
+        ).set;
+
+        // 清空标题
+        const titleInput = document.querySelector('input[placeholder="请输入标题"]');
+        if (titleInput) {
+            nativeSetter.call(titleInput, '');
+            titleInput.dispatchEvent(new Event('input', { bubbles: true }));
+            titleInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        // 清空章节号
+        const inputs = document.querySelectorAll('input');
+        for (const inp of inputs) {
+            if (inp.type === 'text'
+                && inp.placeholder !== '请输入标题'
+                && inp.offsetParent !== null) {
+                nativeSetter.call(inp, '');
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+                break;
+            }
+        }
+
+        // 选中 ProseMirror 编辑器全部内容
+        const editor = document.querySelector('.ProseMirror');
+        if (editor) {
+            editor.focus();
+        }
+    }""")
+    # 全选并删除正文
+    await page.keyboard.press("Control+a")
+    await page.wait_for_timeout(200)
+    await page.keyboard.press("Delete")
+    await page.wait_for_timeout(500)
+
+
+# ---------------------------------------------------------------------------
+# 章节列表提取（修改模式用）— 单次 JS 调用完成全部翻页
+# ---------------------------------------------------------------------------
+_EXTRACT_ALL_JS = r"""async () => {
+    // 等待表格出现
+    const t0 = Date.now();
+    while (!document.querySelector('tr td')) {
+        if (Date.now() - t0 > 10000) break;
+        await new Promise(r => requestAnimationFrame(r));
+    }
+
+    const allChapters = [];
+    const seenKeys = new Set();
+    let totalPages = 0;
+    let pageCount = 0;
+
+    // 同时提取最新发布时间
+    const dateRe = /(\d{4}[-\/]\d{2}[-\/]\d{2})\s+(\d{2}:\d{2})/;
+    let lastPub = null;
+    let lastPubKey = '';
+
+    // 获取总页数
+    for (const li of document.querySelectorAll('li.arco-pagination-item')) {
+        const n = parseInt(li.textContent);
+        if (!isNaN(n) && n > totalPages) totalPages = n;
+    }
+
+    const MAX_TIME = 120000;
+    const start = Date.now();
+
+    for (let i = 0; i < 500 && Date.now() - start < MAX_TIME; i++) {
+        let newCount = 0;
+        for (const row of document.querySelectorAll('tr')) {
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 2) continue;
+            const title = cells[0].textContent.trim();
+            if (!title) continue;
+
+            // 编辑链接
+            let editUrl = null;
+            for (const a of row.querySelectorAll('a')) {
+                const href = a.getAttribute('href') || '';
+                if (/\/publish\//.test(href) || /chapter_id/.test(href)) {
+                    editUrl = href; break;
+                }
+                const text = a.textContent.trim();
+                if (text === '编辑' || text === '修改') {
+                    editUrl = href; break;
+                }
+            }
+
+            // 章节号
+            let chapterNum = null;
+            let m = title.match(/^第\s*(\d+)\s*章/);
+            if (m) chapterNum = parseInt(m[1], 10);
+            else { m = title.match(/^(\d+)/); if (m) chapterNum = parseInt(m[1], 10); }
+
+            const key = chapterNum + '|' + title;
+            if (seenKeys.has(key)) continue;
+            seenKeys.add(key);
+
+            allChapters.push({ title, chapterNum, editUrl, rowIndex: allChapters.length });
+            newCount++;
+
+            // 发布日期
+            const dm = row.textContent.match(dateRe);
+            if (dm) {
+                const d = dm[1].replace(/\//g, '-');
+                const t = dm[2];
+                const pk = d + ' ' + t;
+                if (pk > lastPubKey) {
+                    lastPub = { date: d, time: t, chapter: title };
+                    lastPubKey = pk;
+                }
+            }
+        }
+
+        pageCount++;
+        if (newCount === 0 && pageCount > 1) break;
+
+        // 下一页
+        let nextBtn = document.querySelector(
+            'li.arco-pagination-item-next:not(.arco-pagination-item-disabled)');
+        if (!nextBtn) {
+            nextBtn = document.querySelector(
+                "button[aria-label='next'], .next-page");
+            if (nextBtn && (nextBtn.disabled
+                || nextBtn.classList.contains('disabled'))) nextBtn = null;
+        }
+        if (!nextBtn) break;
+
+        const firstTitle = document.querySelector('tr td')?.textContent?.trim() || '';
+        nextBtn.click();
+
+        // RAF 轮询等待表格变化（~60fps, 零 IPC 开销）
+        await new Promise(resolve => {
+            const deadline = Date.now() + 8000;
+            (function check() {
+                const c = document.querySelector('tr td')?.textContent?.trim() || '';
+                if ((c && c !== firstTitle) || Date.now() > deadline) {
+                    resolve(); return;
+                }
+                requestAnimationFrame(check);
+            })();
+        });
+    }
+
+    return { chapters: allChapters, totalPages, pageCount, lastPublish: lastPub };
+}"""
+
+
+async def extract_chapters_from_page(
+    page, book_id: str = "",
+) -> tuple[list[dict], dict | None]:
+    """从章节管理页提取全部章节列表（单次 JS 调用完成全部翻页）。
+
+    返回 (chapters, last_publish_info)。
+    last_publish_info: {date, time, chapter} 或 None。
+    """
+    result = await page.evaluate(_EXTRACT_ALL_JS)
+    chapters = result.get("chapters", [])
+    total_pages = result.get("totalPages", 0)
+    page_count = result.get("pageCount", 0)
+    last_pub = result.get("lastPublish")
+
+    if total_pages:
+        print(f"  共 {page_count}/{total_pages} 页, {len(chapters)} 个章节")
+    elif chapters:
+        print(f"  共 {page_count} 页, {len(chapters)} 个章节")
+
+    return chapters, last_pub
+
+
+def match_chapters(
+    local_parsed: list[tuple],
+    platform_chapters: list[dict],
+) -> tuple[list, list]:
+    """
+    按章节号匹配本地文件与平台章节。
+
+    返回: (matched, unmatched_local)
+      matched: [(local_idx, platform_ch, int_num, title, content), ...]
+      unmatched_local: [(local_idx, chapter_num, title), ...]
+    """
+    # 平台章节按 chapterNum(int) 建字典
+    platform_map: dict[int, dict] = {}
+    for ch in platform_chapters:
+        num = ch.get("chapterNum")
+        if num is not None and num not in platform_map:
+            platform_map[num] = ch
+
+    matched = []
+    unmatched = []
+    for i, (num, title, content) in enumerate(local_parsed):
+        int_num = int(num) if num else None
+        if int_num and int_num in platform_map:
+            matched.append((i, platform_map[int_num], int_num, title, content))
+        else:
+            unmatched.append((i, num, title))
+    return matched, unmatched
 
 
 async def click_next_step(page):
@@ -939,6 +1156,143 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
 
 # ---------------------------------------------------------------------------
+# 命令: edit (修改已有章节)
+# ---------------------------------------------------------------------------
+async def cmd_edit(directory: Path, book_id: str, args):
+    """按章节号匹配并修改已有章节内容。"""
+    if not AUTH_FILE.exists():
+        print("请先运行 login 命令登录。")
+        return
+
+    cfg = load_config()
+    headless = args.headless or cfg.get("headless", False)
+    delay = args.delay if args.delay is not None else cfg.get("delay_between_chapters", 3)
+    unique_titles = getattr(args, "unique_titles", False)
+    use_ai = getattr(args, "use_ai", False)
+
+    if not directory.is_dir():
+        print(f"目录不存在: {directory}")
+        return
+
+    files = get_md_files(directory)
+    if not files:
+        print(f"在 {directory} 中没有找到 .md/.txt 文件")
+        return
+
+    parsed = [parse_md_file(f) for f in files]
+    if unique_titles:
+        parsed = deduplicate_titles(parsed)
+
+    # 获取平台章节列表
+    print("正在获取平台章节列表...")
+    chapter_manage_url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
+
+    async with async_playwright() as p:
+        browser, context = await create_context(p, headless=headless)
+        page = await context.new_page()
+
+        await page.goto(chapter_manage_url)
+        await page.wait_for_load_state("networkidle")
+
+        platform_chapters, _ = await extract_chapters_from_page(page, book_id)
+
+        if not platform_chapters:
+            print("未在平台找到章节。请检查 Book ID 和登录状态。")
+            await browser.close()
+            return
+
+        print(f"平台共有 {len(platform_chapters)} 个章节。")
+
+        # 匹配
+        matched, unmatched = match_chapters(parsed, platform_chapters)
+
+        if not matched:
+            print("没有匹配到任何章节！请检查本地文件是否包含章节号。")
+            await browser.close()
+            return
+
+        # 预览
+        print(f"\n匹配到 {len(matched)} 个章节:")
+        print("-" * 60)
+        total_words = 0
+        for local_idx, plat_ch, ch_num, title, content in matched:
+            wc = len(strip_md_formatting(content))
+            total_words += wc
+            print(f"  第{ch_num}章 {title} ({wc}字) -> {plat_ch['title']}")
+        print("-" * 60)
+        print(f"总计: {len(matched)} 章, {total_words} 字")
+
+        if unmatched:
+            print(f"\n未匹配 (跳过) {len(unmatched)} 个本地文件:")
+            for local_idx, ch_num, title in unmatched:
+                reason = "无章节号" if ch_num is None else "平台无此章"
+                print(f"  {title} ({reason})")
+
+        print()
+        confirm = input("确认修改? (y/N): ").strip().lower()
+        if confirm != "y":
+            print("已取消。")
+            await browser.close()
+            return
+
+        # 执行修改
+        success = 0
+        failed = 0
+        total = len(matched)
+
+        for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched):
+            print(f"\n[{i+1}/{total}] 修改第{ch_num}章 {title}")
+
+            try:
+                edit_url = plat_ch.get("editUrl")
+                if not edit_url:
+                    print("  !! 无法获取编辑链接，跳过")
+                    failed += 1
+                    continue
+
+                if edit_url.startswith("/"):
+                    edit_url = BASE_URL + edit_url
+
+                await page.goto(edit_url)
+                await wait_for_editor_ready(page)
+                await dismiss_edit_hint(page)
+
+                await clear_editor(page)
+                await fill_chapter(page, str(ch_num), title, content)
+
+                # 走发布流程保存修改
+                await _navigate_to_publish_settings(page, use_ai=use_ai)
+                confirm_btn = page.locator("button", has_text="确认发布")
+                if await confirm_btn.count() == 0:
+                    raise RuntimeError("未找到确认发布按钮")
+                await confirm_btn.first.click()
+                await page.wait_for_timeout(2000)
+                print("  -> 已保存修改")
+                success += 1
+
+                if i < total - 1 and delay > 0:
+                    await page.wait_for_timeout(delay * 1000)
+
+            except Exception as e:
+                print(f"  !! 失败: {e}")
+                failed += 1
+                try:
+                    err_path = SCRIPT_DIR / f"error_edit_{ch_num}.png"
+                    await page.screenshot(path=str(err_path))
+                    print(f"  截图: {err_path}")
+                except Exception:
+                    pass
+
+        await save_auth(context)
+        await browser.close()
+
+        print()
+        print("=" * 40)
+        print(f"  修改完成! 成功: {success}  失败: {failed}")
+        print("=" * 40)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main():
@@ -959,8 +1313,9 @@ def main():
   %(prog)s upload ./chapters --book-id 12345 --schedule 2026-03-14 --per-day 3
       从 3/14 起每天 3 章
 
-  %(prog)s upload ./chapters --book-id 12345 --schedule 2026-03-14 --time 20:00 --per-day 2
-      从 3/14 起每天 2 章, 20:00 发布
+修改已有章节:
+  %(prog)s upload ./chapters --book-id 12345 --edit
+      按章节号匹配并修改已有章节内容
         """,
     )
     sub = parser.add_subparsers(dest="command")
@@ -1000,6 +1355,10 @@ def main():
         "--use-ai", action="store_true",
         help="发布时选择使用AI (默认不使用)",
     )
+    up.add_argument(
+        "--edit", action="store_true",
+        help="修改已有章节 (按章节号匹配, 不可与 --publish/--schedule 同时使用)",
+    )
 
     args = parser.parse_args()
 
@@ -1008,9 +1367,14 @@ def main():
     elif args.command == "books":
         asyncio.run(cmd_books())
     elif args.command == "upload":
-        asyncio.run(
-            cmd_upload(args.directory, args.book_id, args.publish, args)
-        )
+        if getattr(args, "edit", False):
+            if getattr(args, "publish", False) or getattr(args, "schedule", None):
+                parser.error("--edit 不可与 --publish 或 --schedule 同时使用")
+            asyncio.run(cmd_edit(args.directory, args.book_id, args))
+        else:
+            asyncio.run(
+                cmd_upload(args.directory, args.book_id, args.publish, args)
+            )
     else:
         parser.print_help()
 

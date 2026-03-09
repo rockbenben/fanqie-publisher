@@ -22,10 +22,11 @@ try:
         parse_md_file, get_md_files, strip_md_formatting,
         deduplicate_titles, compute_schedule,
         create_context, save_auth,
-        wait_for_editor_ready, fill_chapter,
+        wait_for_editor_ready, fill_chapter, clear_editor, dismiss_edit_hint,
         save_draft, publish_scheduled, _navigate_to_publish_settings,
+        extract_chapters_from_page, match_chapters,
         AUTH_FILE, BASE_URL, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
-        SCRIPT_DIR, ZONE_URL,
+        CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL,
     )
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 except ImportError as e:
@@ -41,7 +42,7 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-CHAPTER_MANAGE_URL = BASE_URL + "/main/writer/chapter-manage/{book_id}"
+CHAPTER_MANAGE_URL = CHAPTER_MANAGE_URL_TPL
 DEFAULT_CHAPTERS_DIR = SCRIPT_DIR / "chapters"
 LOG_FILE = SCRIPT_DIR / "fanqie_error.log"
 
@@ -189,6 +190,8 @@ class FanqieGUI:
         self._closing = False
         self._redirector = None
         self._last_publish_cache: dict[str, dict] = {}  # bookId -> {date, time}
+        self._platform_chapters_cache: dict[str, list] = {}  # bookId -> [章节列表]
+        self._matched_edit: list = []  # 修改模式匹配结果
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -233,7 +236,9 @@ class FanqieGUI:
         ttk.Entry(frm, textvariable=self.dir_var, state="readonly").pack(
             side="left", padx=6, pady=4, fill="x", expand=True)
         ttk.Button(frm, text="浏览...", command=self._on_browse_dir).pack(
-            side="left", padx=(0, 6), pady=4)
+            side="left", pady=4)
+        ttk.Button(frm, text="刷新", command=self._refresh_preview).pack(
+            side="left", padx=(4, 6), pady=4)
         self.unique_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             frm, text="自动去重标题", variable=self.unique_var,
@@ -247,7 +252,7 @@ class FanqieGUI:
         row_radios.pack(fill="x", padx=6, pady=4)
         self.mode_var = tk.StringVar(value="schedule")
         for text, val in [("存草稿", "draft"), ("立即发布", "publish"),
-                          ("定时发布", "schedule")]:
+                          ("定时发布", "schedule"), ("修改", "edit")]:
             ttk.Radiobutton(
                 row_radios, text=text, variable=self.mode_var,
                 value=val, command=self._on_mode_change).pack(side="left", padx=10)
@@ -256,8 +261,9 @@ class FanqieGUI:
         row_opts = ttk.Frame(frm_mode)
         row_opts.pack(fill="x", padx=6, pady=(0, 4))
         self.use_ai_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            row_opts, text="稿件使用了AI创作", variable=self.use_ai_var).pack(side="left", padx=6)
+        self.chk_use_ai = ttk.Checkbutton(
+            row_opts, text="稿件使用了AI创作", variable=self.use_ai_var)
+        self.chk_use_ai.pack(side="left", padx=6)
 
         # 上次发布信息（所有模式可见）
         self.lbl_last_publish = ttk.Label(
@@ -353,11 +359,26 @@ class FanqieGUI:
             self.lbl_auth.configure(text="登录状态: 未登录", foreground="red")
 
     def _on_mode_change(self):
-        if self.mode_var.get() == "schedule":
+        mode = self.mode_var.get()
+        # 切离修改模式时恢复上传按钮
+        if mode != "edit" and not self.uploading:
+            self.btn_upload.configure(state="normal")
+        if mode == "schedule":
             self.sched_frame.pack(fill="x", padx=6, pady=4)
+            self.chk_use_ai.pack(side="left", padx=6)
             self._on_book_changed()  # 触发获取上次发布时间
+        elif mode == "edit":
+            self.sched_frame.pack_forget()
+            self.chk_use_ai.pack(side="left", padx=6)
+            # 未载入章节列表前禁用上传按钮
+            idx = self.cmb_book.current()
+            book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
+            if not (book_id and book_id in self._platform_chapters_cache):
+                self.btn_upload.configure(state="disabled")
+            self._fetch_platform_chapters_for_edit()
         else:
             self.sched_frame.pack_forget()
+            self.chk_use_ai.pack(side="left", padx=6)
         self._refresh_preview()
 
     def _log(self, msg):
@@ -403,6 +424,12 @@ class FanqieGUI:
             return
 
         book_id = self.books[idx]["bookId"]
+
+        # 修改模式: 走专用的章节列表获取（同时获取上次发布信息）
+        if self.mode_var.get() == "edit":
+            self.btn_upload.configure(state="disabled")
+            self._fetch_platform_chapters_for_edit()
+            return
 
         # 有缓存直接用
         if book_id in self._last_publish_cache:
@@ -473,6 +500,66 @@ class FanqieGUI:
             self.minute_var.set(int(parts[1]))
         except (ValueError, IndexError):
             pass
+
+    # -----------------------------------------------------------------------
+    # 修改模式: 获取平台章节列表
+    # -----------------------------------------------------------------------
+    def _fetch_platform_chapters_for_edit(self):
+        idx = self.cmb_book.current()
+        if idx < 0 or not self.books:
+            return
+
+        book_id = self.books[idx]["bookId"]
+
+        if book_id in self._platform_chapters_cache:
+            self._on_platform_chapters_fetched(
+                book_id, self._platform_chapters_cache[book_id], None)
+            return
+
+        if not AUTH_FILE.exists():
+            return
+
+        self.lbl_last_publish.configure(
+            text="正在获取平台章节列表...", foreground="gray")
+
+        async def task():
+            try:
+                async with async_playwright() as p:
+                    browser, context = await create_context(p, headless=True)
+                    page = await context.new_page()
+                    url = CHAPTER_MANAGE_URL.format(book_id=book_id)
+                    await page.goto(url)
+                    await page.wait_for_load_state("networkidle")
+
+                    chapters, last_pub = await extract_chapters_from_page(
+                        page, book_id)
+                    await browser.close()
+
+                self._after(0, self._on_platform_chapters_fetched,
+                            book_id, chapters, None, last_pub)
+            except Exception as e:
+                self._after(0, self._on_platform_chapters_fetched,
+                            book_id, [], str(e), None)
+
+        self.worker.submit(task())
+
+    def _on_platform_chapters_fetched(self, book_id, chapters, error,
+                                      last_pub=None):
+        if error:
+            self.lbl_last_publish.configure(
+                text=f"获取章节列表失败: {error}", foreground="red")
+            return
+
+        self._platform_chapters_cache[book_id] = chapters
+        # 缓存上次发布信息（来自同一浏览器会话）
+        if last_pub and book_id not in self._last_publish_cache:
+            self._last_publish_cache[book_id] = last_pub
+        self.lbl_last_publish.configure(
+            text=f"平台共 {len(chapters)} 个章节", foreground="#d35400")
+        # 载入完成，恢复上传按钮
+        if not self.uploading and self.mode_var.get() == "edit":
+            self.btn_upload.configure(state="normal")
+        self._refresh_preview()
 
     # -----------------------------------------------------------------------
     # 登录
@@ -592,9 +679,15 @@ class FanqieGUI:
         if self.unique_var.get():
             self.parsed_chapters = deduplicate_titles(self.parsed_chapters)
 
+        mode = self.mode_var.get()
+
+        # 修改模式: 专用预览
+        if mode == "edit":
+            self._refresh_edit_preview()
+            return
+
         # 计算排期
         schedule = None
-        mode = self.mode_var.get()
         if mode == "schedule":
             try:
                 date_str = self.date_var.get()
@@ -627,6 +720,56 @@ class FanqieGUI:
         self.progress["value"] = 0
         self.lbl_progress.configure(text=f"0/{len(self.files)}")
 
+    def _refresh_edit_preview(self):
+        """修改模式专用预览: 显示匹配状态。"""
+        idx = self.cmb_book.current()
+        book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
+
+        platform_chapters = []
+        if book_id and book_id in self._platform_chapters_cache:
+            platform_chapters = self._platform_chapters_cache[book_id]
+
+        lines = []
+        matched_count = 0
+        total_words = 0
+        self._matched_edit = []
+
+        if platform_chapters:
+            matched, unmatched = match_chapters(
+                self.parsed_chapters, platform_chapters)
+            self._matched_edit = matched
+            matched_count = len(matched)
+            matched_indices = {m[0] for m in matched}
+
+            for i, (num, title, content) in enumerate(self.parsed_chapters):
+                wc = len(strip_md_formatting(content))
+                total_words += wc
+                num_str = f"第{num}章" if num else "  ?  "
+                if i in matched_indices:
+                    status = "[匹配]"
+                elif num is None:
+                    status = "[跳过:无章节号]"
+                else:
+                    status = "[跳过:平台无此章]"
+                lines.append(
+                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)  {status}")
+        else:
+            for i, (num, title, content) in enumerate(self.parsed_chapters):
+                wc = len(strip_md_formatting(content))
+                total_words += wc
+                num_str = f"第{num}章" if num else "  ?  "
+                lines.append(
+                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)  [待获取章节列表]")
+
+        summary = f"总计: {len(self.files)} 章, {total_words} 字 | 模式: 修改"
+        if platform_chapters:
+            summary += f" | 匹配: {matched_count}/{len(self.files)}"
+
+        self._set_preview(summary + "\n" + "-" * 60 + "\n" + "\n".join(lines))
+        self.progress["maximum"] = max(matched_count, 1)
+        self.progress["value"] = 0
+        self.lbl_progress.configure(text=f"0/{matched_count}")
+
     # -----------------------------------------------------------------------
     # 上传
     # -----------------------------------------------------------------------
@@ -649,6 +792,12 @@ class FanqieGUI:
         mode = self.mode_var.get()
         book_id = self.books[idx]["bookId"]
         book_name = self.books[idx]["name"]
+
+        # 修改模式
+        if mode == "edit":
+            self._on_upload_edit(book_id, book_name)
+            return
+
         use_ai = self.use_ai_var.get()
 
         # 定时发布参数
@@ -786,8 +935,107 @@ class FanqieGUI:
         self._redirector = None
         self._set_uploading(False)
         self._last_publish_cache.clear()  # 上传后清除缓存，下次获取最新数据
+        self._platform_chapters_cache.clear()
         if success >= 0:
-            messagebox.showinfo("上传完成", f"成功: {success}  失败: {failed}")
+            messagebox.showinfo("完成", f"成功: {success}  失败: {failed}")
+
+    # -----------------------------------------------------------------------
+    # 修改模式上传
+    # -----------------------------------------------------------------------
+    def _on_upload_edit(self, book_id, book_name):
+        if not self._matched_edit:
+            messagebox.showwarning("提示", "没有匹配到任何章节。\n请先选择作品并等待章节列表获取完成。")
+            return
+
+        matched = self._matched_edit
+        count = len(matched)
+
+        msg = f"即将修改「{book_name}」的 {count} 个章节\n模式: 修改已有章节（存草稿）"
+        if not messagebox.askyesno("确认修改", msg):
+            return
+
+        self._set_uploading(True)
+        self.progress["value"] = 0
+        self.progress["maximum"] = count
+
+        self._redirector = StdoutRedirector(self.txt_log, self.root)
+        sys.stdout = self._redirector
+
+        cfg = load_config()
+        delay = cfg.get("delay_between_chapters", 3)
+        use_ai = self.use_ai_var.get()
+        matched_copy = list(matched)
+
+        async def task():
+            try:
+                async with async_playwright() as p:
+                    browser, context = await create_context(p, headless=False)
+                    page = await context.new_page()
+
+                    success = 0
+                    failed = 0
+                    total = len(matched_copy)
+
+                    for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched_copy):
+                        print(f"\n[{i+1}/{total}] 修改第{ch_num}章 {title}")
+
+                        try:
+                            edit_url = plat_ch.get("editUrl")
+                            if not edit_url:
+                                print("  !! 无法获取编辑链接，跳过")
+                                failed += 1
+                                self._after(0, self._update_progress, i + 1, total)
+                                continue
+
+                            if edit_url.startswith("/"):
+                                edit_url = BASE_URL + edit_url
+
+                            await page.goto(edit_url)
+                            await wait_for_editor_ready(page)
+                            await dismiss_edit_hint(page)
+
+                            await clear_editor(page)
+                            await fill_chapter(page, str(ch_num), title, content)
+
+                            # 走发布流程保存修改
+                            await _navigate_to_publish_settings(page, use_ai=use_ai)
+                            confirm_btn = page.locator("button", has_text="确认发布")
+                            if await confirm_btn.count() == 0:
+                                raise RuntimeError("未找到确认发布按钮")
+                            await confirm_btn.first.click()
+                            await page.wait_for_timeout(2000)
+                            print("  -> 已保存修改")
+                            success += 1
+
+                        except Exception as e:
+                            print(f"  !! 失败: {e}")
+                            failed += 1
+                            try:
+                                err = SCRIPT_DIR / f"error_edit_{ch_num}.png"
+                                await page.screenshot(path=str(err))
+                                print(f"  截图: {err}")
+                            except Exception:
+                                pass
+
+                        self._after(0, self._update_progress, i + 1, total)
+
+                        if i < total - 1 and delay > 0:
+                            await page.wait_for_timeout(delay * 1000)
+
+                    await save_auth(context)
+                    await browser.close()
+
+                print(f"\n{'='*40}")
+                print(f"  修改完成! 成功: {success}  失败: {failed}")
+                print(f"{'='*40}")
+
+                self._after(0, self._upload_done, success, failed)
+
+            except Exception as e:
+                print(f"\n!! 修改异常: {e}")
+                self._after(0, self._upload_done, -1, -1)
+
+        self.worker.submit(task())
 
     # -----------------------------------------------------------------------
     # 窗口关闭
