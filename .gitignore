@@ -1,0 +1,30 @@
+# Auth & secrets
+.auth_state.json
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+dist/
+build/
+*.egg-info/
+venv/
+.venv/
+
+# Project
+chapters/
+error_*.png
+fanqie_error.log
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+*.swp
