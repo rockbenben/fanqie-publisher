@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-番茄作家 MD 批量上传工具 - GUI 界面
+番茄作家 MD/TXT 批量上传工具 - GUI 界面
 
 使用方法:
     python fanqie_gui.py
 """
 
 import asyncio
+import json
 import logging
 import sys
 import threading
@@ -22,11 +23,12 @@ try:
         parse_md_file, get_md_files, strip_md_formatting,
         deduplicate_titles, compute_schedule,
         create_context, save_auth,
-        wait_for_editor_ready, fill_chapter, clear_editor, dismiss_edit_hint,
+        wait_for_editor_ready, fill_chapter,
         save_draft, publish_scheduled, _navigate_to_publish_settings,
-        extract_chapters_from_page, match_chapters,
+        extract_chapters_from_page, match_chapters, edit_one_chapter,
         AUTH_FILE, BASE_URL, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
-        CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL,
+        CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL, CONFIG_FILE,
+        BOOKS_JS, LAST_PUBLISH_JS,
     )
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 except ImportError as e:
@@ -45,6 +47,14 @@ except ImportError as e:
 CHAPTER_MANAGE_URL = CHAPTER_MANAGE_URL_TPL
 DEFAULT_CHAPTERS_DIR = SCRIPT_DIR / "chapters"
 LOG_FILE = SCRIPT_DIR / "fanqie_error.log"
+
+# 高 DPI 支持 (Windows)
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -110,62 +120,42 @@ class AsyncWorker:
 
 
 # ---------------------------------------------------------------------------
-# JS: 获取作品列表
+# 复用的无头浏览器（后台查询共享一个 chromium 实例）
 # ---------------------------------------------------------------------------
-BOOKS_JS = r"""() => {
-    const results = [];
-    const links = document.querySelectorAll('a[href*="chapter-manage/"]');
-    for (const link of links) {
-        const href = link.getAttribute('href') || '';
-        const m = href.match(/chapter-manage\/(\d+)&([^?]*)/);
-        if (!m) continue;
-        const bookId = m[1];
-        let name;
-        try { name = decodeURIComponent(m[2]); }
-        catch { name = m[2]; }
-        let container = link;
-        for (let i = 0; i < 12; i++) {
-            if (!container.parentElement) break;
-            container = container.parentElement;
-            if (container.textContent.length > 30 &&
-                container.textContent.includes('万字')) break;
-        }
-        const text = container.textContent || '';
-        const chapterMatch = text.match(/(\d+)\s*章/);
-        const wordMatch = text.match(/([\d.]+)\s*万字/);
-        const statusMatch = text.match(/(连载中|已完结)/);
-        results.push({
-            bookId, name,
-            chapters: chapterMatch ? chapterMatch[1] : '?',
-            words: wordMatch ? wordMatch[1] + '万' : '?',
-            status: statusMatch ? statusMatch[1] : '',
-        });
-    }
-    return results;
-}"""
+class _SharedBrowser:
+    """复用的无头浏览器实例，用于作品列表 / 发布时间等后台查询。"""
 
-# ---------------------------------------------------------------------------
-# JS: 从章节管理页提取最后一个定时发布时间
-# ---------------------------------------------------------------------------
-LAST_PUBLISH_JS = r"""() => {
-    // 遍历表格行，提取章节名称和发布时间，取日期最新的一行
-    const re = /(\d{4}[-/]\d{2}[-/]\d{2})\s+(\d{2}:\d{2})/;
-    let best = null, bestKey = '';
-    for (const row of document.querySelectorAll('tr')) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 2) continue;
-        const m = row.textContent.match(re);
-        if (!m) continue;
-        const d = m[1].replace(/\//g, '-');
-        const t = m[2];
-        const key = d + ' ' + t;
-        if (key > bestKey) {
-            best = {date: d, time: t, chapter: cells[0].textContent.trim()};
-            bestKey = key;
-        }
-    }
-    return best;
-}"""
+    def __init__(self):
+        self._pw = None
+        self._browser = None
+        self._context = None
+
+    async def ensure(self):
+        """确保浏览器运行中，返回 context。"""
+        if self._browser and self._browser.is_connected():
+            return self._context
+        await self.close()
+        self._pw = await async_playwright().start()
+        self._browser, self._context = await create_context(
+            self._pw, headless=True)
+        return self._context
+
+    async def refresh(self):
+        """重新创建（登录后需要刷新 auth）。"""
+        await self.close()
+
+    async def close(self):
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+        if self._pw:
+            try:
+                await self._pw.stop()
+            except Exception:
+                pass
+        self._browser = self._context = self._pw = None
 
 
 # ---------------------------------------------------------------------------
@@ -175,12 +165,19 @@ class FanqieGUI:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("番茄作家 MD 批量上传工具")
-        self.root.geometry("820x720")
-        self.root.minsize(720, 600)
+        self.root.title("番茄作家 MD/TXT 批量上传工具")
+        _w, _h = 1100, 920
+        self.root.update_idletasks()
+        _sx = (self.root.winfo_screenwidth() - _w) // 2
+        _sy = (self.root.winfo_screenheight() - _h) // 2
+        self.root.geometry(f"{_w}x{_h}+{_sx}+{_sy}")
+        self.root.minsize(960, 820)
 
         self.worker = AsyncWorker()
         self.worker.start()
+
+        # 配置
+        self._cfg = load_config()
 
         # 状态
         self.books: list[dict] = []
@@ -188,10 +185,13 @@ class FanqieGUI:
         self.files: list[Path] = []
         self.uploading = False
         self._closing = False
+        self._cancel_requested = False
         self._redirector = None
         self._last_publish_cache: dict[str, dict] = {}  # bookId -> {date, time}
         self._platform_chapters_cache: dict[str, list] = {}  # bookId -> [章节列表]
         self._matched_edit: list = []  # 修改模式匹配结果
+        self._shared = _SharedBrowser()  # 复用的无头浏览器
+        self._fetch_gen = 0  # 防抖: 每次切换作品递增
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -250,7 +250,7 @@ class FanqieGUI:
 
         row_radios = ttk.Frame(frm_mode)
         row_radios.pack(fill="x", padx=6, pady=4)
-        self.mode_var = tk.StringVar(value="schedule")
+        self.mode_var = tk.StringVar(value=self._cfg.get("default_mode", "schedule"))
         for text, val in [("存草稿", "draft"), ("立即发布", "publish"),
                           ("定时发布", "schedule"), ("修改", "edit")]:
             ttk.Radiobutton(
@@ -282,32 +282,31 @@ class FanqieGUI:
         self.ent_date = ttk.Entry(r1, textvariable=self.date_var, width=14)
         self.ent_date.pack(side="left", padx=4)
         ttk.Label(r1, text="每天章数:").pack(side="left", padx=(20, 0))
-        self.perday_var = tk.IntVar(value=2)
+        self.perday_var = tk.IntVar(value=self._cfg.get("default_per_day", 2))
         ttk.Spinbox(
             r1, from_=1, to=20, textvariable=self.perday_var,
             width=4).pack(side="left", padx=4)
 
-        # Row 2: 时间
+        # Row 2: 时间（支持多个时间，逗号分隔）
         r2 = ttk.Frame(self.sched_frame)
         r2.pack(fill="x", padx=6, pady=2)
         ttk.Label(r2, text="发布时间:").pack(side="left")
-        self.hour_var = tk.IntVar(value=8)
-        ttk.Spinbox(
-            r2, from_=0, to=23, textvariable=self.hour_var,
-            width=3, format="%02.0f", wrap=True).pack(side="left", padx=4)
-        ttk.Label(r2, text="时").pack(side="left")
-        self.minute_var = tk.IntVar(value=0)
-        ttk.Spinbox(
-            r2, from_=0, to=59, textvariable=self.minute_var,
-            width=3, format="%02.0f", wrap=True).pack(side="left", padx=4)
-        ttk.Label(r2, text="分").pack(side="left")
+        self.time_var = tk.StringVar(value=self._cfg.get("default_time", "08:00"))
+        ttk.Entry(r2, textvariable=self.time_var, width=24).pack(
+            side="left", padx=4)
+        ttk.Label(r2, text="(多时间逗号分隔, 如 08:00,12:00)").pack(side="left")
 
         # 默认模式为定时发布，显示定时设置面板
         self.sched_frame.pack(fill="x", padx=6, pady=4)
 
         # 参数变化时刷新预览
-        for var in (self.date_var, self.perday_var, self.hour_var, self.minute_var):
+        for var in (self.date_var, self.perday_var, self.time_var):
             var.trace_add("write", lambda *_: self._refresh_preview())
+        # 时间点数量 > 每天章数时，自动上调 per_day
+        self.time_var.trace_add("write", lambda *_: self._sync_perday_from_times())
+        # 持久化可配置项（不含日期，日期每天变化）
+        for var in (self.perday_var, self.time_var):
+            var.trace_add("write", lambda *_: self._schedule_config_save())
 
         # --- 5. 章节预览 ---
         frm = ttk.LabelFrame(self.root, text="章节预览")
@@ -331,6 +330,10 @@ class FanqieGUI:
         # --- 7. 运行日志 ---
         frm = ttk.LabelFrame(self.root, text="运行日志")
         frm.pack(fill="both", expand=True, **pad)
+        log_bar = ttk.Frame(frm)
+        log_bar.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Button(log_bar, text="导出日志", command=self._export_log).pack(
+            side="right")
         self.txt_log = scrolledtext.ScrolledText(
             frm, height=8, state="disabled",
             font=("Consolas", 9))
@@ -376,10 +379,14 @@ class FanqieGUI:
             if not (book_id and book_id in self._platform_chapters_cache):
                 self.btn_upload.configure(state="disabled")
             self._fetch_platform_chapters_for_edit()
+        elif mode == "draft":
+            self.sched_frame.pack_forget()
+            self.chk_use_ai.pack_forget()  # 草稿模式不需要AI选项
         else:
             self.sched_frame.pack_forget()
             self.chk_use_ai.pack(side="left", padx=6)
         self._refresh_preview()
+        self._schedule_config_save()
 
     def _log(self, msg):
         self.txt_log.configure(state="normal")
@@ -393,15 +400,77 @@ class FanqieGUI:
         self.txt_preview.insert("1.0", text)
         self.txt_preview.configure(state="disabled")
 
+    def _export_log(self):
+        """导出运行日志到文件。"""
+        content = self.txt_log.get("1.0", tk.END).strip()
+        if not content:
+            messagebox.showinfo("提示", "暂无日志内容")
+            return
+        fp = filedialog.asksaveasfilename(
+            title="导出日志",
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            initialfile=f"fanqie_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        )
+        if fp:
+            Path(fp).write_text(content, encoding="utf-8")
+            self._log(f"日志已导出: {fp}")
+
+    # -----------------------------------------------------------------------
+    # 配置持久化
+    # -----------------------------------------------------------------------
+    def _sync_perday_from_times(self):
+        """时间点数量 > 每天章数时，自动上调 per_day。"""
+        raw = self.time_var.get()
+        n_times = len([t for t in raw.split(",") if t.strip()])
+        if n_times < 1:
+            return
+        try:
+            cur = self.perday_var.get()
+        except tk.TclError:
+            cur = 1
+        if n_times > cur:
+            self.perday_var.set(n_times)
+
+    def _schedule_config_save(self):
+        """延迟保存配置（防抖 1 秒，避免频繁写盘）。"""
+        if hasattr(self, "_config_save_after"):
+            self.root.after_cancel(self._config_save_after)
+        self._config_save_after = self.root.after(1000, self._save_config)
+
+    def _save_config(self):
+        """将当前 GUI 设置写入 config.json。"""
+        self._cfg["default_mode"] = self.mode_var.get()
+        self._cfg["default_time"] = self.time_var.get().strip() or "08:00"
+        try:
+            self._cfg["default_per_day"] = self.perday_var.get()
+        except tk.TclError:
+            pass
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._cfg, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+        except Exception:
+            pass
+
     def _set_uploading(self, active):
         self.uploading = active
-        state = "disabled" if active else "normal"
-        self.btn_upload.configure(
-            state=state, text="上传中..." if active else "开始上传")
+        self._cancel_requested = False
+        if active:
+            self.btn_upload.configure(state="normal", text="停止上传")
+        else:
+            self.btn_upload.configure(state="normal", text="开始上传")
+            # 修改模式下如果未载入章节列表则禁用
+            if self.mode_var.get() == "edit":
+                idx = self.cmb_book.current()
+                book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
+                if not (book_id and book_id in self._platform_chapters_cache):
+                    self.btn_upload.configure(state="disabled")
         # 上传期间禁用所有可能影响状态的控件
-        self.btn_books.configure(state=state)
+        ctrl_state = "disabled" if active else "normal"
+        self.btn_books.configure(state=ctrl_state)
         self.cmb_book.configure(state="disabled" if active else "readonly")
-        self.btn_open_manage.configure(state=state)
+        self.btn_open_manage.configure(state=ctrl_state)
 
     # -----------------------------------------------------------------------
     # 快捷链接: 打开章节管理
@@ -419,6 +488,8 @@ class FanqieGUI:
     # 作品切换 → 获取上次发布时间
     # -----------------------------------------------------------------------
     def _on_book_changed(self):
+        self._fetch_gen += 1
+
         idx = self.cmb_book.current()
         if idx < 0 or not self.books:
             return
@@ -436,39 +507,53 @@ class FanqieGUI:
             self._apply_last_publish(self._last_publish_cache[book_id])
             return
 
-        # 后台获取
+        # 后台获取（仅默认页，一般最新发布在首页即可看到）
         if not AUTH_FILE.exists():
             return
 
         self.lbl_last_publish.configure(
             text="上次定时发布: 获取中...", foreground="gray")
 
+        gen = self._fetch_gen
+
         async def task():
+            page = None
             try:
-                async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=True)
-                    page = await context.new_page()
-                    url = CHAPTER_MANAGE_URL.format(book_id=book_id)
-                    await page.goto(url)
-                    await page.wait_for_load_state("networkidle")
-                    await page.wait_for_timeout(2000)
-
-                    # 尝试滚动到页面底部加载更多章节
-                    await page.evaluate(
-                        "window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(1000)
-
-                    result = await page.evaluate(LAST_PUBLISH_JS)
-                    await browser.close()
-
+                ctx = await self._shared.ensure()
+                page = await ctx.new_page()
+                if self._fetch_gen != gen:
+                    return
+                url = CHAPTER_MANAGE_URL.format(book_id=book_id)
+                await page.goto(url)
+                await page.wait_for_load_state("networkidle")
+                try:
+                    await page.wait_for_selector("tr td", timeout=5000)
+                except PWTimeout:
+                    pass
+                if self._fetch_gen != gen:
+                    return
+                result = await page.evaluate(LAST_PUBLISH_JS)
                 self._after(0, self._last_publish_fetched, book_id, result)
             except Exception:
-                self._after(0, self._last_publish_fetched, book_id, None)
+                if self._fetch_gen == gen:
+                    self._after(0, self._last_publish_fetched, book_id, None)
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
 
         self.worker.submit(task())
 
     def _last_publish_fetched(self, book_id, result):
         """后台获取完成，更新缓存和 UI。"""
+        # 检查当前选中的作品是否仍匹配
+        idx = self.cmb_book.current()
+        current_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
+        if current_id != book_id:
+            return  # 用户已切换作品，丢弃过期结果
+
         if result:
             self._last_publish_cache[book_id] = result
             self._apply_last_publish(result)
@@ -494,12 +579,8 @@ class FanqieGUI:
         except ValueError:
             pass
 
-        try:
-            parts = time_str.split(":")
-            self.hour_var.set(int(parts[0]))
-            self.minute_var.set(int(parts[1]))
-        except (ValueError, IndexError):
-            pass
+        if time_str:
+            self.time_var.set(time_str)
 
     # -----------------------------------------------------------------------
     # 修改模式: 获取平台章节列表
@@ -522,29 +603,47 @@ class FanqieGUI:
         self.lbl_last_publish.configure(
             text="正在获取平台章节列表...", foreground="gray")
 
+        gen = self._fetch_gen
+
         async def task():
+            page = None
             try:
-                async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=True)
-                    page = await context.new_page()
-                    url = CHAPTER_MANAGE_URL.format(book_id=book_id)
-                    await page.goto(url)
-                    await page.wait_for_load_state("networkidle")
+                ctx = await self._shared.ensure()
+                page = await ctx.new_page()
+                if self._fetch_gen != gen:
+                    return
+                url = CHAPTER_MANAGE_URL.format(book_id=book_id)
+                await page.goto(url)
+                await page.wait_for_load_state("networkidle")
 
-                    chapters, last_pub = await extract_chapters_from_page(
-                        page, book_id)
-                    await browser.close()
+                chapters, last_pub = await extract_chapters_from_page(
+                    page, book_id)
 
+                if self._fetch_gen != gen:
+                    return
                 self._after(0, self._on_platform_chapters_fetched,
                             book_id, chapters, None, last_pub)
             except Exception as e:
-                self._after(0, self._on_platform_chapters_fetched,
-                            book_id, [], str(e), None)
+                if self._fetch_gen == gen:
+                    self._after(0, self._on_platform_chapters_fetched,
+                                book_id, [], str(e), None)
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
 
         self.worker.submit(task())
 
     def _on_platform_chapters_fetched(self, book_id, chapters, error,
                                       last_pub=None):
+        # 检查当前选中的作品是否仍匹配
+        idx = self.cmb_book.current()
+        current_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
+        if current_id != book_id:
+            return  # 用户已切换作品，丢弃过期结果
+
         if error:
             self.lbl_last_publish.configure(
                 text=f"获取章节列表失败: {error}", foreground="red")
@@ -603,6 +702,8 @@ class FanqieGUI:
             self._log(f"登录失败: {error}")
         else:
             self._log("登录状态已保存。")
+            # 刷新共享浏览器以加载新的登录状态
+            self.worker.submit(self._shared.refresh())
             self._after(300, self._on_refresh_books)
 
     # -----------------------------------------------------------------------
@@ -616,19 +717,24 @@ class FanqieGUI:
         self._log("正在获取作品列表...")
 
         async def task():
+            page = None
             try:
-                async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=True)
-                    page = await context.new_page()
-                    await page.goto(BOOK_MANAGE_URL)
-                    await page.wait_for_load_state("networkidle")
-                    await page.wait_for_timeout(3000)
-                    books = await page.evaluate(BOOKS_JS)
-                    await save_auth(context)
-                    await browser.close()
+                ctx = await self._shared.ensure()
+                page = await ctx.new_page()
+                await page.goto(BOOK_MANAGE_URL)
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(3000)
+                books = await page.evaluate(BOOKS_JS)
+                await save_auth(ctx)
                 self._after(0, self._books_fetched, books, None)
             except Exception as e:
                 self._after(0, self._books_fetched, [], str(e))
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
 
         self.worker.submit(task())
 
@@ -692,7 +798,7 @@ class FanqieGUI:
             try:
                 date_str = self.date_var.get()
                 datetime.strptime(date_str, "%Y-%m-%d")
-                time_str = f"{self.hour_var.get():02d}:{self.minute_var.get():02d}"
+                time_str = self.time_var.get().strip() or "08:00"
                 per_day = self.perday_var.get()
                 schedule = compute_schedule(
                     len(self.parsed_chapters), date_str, time_str, per_day)
@@ -775,6 +881,9 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     def _on_upload(self):
         if self.uploading:
+            # 正在上传中 -> 请求取消
+            self._cancel_requested = True
+            self.btn_upload.configure(state="disabled", text="正在停止...")
             return
 
         # 验证
@@ -810,7 +919,7 @@ class FanqieGUI:
                 messagebox.showerror("日期错误", "请输入正确的日期: YYYY-MM-DD")
                 return
             try:
-                time_str = f"{self.hour_var.get():02d}:{self.minute_var.get():02d}"
+                time_str = self.time_var.get().strip() or "08:00"
                 per_day = max(1, self.perday_var.get())
             except tk.TclError:
                 messagebox.showerror("参数错误", "请输入有效的时间和每天章数")
@@ -835,8 +944,7 @@ class FanqieGUI:
         self._redirector = StdoutRedirector(self.txt_log, self.root)
         sys.stdout = self._redirector
 
-        cfg = load_config()
-        delay = cfg.get("delay_between_chapters", 3)
+        delay = self._cfg.get("delay_between_chapters", 3)
 
         # 复制数据避免主线程修改
         parsed = list(self.parsed_chapters)
@@ -862,8 +970,13 @@ class FanqieGUI:
                     success = 0
                     failed = 0
                     total = len(files)
+                    max_retries = self._cfg.get("max_retries", 2)
 
                     for i in range(total):
+                        if self._cancel_requested:
+                            print("\n用户取消上传。")
+                            break
+
                         chapter_num, title, content = parsed[i]
                         num_str = f"第{chapter_num}章 " if chapter_num else ""
                         sched_info = ""
@@ -871,39 +984,51 @@ class FanqieGUI:
                             sched_info = f" -> {schedule[i][0]} {schedule[i][1]}"
                         print(f"\n[{i+1}/{total}] {num_str}{title}{sched_info}")
 
-                        try:
-                            if i > 0:
-                                await page.goto(url)
-                                await wait_for_editor_ready(page)
-
-                            await fill_chapter(page, chapter_num, title, content)
-
-                            if schedule:
-                                d, t = schedule[i]
-                                await publish_scheduled(page, d, t, use_ai=use_ai)
-                                print(f"  -> 定时发布 {d} {t}")
-                            elif mode == "publish":
-                                await _navigate_to_publish_settings(page, use_ai=use_ai)
-                                btn = page.locator("button", has_text="确认发布")
-                                if await btn.count() == 0:
-                                    raise RuntimeError("未找到确认发布按钮")
-                                await btn.first.click()
-                                await page.wait_for_timeout(2000)
-                                print("  -> 已发布")
-                            else:
-                                await save_draft(page)
-                                print("  -> 已存草稿")
-
-                            success += 1
-                        except Exception as e:
-                            print(f"  !! 失败: {e}")
-                            failed += 1
+                        ok = False
+                        for attempt in range(1, max_retries + 2):
                             try:
-                                err = SCRIPT_DIR / f"error_{i}_{files[i].stem}.png"
-                                await page.screenshot(path=str(err))
-                                print(f"  截图: {err}")
-                            except Exception:
-                                pass
+                                if i > 0 or attempt > 1:
+                                    await page.goto(url)
+                                    await wait_for_editor_ready(page)
+
+                                await fill_chapter(page, chapter_num, title, content)
+
+                                if schedule:
+                                    d, t = schedule[i]
+                                    await publish_scheduled(page, d, t, use_ai=use_ai)
+                                    print(f"  -> 定时发布 {d} {t}")
+                                elif mode == "publish":
+                                    await _navigate_to_publish_settings(page, use_ai=use_ai)
+                                    btn = page.locator("button", has_text="确认发布")
+                                    if await btn.count() == 0:
+                                        raise RuntimeError("未找到确认发布按钮")
+                                    await btn.first.click()
+                                    await page.wait_for_timeout(2000)
+                                    print("  -> 已发布")
+                                else:
+                                    await save_draft(page)
+                                    print("  -> 已存草稿")
+
+                                ok = True
+                                break
+
+                            except Exception as e:
+                                if attempt <= max_retries:
+                                    print(f"  !! 第{attempt}次失败: {e}，重试中...")
+                                    await page.wait_for_timeout(2000)
+                                else:
+                                    print(f"  !! 失败: {e}")
+                                    try:
+                                        err = SCRIPT_DIR / f"error_{i}_{files[i].stem}.png"
+                                        await page.screenshot(path=str(err))
+                                        print(f"  截图: {err}")
+                                    except Exception:
+                                        pass
+
+                        if ok:
+                            success += 1
+                        else:
+                            failed += 1
 
                         self._after(0, self._update_progress, i + 1, total)
 
@@ -950,7 +1075,7 @@ class FanqieGUI:
         matched = self._matched_edit
         count = len(matched)
 
-        msg = f"即将修改「{book_name}」的 {count} 个章节\n模式: 修改已有章节（存草稿）"
+        msg = f"即将修改「{book_name}」的 {count} 个章节\n模式: 修改已有章节"
         if not messagebox.askyesno("确认修改", msg):
             return
 
@@ -961,8 +1086,7 @@ class FanqieGUI:
         self._redirector = StdoutRedirector(self.txt_log, self.root)
         sys.stdout = self._redirector
 
-        cfg = load_config()
-        delay = cfg.get("delay_between_chapters", 3)
+        delay = self._cfg.get("delay_between_chapters", 3)
         use_ai = self.use_ai_var.get()
         matched_copy = list(matched)
 
@@ -977,45 +1101,29 @@ class FanqieGUI:
                     total = len(matched_copy)
 
                     for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched_copy):
+                        if self._cancel_requested:
+                            print("\n用户取消修改。")
+                            break
+
                         print(f"\n[{i+1}/{total}] 修改第{ch_num}章 {title}")
 
-                        try:
-                            edit_url = plat_ch.get("editUrl")
-                            if not edit_url:
-                                print("  !! 无法获取编辑链接，跳过")
-                                failed += 1
-                                self._after(0, self._update_progress, i + 1, total)
-                                continue
-
-                            if edit_url.startswith("/"):
-                                edit_url = BASE_URL + edit_url
-
-                            await page.goto(edit_url)
-                            await wait_for_editor_ready(page)
-                            await dismiss_edit_hint(page)
-
-                            await clear_editor(page)
-                            await fill_chapter(page, str(ch_num), title, content)
-
-                            # 走发布流程保存修改
-                            await _navigate_to_publish_settings(page, use_ai=use_ai)
-                            confirm_btn = page.locator("button", has_text="确认发布")
-                            if await confirm_btn.count() == 0:
-                                raise RuntimeError("未找到确认发布按钮")
-                            await confirm_btn.first.click()
-                            await page.wait_for_timeout(2000)
-                            print("  -> 已保存修改")
-                            success += 1
-
-                        except Exception as e:
-                            print(f"  !! 失败: {e}")
+                        edit_url = plat_ch.get("editUrl")
+                        if not edit_url:
+                            print("  !! 无法获取编辑链接，跳过")
                             failed += 1
-                            try:
-                                err = SCRIPT_DIR / f"error_edit_{ch_num}.png"
-                                await page.screenshot(path=str(err))
-                                print(f"  截图: {err}")
-                            except Exception:
-                                pass
+                            self._after(0, self._update_progress, i + 1, total)
+                            continue
+
+                        if edit_url.startswith("/"):
+                            edit_url = BASE_URL + edit_url
+
+                        if await edit_one_chapter(
+                                page, edit_url, ch_num, title, content,
+                                use_ai=use_ai,
+                                max_retries=self._cfg.get("max_retries", 2)):
+                            success += 1
+                        else:
+                            failed += 1
 
                         self._after(0, self._update_progress, i + 1, total)
 
@@ -1048,6 +1156,12 @@ class FanqieGUI:
         # 恢复 stdout 以防重定向仍在生效
         if self._redirector:
             sys.stdout = self._redirector._original or sys.__stdout__
+        # 关闭共享浏览器
+        try:
+            future = self.worker.submit(self._shared.close())
+            future.result(timeout=5)
+        except Exception:
+            pass
         self.worker.stop()
         self.root.destroy()
 

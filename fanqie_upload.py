@@ -55,7 +55,15 @@ CHAPTER_MANAGE_URL_TPL = BASE_URL + "/main/writer/chapter-manage/{book_id}"
 DEFAULT_CONFIG = {
     "delay_between_chapters": 3,   # 章节之间等待秒数
     "headless": False,             # 是否无头模式
+    "max_retries": 2,              # 单章失败最大重试次数
+    "default_mode": "schedule",    # GUI 默认发布模式
+    "default_per_day": 2,          # GUI 默认每天章数
+    "default_time": "08:00",       # GUI 默认发布时间（支持逗号分隔多时间）
+    "browser_timeout": 15000,      # 浏览器操作超时 (ms)
 }
+
+# 平台修饰键 (macOS = Meta/Cmd, 其他 = Control)
+_MOD_KEY = "Meta" if sys.platform == "darwin" else "Control"
 
 
 # ---------------------------------------------------------------------------
@@ -427,9 +435,13 @@ async def fill_chapter(page, chapter_num: str | None, title: str, content: str):
         }""",
         [chapter_num or "", title, plain_content],
     )
-    await page.wait_for_timeout(2000)
-
-    wc = await _get_word_count(page)
+    # 轮询等待正文写入完成（最多 3 秒）
+    wc = 0
+    for _ in range(6):
+        await page.wait_for_timeout(500)
+        wc = await _get_word_count(page)
+        if wc > 0:
+            break
     if wc > 0:
         print(f"    正文字数 {wc}")
     else:
@@ -498,10 +510,71 @@ async def clear_editor(page):
         }
     }""")
     # 全选并删除正文
-    await page.keyboard.press("Control+a")
+    await page.keyboard.press(f"{_MOD_KEY}+a")
     await page.wait_for_timeout(200)
     await page.keyboard.press("Delete")
     await page.wait_for_timeout(500)
+
+
+# ---------------------------------------------------------------------------
+# JS: 获取作品列表（CLI 和 GUI 共用）
+# ---------------------------------------------------------------------------
+BOOKS_JS = r"""() => {
+    const results = [];
+    const links = document.querySelectorAll('a[href*="chapter-manage/"]');
+    for (const link of links) {
+        const href = link.getAttribute('href') || '';
+        const m = href.match(/chapter-manage\/(\d+)&([^?]*)/);
+        if (!m) continue;
+        const bookId = m[1];
+        let name;
+        try { name = decodeURIComponent(m[2]); }
+        catch { name = m[2]; }
+        let container = link;
+        for (let i = 0; i < 12; i++) {
+            if (!container.parentElement) break;
+            container = container.parentElement;
+            if (container.textContent.length > 30 &&
+                container.textContent.includes('万字')) break;
+        }
+        const text = container.textContent || '';
+        const chapterMatch = text.match(/(\d+)\s*章/);
+        const wordMatch = text.match(/([\d.]+)\s*万字/);
+        const statusMatch = text.match(/(连载中|已完结)/);
+        const signMatch = text.match(/(已签约|未签约)/);
+        results.push({
+            bookId, name,
+            chapters: chapterMatch ? chapterMatch[1] : '?',
+            words: wordMatch ? wordMatch[1] + '万' : '?',
+            status: (statusMatch ? statusMatch[1] : '') +
+                    (signMatch ? ' · ' + signMatch[1] : ''),
+        });
+    }
+    return results;
+}"""
+
+
+# ---------------------------------------------------------------------------
+# JS: 从章节管理页提取最新一条发布时间（仅当前页，不翻页）
+# ---------------------------------------------------------------------------
+LAST_PUBLISH_JS = r"""() => {
+    const re = /(\d{4}[-/]\d{2}[-/]\d{2})\s+(\d{2}:\d{2})/;
+    let best = null, bestKey = '';
+    for (const row of document.querySelectorAll('tr')) {
+        const cells = row.querySelectorAll('td');
+        if (cells.length < 2) continue;
+        const m = row.textContent.match(re);
+        if (!m) continue;
+        const d = m[1].replace(/\//g, '-');
+        const t = m[2];
+        const key = d + ' ' + t;
+        if (key > bestKey) {
+            best = {date: d, time: t, chapter: cells[0].textContent.trim()};
+            bestKey = key;
+        }
+    }
+    return best;
+}"""
 
 
 # ---------------------------------------------------------------------------
@@ -690,19 +763,31 @@ def compute_schedule(
     """
     计算每章的定时发布日期和时间。
 
+    pub_time 支持逗号分隔的多个时间（如 "08:00,12:00,20:00"），
+    每天内的章节按顺序轮流使用各时间点。
+
     返回: [(date_str, time_str), ...] 长度等于 file_count
-    例如: start_date="2026-03-14", pub_time="08:00", per_day=3, file_count=7
-      -> [("2026-03-14","08:00"), ("2026-03-14","08:00"), ("2026-03-14","08:00"),
-          ("2026-03-15","08:00"), ("2026-03-15","08:00"), ("2026-03-15","08:00"),
-          ("2026-03-16","08:00")]
     """
     per_day = max(1, per_day)
     base = datetime.strptime(start_date, "%Y-%m-%d")
+    times = [t.strip() for t in pub_time.split(",") if t.strip()]
+    if not times:
+        times = ["08:00"]
+    # 时间点数量 > per_day 时，以时间点为准
+    effective = max(per_day, len(times))
+    # 时间点不足时，从最后一个时间点起每隔 1 分钟补齐
+    if len(times) < effective:
+        last = datetime.strptime(times[-1], "%H:%M")
+        while len(times) < effective:
+            last += timedelta(minutes=1)
+            times.append(last.strftime("%H:%M"))
     schedule = []
     for i in range(file_count):
-        day_offset = i // per_day
+        day_offset = i // effective
         d = base + timedelta(days=day_offset)
-        schedule.append((d.strftime("%Y-%m-%d"), pub_time))
+        slot = i % effective
+        t = times[slot]
+        schedule.append((d.strftime("%Y-%m-%d"), t))
     return schedule
 
 
@@ -720,7 +805,6 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
     """
     # --- Step 1: 点击"下一步" ---
     await click_next_step(page)
-    await page.wait_for_timeout(1500)
 
     # --- Step 2: 循环处理所有可能出现的弹窗/面板 ---
     for _ in range(10):
@@ -838,7 +922,12 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
         return 'not_found';
     }""")
     print(f"    定时发布开关: {switched}")
-    await page.wait_for_timeout(1000)
+    # 等待日期输入框出现
+    try:
+        await page.wait_for_selector("input[placeholder='请选择日期']", timeout=5000)
+    except PWTimeout:
+        pass
+    await page.wait_for_timeout(300)
 
     # 3. 填写日期 (Arco DatePicker)
     #    键盘方式: 点击输入框 -> 全选 -> 输入日期 -> Enter 确认
@@ -848,7 +937,7 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
     else:
         await date_input.click()
         await page.wait_for_timeout(300)
-        await page.keyboard.press("Control+a")
+        await page.keyboard.press(f"{_MOD_KEY}+a")
         await page.keyboard.type(date_str, delay=50)
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(500)
@@ -863,7 +952,7 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
     else:
         await time_input.click()
         await page.wait_for_timeout(300)
-        await page.keyboard.press("Control+a")
+        await page.keyboard.press(f"{_MOD_KEY}+a")
         await page.keyboard.type(time_str, delay=50)
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(500)
@@ -918,48 +1007,7 @@ async def cmd_books():
         await page.wait_for_load_state("networkidle")
         await page.wait_for_timeout(3000)
 
-        # 从 chapter-manage 链接中提取 book_id 和书名
-        # 链接格式: /main/writer/chapter-manage/{book_id}&{URL编码书名}?type=1
-        books = await page.evaluate(
-            r"""() => {
-                const results = [];
-                const links = document.querySelectorAll('a[href*="chapter-manage/"]');
-                for (const link of links) {
-                    const href = link.getAttribute('href') || '';
-                    const m = href.match(/chapter-manage\/(\d+)&([^?]*)/);
-                    if (!m) continue;
-                    const bookId = m[1];
-                    const encodedName = m[2];
-                    let name;
-                    try { name = decodeURIComponent(encodedName); }
-                    catch { name = encodedName; }
-
-                    // 向上找同级卡片区域，提取字数/章数/状态
-                    let container = link;
-                    for (let i = 0; i < 12; i++) {
-                        if (!container.parentElement) break;
-                        container = container.parentElement;
-                        if (container.textContent.length > 30 &&
-                            container.textContent.includes('万字')) break;
-                    }
-                    const text = container.textContent || '';
-                    const chapterMatch = text.match(/(\d+)\s*章/);
-                    const wordMatch = text.match(/([\d.]+)\s*万字/);
-                    const statusMatch = text.match(/(连载中|已完结)/);
-                    const signMatch = text.match(/(已签约|未签约)/);
-
-                    results.push({
-                        bookId,
-                        name,
-                        chapters: chapterMatch ? chapterMatch[1] : '?',
-                        words: wordMatch ? wordMatch[1] + '万' : '?',
-                        status: (statusMatch ? statusMatch[1] : '') +
-                                (signMatch ? ' · ' + signMatch[1] : ''),
-                    });
-                }
-                return results;
-            }"""
-        )
+        books = await page.evaluate(BOOKS_JS)
 
         print()
         if not books:
@@ -1093,6 +1141,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
         success = 0
         failed = 0
+        max_retries = cfg.get("max_retries", 2)
 
         for i, file in enumerate(files):
             chapter_num, title, content = parsed[i]
@@ -1100,50 +1149,55 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
             sched_info = f" -> {schedule[i][0]} {schedule[i][1]}" if schedule else ""
             print(f"\n[{i+1}/{len(files)}] {num_str}{title}{sched_info}")
 
-            try:
-                # 首章复用当前页面，后续章节导航到新建 URL
-                if i > 0:
-                    await page.goto(new_chapter_url)
-                    await wait_for_editor_ready(page)
+            ok = False
+            for attempt in range(1, max_retries + 2):
+                try:
+                    # 首章首次复用当前页面，其余情况导航到新建 URL
+                    if i > 0 or attempt > 1:
+                        await page.goto(new_chapter_url)
+                        await wait_for_editor_ready(page)
 
-                # 填入内容
-                await fill_chapter(page, chapter_num, title, content)
+                    await fill_chapter(page, chapter_num, title, content)
 
-                if schedule:
-                    # 定时发布
-                    date_str, time_str = schedule[i]
-                    await publish_scheduled(page, date_str, time_str, use_ai=use_ai)
-                    print(f"  -> 定时发布 {date_str} {time_str}")
-                elif publish:
-                    # 立即发布
-                    await _navigate_to_publish_settings(page, use_ai=use_ai)
-                    confirm_btn = page.locator("button", has_text="确认发布")
-                    if await confirm_btn.count() == 0:
-                        raise RuntimeError("未找到确认发布按钮")
-                    await confirm_btn.first.click()
-                    await page.wait_for_timeout(2000)
-                    print(f"  -> 已发布")
-                else:
-                    await save_draft(page)
-                    print(f"  -> 已存草稿")
+                    if schedule:
+                        date_str, time_str = schedule[i]
+                        await publish_scheduled(page, date_str, time_str, use_ai=use_ai)
+                        print(f"  -> 定时发布 {date_str} {time_str}")
+                    elif publish:
+                        await _navigate_to_publish_settings(page, use_ai=use_ai)
+                        confirm_btn = page.locator("button", has_text="确认发布")
+                        if await confirm_btn.count() == 0:
+                            raise RuntimeError("未找到确认发布按钮")
+                        await confirm_btn.first.click()
+                        await page.wait_for_timeout(2000)
+                        print(f"  -> 已发布")
+                    else:
+                        await save_draft(page)
+                        print(f"  -> 已存草稿")
 
+                    ok = True
+                    break
+
+                except Exception as e:
+                    if attempt <= max_retries:
+                        print(f"  !! 第{attempt}次失败: {e}，重试中...")
+                        await page.wait_for_timeout(2000)
+                    else:
+                        print(f"  !! 失败: {e}")
+                        try:
+                            err_path = SCRIPT_DIR / f"error_{i}_{file.stem}.png"
+                            await page.screenshot(path=str(err_path))
+                            print(f"  截图: {err_path}")
+                        except Exception:
+                            pass
+
+            if ok:
                 success += 1
-
-                # 章节间等待
-                if i < len(files) - 1 and delay > 0:
-                    await page.wait_for_timeout(delay * 1000)
-
-            except Exception as e:
-                print(f"  !! 失败: {e}")
+            else:
                 failed += 1
 
-                # 截图
-                try:
-                    err_path = SCRIPT_DIR / f"error_{i}_{file.stem}.png"
-                    await page.screenshot(path=str(err_path))
-                    print(f"  截图: {err_path}")
-                except Exception:
-                    pass
+            if i < len(files) - 1 and delay > 0:
+                await page.wait_for_timeout(delay * 1000)
 
         await save_auth(context)
         await browser.close()
@@ -1153,6 +1207,44 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         print(f"  上传完成!")
         print(f"  成功: {success}  失败: {failed}")
         print("=" * 40)
+
+
+# ---------------------------------------------------------------------------
+# 修改单章（CLI 和 GUI 共用）
+# ---------------------------------------------------------------------------
+async def edit_one_chapter(
+    page, edit_url: str, ch_num: int, title: str, content: str,
+    *, use_ai: bool = False, max_retries: int = 2,
+) -> bool:
+    """编辑单个已有章节（含重试）。成功返回 True，失败返回 False。"""
+    for attempt in range(1, max_retries + 2):
+        try:
+            await page.goto(edit_url)
+            await wait_for_editor_ready(page)
+            await dismiss_edit_hint(page)
+            await clear_editor(page)
+            await fill_chapter(page, str(ch_num), title, content)
+            await _navigate_to_publish_settings(page, use_ai=use_ai)
+            confirm_btn = page.locator("button", has_text="确认发布")
+            if await confirm_btn.count() == 0:
+                raise RuntimeError("未找到确认发布按钮")
+            await confirm_btn.first.click()
+            await page.wait_for_timeout(2000)
+            print("  -> 已保存修改")
+            return True
+        except Exception as e:
+            if attempt <= max_retries:
+                print(f"  !! 第{attempt}次失败: {e}，重试中...")
+                await page.wait_for_timeout(2000)
+            else:
+                print(f"  !! 失败: {e}")
+                try:
+                    err_path = SCRIPT_DIR / f"error_edit_{ch_num}.png"
+                    await page.screenshot(path=str(err_path))
+                    print(f"  截图: {err_path}")
+                except Exception:
+                    pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1243,45 +1335,24 @@ async def cmd_edit(directory: Path, book_id: str, args):
         for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched):
             print(f"\n[{i+1}/{total}] 修改第{ch_num}章 {title}")
 
-            try:
-                edit_url = plat_ch.get("editUrl")
-                if not edit_url:
-                    print("  !! 无法获取编辑链接，跳过")
-                    failed += 1
-                    continue
-
-                if edit_url.startswith("/"):
-                    edit_url = BASE_URL + edit_url
-
-                await page.goto(edit_url)
-                await wait_for_editor_ready(page)
-                await dismiss_edit_hint(page)
-
-                await clear_editor(page)
-                await fill_chapter(page, str(ch_num), title, content)
-
-                # 走发布流程保存修改
-                await _navigate_to_publish_settings(page, use_ai=use_ai)
-                confirm_btn = page.locator("button", has_text="确认发布")
-                if await confirm_btn.count() == 0:
-                    raise RuntimeError("未找到确认发布按钮")
-                await confirm_btn.first.click()
-                await page.wait_for_timeout(2000)
-                print("  -> 已保存修改")
-                success += 1
-
-                if i < total - 1 and delay > 0:
-                    await page.wait_for_timeout(delay * 1000)
-
-            except Exception as e:
-                print(f"  !! 失败: {e}")
+            edit_url = plat_ch.get("editUrl")
+            if not edit_url:
+                print("  !! 无法获取编辑链接，跳过")
                 failed += 1
-                try:
-                    err_path = SCRIPT_DIR / f"error_edit_{ch_num}.png"
-                    await page.screenshot(path=str(err_path))
-                    print(f"  截图: {err_path}")
-                except Exception:
-                    pass
+                continue
+
+            if edit_url.startswith("/"):
+                edit_url = BASE_URL + edit_url
+
+            if await edit_one_chapter(page, edit_url, ch_num, title, content,
+                                      use_ai=use_ai,
+                                      max_retries=cfg.get("max_retries", 2)):
+                success += 1
+            else:
+                failed += 1
+
+            if i < total - 1 and delay > 0:
+                await page.wait_for_timeout(delay * 1000)
 
         await save_auth(context)
         await browser.close()
@@ -1341,7 +1412,7 @@ def main():
     )
     up.add_argument(
         "--time", default="08:00",
-        help="定时发布时间, 格式 HH:MM (默认 08:00)",
+        help="定时发布时间, 如 08:00 或 08:00,12:00,20:00 (多时间逗号分隔)",
     )
     up.add_argument(
         "--per-day", type=int, default=1,
