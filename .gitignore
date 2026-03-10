@@ -1,5 +1,6 @@
 # Auth & secrets
 .auth_state.json
+.gui_state.json
 .env
 
 # Python

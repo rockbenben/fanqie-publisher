@@ -21,13 +21,14 @@ try:
     from fanqie_upload import (
         load_config,
         parse_md_file, get_md_files, strip_md_formatting,
-        deduplicate_titles, compute_schedule,
+        deduplicate_titles, compute_schedule, _validate_times,
+        DailyLimitReached, _check_daily_limit,
         create_context, save_auth,
         wait_for_editor_ready, fill_chapter,
         save_draft, publish_scheduled, _navigate_to_publish_settings,
         extract_chapters_from_page, match_chapters, edit_one_chapter,
         AUTH_FILE, BASE_URL, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
-        CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL, CONFIG_FILE,
+        CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL, CONFIG_FILE, GUI_STATE_FILE,
         BOOKS_JS, LAST_PUBLISH_JS,
     )
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -178,6 +179,7 @@ class FanqieGUI:
 
         # 配置
         self._cfg = load_config()
+        self._gui_state = self._load_gui_state()
 
         # 状态
         self.books: list[dict] = []
@@ -307,6 +309,8 @@ class FanqieGUI:
         # 持久化可配置项（不含日期，日期每天变化）
         for var in (self.perday_var, self.time_var):
             var.trace_add("write", lambda *_: self._schedule_config_save())
+        # 启动时同步: config 可能有 per_day=2 但 times=3 个
+        self._sync_perday_from_times()
 
         # --- 5. 章节预览 ---
         frm = ttk.LabelFrame(self.root, text="章节预览")
@@ -421,8 +425,8 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     def _sync_perday_from_times(self):
         """时间点数量 > 每天章数时，自动上调 per_day。"""
-        raw = self.time_var.get()
-        n_times = len([t for t in raw.split(",") if t.strip()])
+        validated = _validate_times(self.time_var.get())
+        n_times = len(validated)
         if n_times < 1:
             return
         try:
@@ -449,6 +453,26 @@ class FanqieGUI:
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self._cfg, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+        except Exception:
+            pass
+
+    # --- GUI 内部状态 (.gui_state.json，不含在用户 config 中) ---
+
+    @staticmethod
+    def _load_gui_state() -> dict:
+        if GUI_STATE_FILE.exists():
+            try:
+                with open(GUI_STATE_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return {}
+
+    def _save_gui_state(self):
+        try:
+            with open(GUI_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._gui_state, f, ensure_ascii=False, indent=2)
                 f.write("\n")
         except Exception:
             pass
@@ -495,6 +519,10 @@ class FanqieGUI:
             return
 
         book_id = self.books[idx]["bookId"]
+
+        # 记住选择的作品（存到隐藏状态文件，不污染 config.json）
+        self._gui_state["last_book_id"] = book_id
+        self._save_gui_state()
 
         # 修改模式: 走专用的章节列表获取（同时获取上次发布信息）
         if self.mode_var.get() == "edit":
@@ -562,7 +590,11 @@ class FanqieGUI:
                 text="上次定时发布: 未找到", foreground="gray")
 
     def _apply_last_publish(self, info):
-        """将上次发布信息显示到 UI 并自动建议下一天日期和相同时间。"""
+        """将上次发布信息显示到 UI 并自动建议下一天起始日期。
+
+        只更新 date_var，不覆盖 time_var —— 时间是用户配置项，
+        平台单条发布记录不应覆盖用户设定的多时间方案。
+        """
         date_str = info["date"]
         time_str = info["time"]
         chapter = info.get("chapter", "")
@@ -571,16 +603,13 @@ class FanqieGUI:
             label += f"  ({chapter})"
         self.lbl_last_publish.configure(text=label, foreground="#d35400")
 
-        # 自动建议: 起始日期 = 上次日期 + 1 天，时间 = 上次相同
+        # 自动建议: 起始日期 = 上次日期 + 1 天
         try:
             last_dt = datetime.strptime(date_str, "%Y-%m-%d")
             next_dt = last_dt + timedelta(days=1)
             self.date_var.set(next_dt.strftime("%Y-%m-%d"))
         except ValueError:
             pass
-
-        if time_str:
-            self.time_var.set(time_str)
 
     # -----------------------------------------------------------------------
     # 修改模式: 获取平台章节列表
@@ -753,9 +782,17 @@ class FanqieGUI:
             for b in books
         ]
         self.cmb_book["values"] = display
-        self.cmb_book.current(0)
+        # 恢复上次选择的作品，找不到则默认第一部
+        last_id = self._gui_state.get("last_book_id", "")
+        target_idx = 0
+        if last_id:
+            for i, b in enumerate(books):
+                if b["bookId"] == last_id:
+                    target_idx = i
+                    break
+        self.cmb_book.current(target_idx)
         self._log(f"找到 {len(books)} 部作品。")
-        self._on_book_changed()  # 自动获取首部作品的最后发布时间
+        self._on_book_changed()
 
     # -----------------------------------------------------------------------
     # 目录选择 + 预览
@@ -819,7 +856,10 @@ class FanqieGUI:
         mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布"}
         summary = f"总计: {len(self.files)} 章, {total_words} 字 | 模式: {mode_labels[mode]}"
         if schedule:
-            summary += f" | 排期: {date_str} ~ {schedule[-1][0]}"
+            # 统计首天章数即为 effective per_day
+            first_day = schedule[0][0]
+            eff = sum(1 for d, _ in schedule if d == first_day)
+            summary += f" | 每天{eff}章 | 排期: {date_str} ~ {schedule[-1][0]}"
 
         self._set_preview(summary + "\n" + "-" * 60 + "\n" + "\n".join(lines))
         self.progress["maximum"] = len(self.files)
@@ -919,10 +959,16 @@ class FanqieGUI:
                 messagebox.showerror("日期错误", "请输入正确的日期: YYYY-MM-DD")
                 return
             try:
-                time_str = self.time_var.get().strip() or "08:00"
                 per_day = max(1, self.perday_var.get())
             except tk.TclError:
-                messagebox.showerror("参数错误", "请输入有效的时间和每天章数")
+                messagebox.showerror("参数错误", "请输入有效的每天章数")
+                return
+            time_str = self.time_var.get().strip() or "08:00"
+            if not _validate_times(time_str):
+                messagebox.showerror(
+                    "时间格式错误",
+                    "请输入有效的发布时间 (HH:MM)\n"
+                    "多个时间用逗号分隔, 如: 08:00,12:00,20:00")
                 return
             schedule = compute_schedule(
                 len(self.parsed_chapters), date_str, time_str, per_day)
@@ -985,6 +1031,7 @@ class FanqieGUI:
                         print(f"\n[{i+1}/{total}] {num_str}{title}{sched_info}")
 
                         ok = False
+                        daily_limit = False
                         for attempt in range(1, max_retries + 2):
                             try:
                                 if i > 0 or attempt > 1:
@@ -1004,12 +1051,18 @@ class FanqieGUI:
                                         raise RuntimeError("未找到确认发布按钮")
                                     await btn.first.click()
                                     await page.wait_for_timeout(2000)
+                                    await _check_daily_limit(page)
                                     print("  -> 已发布")
                                 else:
                                     await save_draft(page)
                                     print("  -> 已存草稿")
 
                                 ok = True
+                                break
+
+                            except DailyLimitReached as e:
+                                print(f"\n⚠ {e}")
+                                daily_limit = True
                                 break
 
                             except Exception as e:
@@ -1024,6 +1077,10 @@ class FanqieGUI:
                                         print(f"  截图: {err}")
                                     except Exception:
                                         pass
+
+                        if daily_limit:
+                            failed += 1
+                            break
 
                         if ok:
                             success += 1
@@ -1117,13 +1174,18 @@ class FanqieGUI:
                         if edit_url.startswith("/"):
                             edit_url = BASE_URL + edit_url
 
-                        if await edit_one_chapter(
-                                page, edit_url, ch_num, title, content,
-                                use_ai=use_ai,
-                                max_retries=self._cfg.get("max_retries", 2)):
-                            success += 1
-                        else:
+                        try:
+                            if await edit_one_chapter(
+                                    page, edit_url, ch_num, title, content,
+                                    use_ai=use_ai,
+                                    max_retries=self._cfg.get("max_retries", 2)):
+                                success += 1
+                            else:
+                                failed += 1
+                        except DailyLimitReached as e:
+                            print(f"\n⚠ {e}")
                             failed += 1
+                            break
 
                         self._after(0, self._update_progress, i + 1, total)
 

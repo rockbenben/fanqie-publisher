@@ -44,6 +44,7 @@ ZONE_URL = f"{BASE_URL}/writer/zone/"
 # 持久化文件（与脚本同目录）
 SCRIPT_DIR = Path(__file__).parent
 AUTH_FILE = SCRIPT_DIR / ".auth_state.json"
+GUI_STATE_FILE = SCRIPT_DIR / ".gui_state.json"
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 
 # 页面路径
@@ -64,6 +65,22 @@ DEFAULT_CONFIG = {
 
 # 平台修饰键 (macOS = Meta/Cmd, 其他 = Control)
 _MOD_KEY = "Meta" if sys.platform == "darwin" else "Control"
+
+
+class DailyLimitReached(RuntimeError):
+    """当日发布字数已达平台上限，无法继续发布。"""
+
+
+async def _check_daily_limit(page):
+    """检测平台"当日发布字数上限"提示，若存在则抛出 DailyLimitReached。"""
+    try:
+        tip = page.locator("text=已到达当日发布字数上限")
+        if await tip.count() > 0:
+            raise DailyLimitReached("已到达当日发布字数上限，无法继续发布")
+    except DailyLimitReached:
+        raise
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +774,25 @@ async def click_next_step(page):
 # ---------------------------------------------------------------------------
 # 定时发布
 # ---------------------------------------------------------------------------
+def _validate_times(raw: str) -> list[str]:
+    """解析、校验、排序、去重时间字符串。
+
+    输入: 逗号分隔的时间 (如 "20:00, 08:00, 12:00")
+    输出: 合法的 HH:MM 列表, 已排序去重 (如 ["08:00", "12:00", "20:00"])
+    不合法的条目静默丢弃。
+    """
+    result = []
+    for t in raw.split(","):
+        t = t.strip()
+        if not re.match(r"^\d{2}:\d{2}$", t):
+            continue
+        h, m = int(t[:2]), int(t[3:])
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            result.append(t)
+    # 字符串排序对 HH:MM 格式等同时间排序; dict.fromkeys 保序去重
+    return list(dict.fromkeys(sorted(result)))
+
+
 def compute_schedule(
     file_count: int, start_date: str, pub_time: str, per_day: int
 ) -> list[tuple[str, str]]:
@@ -764,23 +800,32 @@ def compute_schedule(
     计算每章的定时发布日期和时间。
 
     pub_time 支持逗号分隔的多个时间（如 "08:00,12:00,20:00"），
-    每天内的章节按顺序轮流使用各时间点。
+    每天内的章节按顺序使用各时间点。
+
+    规则:
+      - 时间点数量 > per_day 时, 以时间点数量为准
+      - 时间点不足时, 从末尾 +1 分钟补齐, 最多到 23:59
+      - 超过 23:59 的槽位复用 23:59
 
     返回: [(date_str, time_str), ...] 长度等于 file_count
     """
     per_day = max(1, per_day)
     base = datetime.strptime(start_date, "%Y-%m-%d")
-    times = [t.strip() for t in pub_time.split(",") if t.strip()]
+    times = _validate_times(pub_time)
     if not times:
         times = ["08:00"]
     # 时间点数量 > per_day 时，以时间点为准
     effective = max(per_day, len(times))
-    # 时间点不足时，从最后一个时间点起每隔 1 分钟补齐
+    # 时间点不足时，从最后一个时间点起每隔 1 分钟补齐，上限 23:59
     if len(times) < effective:
         last = datetime.strptime(times[-1], "%H:%M")
+        cap = datetime.strptime("23:59", "%H:%M")
         while len(times) < effective:
-            last += timedelta(minutes=1)
-            times.append(last.strftime("%H:%M"))
+            nxt = last + timedelta(minutes=1)
+            if nxt > cap:
+                nxt = cap            # 跨午夜: 使用相同时间
+            last = nxt
+            times.append(nxt.strftime("%H:%M"))
     schedule = []
     for i in range(file_count):
         day_offset = i // effective
@@ -808,6 +853,9 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
 
     # --- Step 2: 循环处理所有可能出现的弹窗/面板 ---
     for _ in range(10):
+        # 平台当日字数上限检测
+        await _check_daily_limit(page)
+
         # 已经到达发布设置?
         if await page.locator("text=发布设置").count() > 0:
             await _apply_publish_options(page, use_ai=use_ai)
@@ -961,11 +1009,13 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
         await page.wait_for_timeout(300)
 
     # 5. 确认发布
+    await _check_daily_limit(page)
     confirm_btn = page.locator("button", has_text="确认发布")
     if await confirm_btn.count() == 0:
         raise RuntimeError("未找到确认发布按钮")
     await confirm_btn.first.click()
     await page.wait_for_timeout(2000)
+    await _check_daily_limit(page)
 
 
 # ---------------------------------------------------------------------------
@@ -1088,7 +1138,9 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
     # 确定模式
     if schedule:
-        mode_str = f"定时发布 (从 {schedule_date} 起, 每天 {per_day} 章, {schedule_time})"
+        validated = _validate_times(schedule_time)
+        eff = max(per_day, len(validated)) if validated else per_day
+        mode_str = f"定时发布 (从 {schedule_date} 起, 每天 {eff} 章, {schedule_time})"
     elif publish:
         mode_str = "立即发布"
     else:
@@ -1150,6 +1202,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
             print(f"\n[{i+1}/{len(files)}] {num_str}{title}{sched_info}")
 
             ok = False
+            daily_limit = False
             for attempt in range(1, max_retries + 2):
                 try:
                     # 首章首次复用当前页面，其余情况导航到新建 URL
@@ -1170,12 +1223,18 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                             raise RuntimeError("未找到确认发布按钮")
                         await confirm_btn.first.click()
                         await page.wait_for_timeout(2000)
+                        await _check_daily_limit(page)
                         print(f"  -> 已发布")
                     else:
                         await save_draft(page)
                         print(f"  -> 已存草稿")
 
                     ok = True
+                    break
+
+                except DailyLimitReached as e:
+                    print(f"\n⚠ {e}")
+                    daily_limit = True
                     break
 
                 except Exception as e:
@@ -1190,6 +1249,10 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                             print(f"  截图: {err_path}")
                         except Exception:
                             pass
+
+            if daily_limit:
+                failed += 1
+                break
 
             if ok:
                 success += 1
@@ -1216,7 +1279,10 @@ async def edit_one_chapter(
     page, edit_url: str, ch_num: int, title: str, content: str,
     *, use_ai: bool = False, max_retries: int = 2,
 ) -> bool:
-    """编辑单个已有章节（含重试）。成功返回 True，失败返回 False。"""
+    """编辑单个已有章节（含重试）。成功返回 True，失败返回 False。
+
+    DailyLimitReached 不在此处捕获，直接向上抛出以停止整个循环。
+    """
     for attempt in range(1, max_retries + 2):
         try:
             await page.goto(edit_url)
@@ -1225,13 +1291,17 @@ async def edit_one_chapter(
             await clear_editor(page)
             await fill_chapter(page, str(ch_num), title, content)
             await _navigate_to_publish_settings(page, use_ai=use_ai)
+            await _check_daily_limit(page)
             confirm_btn = page.locator("button", has_text="确认发布")
             if await confirm_btn.count() == 0:
                 raise RuntimeError("未找到确认发布按钮")
             await confirm_btn.first.click()
             await page.wait_for_timeout(2000)
+            await _check_daily_limit(page)
             print("  -> 已保存修改")
             return True
+        except DailyLimitReached:
+            raise
         except Exception as e:
             if attempt <= max_retries:
                 print(f"  !! 第{attempt}次失败: {e}，重试中...")
@@ -1344,12 +1414,17 @@ async def cmd_edit(directory: Path, book_id: str, args):
             if edit_url.startswith("/"):
                 edit_url = BASE_URL + edit_url
 
-            if await edit_one_chapter(page, edit_url, ch_num, title, content,
-                                      use_ai=use_ai,
-                                      max_retries=cfg.get("max_retries", 2)):
-                success += 1
-            else:
+            try:
+                if await edit_one_chapter(page, edit_url, ch_num, title, content,
+                                          use_ai=use_ai,
+                                          max_retries=cfg.get("max_retries", 2)):
+                    success += 1
+                else:
+                    failed += 1
+            except DailyLimitReached as e:
+                print(f"\n⚠ {e}")
                 failed += 1
+                break
 
             if i < total - 1 and delay > 0:
                 await page.wait_for_timeout(delay * 1000)
