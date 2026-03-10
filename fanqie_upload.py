@@ -452,9 +452,9 @@ async def fill_chapter(page, chapter_num: str | None, title: str, content: str):
         }""",
         [chapter_num or "", title, plain_content],
     )
-    # 轮询等待正文写入完成（最多 3 秒）
+    # 轮询等待正文写入完成（最多 5 秒）
     wc = 0
-    for _ in range(6):
+    for _ in range(10):
         await page.wait_for_timeout(500)
         wc = await _get_word_count(page)
         if wc > 0:
@@ -462,7 +462,7 @@ async def fill_chapter(page, chapter_num: str | None, title: str, content: str):
     if wc > 0:
         print(f"    正文字数 {wc}")
     else:
-        print("    !! 正文粘贴失败 (字数=0)")
+        raise RuntimeError("正文粘贴失败 (字数=0)，请重试")
 
 
 async def save_draft(page):
@@ -1154,7 +1154,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         wc = len(strip_md_formatting(content))
         total_words += wc
         num_str = f"第{num}章" if num else "   ?  "
-        sched_str = f"  [{schedule[i][0]}]" if schedule else ""
+        sched_str = f"  [{schedule[i][0]} {schedule[i][1]}]" if schedule else ""
         print(f"  {i+1:3d}. {num_str} {title}  ({wc} 字){sched_str}")
     print("-" * 60)
     print(f"总计: {len(files)} 章, {total_words} 字")

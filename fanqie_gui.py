@@ -196,6 +196,7 @@ class FanqieGUI:
         self._matched_edit: list = []  # 修改模式匹配结果
         self._shared = _SharedBrowser()  # 复用的无头浏览器
         self._fetch_gen = 0  # 防抖: 每次切换作品递增
+        self._login_in_progress = False  # 防止并发登录
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -214,8 +215,8 @@ class FanqieGUI:
             frm, textvariable=self.account_var, state="readonly", width=16)
         self.cmb_account.pack(side="left", padx=6, pady=4)
         self.cmb_account.bind("<<ComboboxSelected>>", self._on_account_selected)
-        ttk.Button(frm, text="登录/新建", command=self._on_login).pack(
-            side="left", padx=6, pady=4)
+        self.btn_login = ttk.Button(frm, text="登录/新建", command=self._on_login)
+        self.btn_login.pack(side="left", padx=6, pady=4)
         self.lbl_auth = ttk.Label(frm, text="")
         self.lbl_auth.pack(side="left", padx=6)
         self._refresh_account_list()
@@ -247,12 +248,12 @@ class FanqieGUI:
             side="left", padx=6, pady=4, fill="x", expand=True)
         ttk.Button(frm, text="浏览...", command=self._on_browse_dir).pack(
             side="left", pady=4)
-        ttk.Button(frm, text="刷新", command=self._refresh_preview).pack(
+        ttk.Button(frm, text="刷新", command=self._reload_chapters).pack(
             side="left", padx=(4, 6), pady=4)
         self.unique_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             frm, text="自动去重标题", variable=self.unique_var,
-            command=self._refresh_preview).pack(side="left", padx=6)
+            command=self._reload_chapters).pack(side="left", padx=6)
 
         # --- 4. 发布模式 ---
         frm_mode = ttk.LabelFrame(self.root, text="发布模式")
@@ -261,11 +262,14 @@ class FanqieGUI:
         row_radios = ttk.Frame(frm_mode)
         row_radios.pack(fill="x", padx=6, pady=4)
         self.mode_var = tk.StringVar(value=self._cfg.get("default_mode", "schedule"))
+        self._mode_radios: list[ttk.Radiobutton] = []
         for text, val in [("存草稿", "draft"), ("立即发布", "publish"),
                           ("定时发布", "schedule"), ("修改", "edit")]:
-            ttk.Radiobutton(
+            rb = ttk.Radiobutton(
                 row_radios, text=text, variable=self.mode_var,
-                value=val, command=self._on_mode_change).pack(side="left", padx=10)
+                value=val, command=self._on_mode_change)
+            rb.pack(side="left", padx=10)
+            self._mode_radios.append(rb)
 
         # 发布选项（所有非草稿模式可见）
         row_opts = ttk.Frame(frm_mode)
@@ -306,8 +310,14 @@ class FanqieGUI:
             side="left", padx=4)
         ttk.Label(r2, text="(多时间逗号分隔, 如 08:00,12:00)").pack(side="left")
 
-        # 默认模式为定时发布，显示定时设置面板
-        self.sched_frame.pack(fill="x", padx=6, pady=4)
+        # 根据初始模式决定面板可见性
+        _init_mode = self.mode_var.get()
+        if _init_mode == "schedule":
+            self.sched_frame.pack(fill="x", padx=6, pady=4)
+        elif _init_mode in ("draft", "publish"):
+            self.lbl_last_publish.pack_forget()
+        if _init_mode == "draft":
+            self.chk_use_ai.pack_forget()
 
         # 参数变化时刷新预览
         for var in (self.date_var, self.perday_var, self.time_var):
@@ -353,7 +363,7 @@ class FanqieGUI:
 
         # 启动时自动加载预览
         if self.dir_var.get():
-            self.root.after(100, self._refresh_preview)
+            self.root.after(100, self._reload_chapters)
 
     # -----------------------------------------------------------------------
     # UI 辅助
@@ -478,10 +488,12 @@ class FanqieGUI:
         if mode != "edit" and not self.uploading:
             self.btn_upload.configure(state="normal")
         if mode == "schedule":
+            self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
             self.sched_frame.pack(fill="x", padx=6, pady=4)
             self.chk_use_ai.pack(side="left", padx=6)
             self._on_book_changed()  # 触发获取上次发布时间
         elif mode == "edit":
+            self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
             self.sched_frame.pack_forget()
             self.chk_use_ai.pack(side="left", padx=6)
             # 未载入章节列表前禁用上传按钮
@@ -491,9 +503,11 @@ class FanqieGUI:
                 self.btn_upload.configure(state="disabled")
             self._fetch_platform_chapters_for_edit()
         elif mode == "draft":
+            self.lbl_last_publish.pack_forget()
             self.sched_frame.pack_forget()
             self.chk_use_ai.pack_forget()  # 草稿模式不需要AI选项
         else:
+            self.lbl_last_publish.pack_forget()
             self.sched_frame.pack_forget()
             self.chk_use_ai.pack(side="left", padx=6)
         self._refresh_preview()
@@ -600,9 +614,12 @@ class FanqieGUI:
         # 上传期间禁用所有可能影响状态的控件
         ctrl_state = "disabled" if active else "normal"
         self.btn_books.configure(state=ctrl_state)
+        self.btn_login.configure(state=ctrl_state)
         self.cmb_book.configure(state="disabled" if active else "readonly")
         self.cmb_account.configure(state="disabled" if active else "readonly")
         self.btn_open_manage.configure(state=ctrl_state)
+        for rb in self._mode_radios:
+            rb.configure(state=ctrl_state)
 
     # -----------------------------------------------------------------------
     # 快捷链接: 打开章节管理
@@ -803,6 +820,10 @@ class FanqieGUI:
     # 登录
     # -----------------------------------------------------------------------
     def _on_login(self):
+        # 防止并发登录
+        if self._login_in_progress:
+            messagebox.showinfo("提示", "登录正在进行中，请先完成或取消当前登录。")
+            return
         # 弹出对话框要求输入账号名称
         raw = simpledialog.askstring(
             "账号名称",
@@ -827,6 +848,9 @@ class FanqieGUI:
 
         self._pending_account_name = name
         self._login_event = threading.Event()
+        self._login_cancelled = False
+        self._login_in_progress = True
+        self.btn_login.configure(state="disabled")
 
         async def task():
             try:
@@ -839,6 +863,11 @@ class FanqieGUI:
                     self._after(0, self._show_login_dialog)
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, self._login_event.wait)
+
+                    if self._login_cancelled:
+                        await browser.close()
+                        self._after(0, self._login_done, "cancelled")
+                        return
 
                     await save_auth(context)
 
@@ -855,17 +884,78 @@ class FanqieGUI:
         self.worker.submit(task())
 
     def _show_login_dialog(self):
-        # 将主窗口提到最前，确保对话框不被浏览器窗口遮挡
-        self.root.lift()
-        self.root.attributes("-topmost", True)
-        messagebox.showinfo(
-            "登录", "请在浏览器中登录番茄作家账号\n完成后点击「确定」保存会话")
-        self.root.attributes("-topmost", False)
-        self._login_event.set()
+        # 最小化主窗口，避免遮挡浏览器
+        self.root.iconify()
+
+        # 创建醒目的浮动窗口（非模态），放在屏幕右下角
+        win = tk.Toplevel(self.root)
+        win.title("等待登录")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.configure(bg="#FFF3CD")  # 醒目的暖黄色背景
+
+        body = tk.Frame(win, bg="#FFF3CD")
+        body.pack(padx=16, pady=12)
+
+        tk.Label(
+            body, text="⏳ 请在浏览器中登录",
+            font=("", 12, "bold"), bg="#FFF3CD", fg="#856404",
+        ).pack(pady=(0, 6))
+        tk.Label(
+            body, text="登录完成后点击下方按钮保存会话",
+            font=("", 9), bg="#FFF3CD", fg="#856404",
+        ).pack(pady=(0, 10))
+
+        btn_frame = tk.Frame(body, bg="#FFF3CD")
+        btn_frame.pack()
+
+        def on_confirm():
+            win.destroy()
+            self.root.deiconify()
+            self.root.lift()
+            self._login_event.set()
+
+        def on_cancel():
+            self._login_cancelled = True
+            win.destroy()
+            self.root.deiconify()
+            self.root.lift()
+            self._login_event.set()
+
+        tk.Button(
+            btn_frame, text="✔ 登录完成，保存会话",
+            font=("", 10, "bold"), fg="white", bg="#28A745",
+            activebackground="#218838", activeforeground="white",
+            padx=12, pady=4, cursor="hand2",
+            command=on_confirm,
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Button(
+            btn_frame, text="取消",
+            font=("", 10), fg="#856404", bg="#FFEEBA",
+            activebackground="#FFE083", padx=12, pady=4,
+            cursor="hand2", command=on_cancel,
+        ).pack(side="left")
+
+        # 关闭按钮 = 取消
+        win.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        # 定位到屏幕右下角
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        ww = win.winfo_width()
+        wh = win.winfo_height()
+        win.geometry(f"+{sw - ww - 40}+{sh - wh - 80}")
 
     def _login_done(self, error):
+        self._login_in_progress = False
+        self.btn_login.configure(state="normal")
         name = getattr(self, "_pending_account_name", "")
         self._pending_account_name = ""
+        if error == "cancelled":
+            self._log("登录已取消。")
+            return
         if error:
             self._refresh_auth_status()
             self._log(f"登录失败: {error}")
@@ -919,6 +1009,7 @@ class FanqieGUI:
             return
         self.books = books
         self._last_publish_cache.clear()  # 清空缓存
+        self._platform_chapters_cache.clear()  # 修改模式章节缓存也一起清
         if not books:
             self._log("未找到作品，请检查登录状态。")
             return
@@ -949,25 +1040,36 @@ class FanqieGUI:
         if not d:
             return
         self.dir_var.set(d)
-        self._refresh_preview()
+        self._reload_chapters()
 
-    def _refresh_preview(self):
+    def _reload_chapters(self):
+        """从磁盘重新扫描并解析章节文件。仅在目录变更/用户点刷新时调用。"""
         dir_path = self.dir_var.get()
         if not dir_path:
             return
         p = Path(dir_path)
         if not p.is_dir():
+            self.files = []
+            self.parsed_chapters = []
             self._set_preview("目录不存在")
             return
 
         self.files = get_md_files(p)
         if not self.files:
+            self.parsed_chapters = []
             self._set_preview("目录中没有 .md/.txt 文件")
             return
 
         self.parsed_chapters = [parse_md_file(f) for f in self.files]
         if self.unique_var.get():
             self.parsed_chapters = deduplicate_titles(self.parsed_chapters)
+
+        self._refresh_preview()
+
+    def _refresh_preview(self):
+        """仅重新计算排期和刷新预览文本，不重新读取文件。"""
+        if not self.files or not self.parsed_chapters:
+            return
 
         mode = self.mode_var.get()
 
