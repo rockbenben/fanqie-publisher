@@ -1,5 +1,5 @@
 # Auth & secrets
-.auth_state.json
+.auth_*.json
 .gui_state.json
 .env
 

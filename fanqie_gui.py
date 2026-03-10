@@ -9,11 +9,13 @@
 import asyncio
 import json
 import logging
+import re
+import shutil
 import sys
 import threading
 import tkinter as tk
 import webbrowser
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -207,10 +209,16 @@ class FanqieGUI:
         # --- 1. 账号 ---
         frm = ttk.LabelFrame(self.root, text="账号")
         frm.pack(fill="x", **pad)
-        ttk.Button(frm, text="登录番茄作家", command=self._on_login).pack(
+        self.account_var = tk.StringVar()
+        self.cmb_account = ttk.Combobox(
+            frm, textvariable=self.account_var, state="readonly", width=16)
+        self.cmb_account.pack(side="left", padx=6, pady=4)
+        self.cmb_account.bind("<<ComboboxSelected>>", self._on_account_selected)
+        ttk.Button(frm, text="登录/新建", command=self._on_login).pack(
             side="left", padx=6, pady=4)
         self.lbl_auth = ttk.Label(frm, text="")
         self.lbl_auth.pack(side="left", padx=6)
+        self._refresh_account_list()
         self._refresh_auth_status()
 
         # --- 2. 作品选择 ---
@@ -360,10 +368,109 @@ class FanqieGUI:
             pass
 
     def _refresh_auth_status(self):
+        acct = self._gui_state.get("current_account", "")
+        # L1: 命名文件已被删除 → 清除残留记录
+        if acct and not (SCRIPT_DIR / f".auth_{acct}.json").exists():
+            self._gui_state.pop("current_account", None)
+            self._save_gui_state()
+            acct = ""
         if AUTH_FILE.exists():
-            self.lbl_auth.configure(text="登录状态: 已保存", foreground="green")
+            if acct:
+                self.lbl_auth.configure(
+                    text=f"当前: {acct}", foreground="green")
+            else:
+                self.lbl_auth.configure(
+                    text="登录状态: 已保存", foreground="green")
         else:
             self.lbl_auth.configure(text="登录状态: 未登录", foreground="red")
+
+    # -----------------------------------------------------------------------
+    # 多账号管理
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _sanitize_account_name(name: str) -> str:
+        """移除 Windows 文件名非法字符，返回清理后的名称。"""
+        # Windows 文件名禁止字符: \ / : * ? " < > |
+        cleaned = re.sub(r'[\\/:*?"<>|]', "", name).strip()
+        # 防止与活跃 auth 文件冲突
+        if cleaned.lower() == "state":
+            cleaned = ""
+        return cleaned
+
+    def _scan_accounts(self) -> list[str]:
+        """扫描 SCRIPT_DIR 下所有 .auth_*.json，返回账号名称列表。"""
+        names: list[str] = []
+        for p in sorted(SCRIPT_DIR.glob(".auth_*.json")):
+            fn = p.name                     # .auth_作家A.json
+            if fn == ".auth_state.json":
+                continue
+            # 提取名称: 去掉 ".auth_" 前缀和 ".json" 后缀
+            name = fn[len(".auth_"):-len(".json")]
+            if name:
+                names.append(name)
+        return names
+
+    def _refresh_account_list(self):
+        """刷新 combobox 的账号列表，并恢复之前的选中项。"""
+        names = self._scan_accounts()
+        values = names + ["(新建)"]
+        self.cmb_account["values"] = values
+
+        current = self._gui_state.get("current_account", "")
+        if current and current in names:
+            self.cmb_account.set(current)
+        elif names:
+            # 当前账号不在列表中 — 不自动选中，留空
+            pass
+        # 如果没有任何命名账号且无 current，combobox 自然留空
+
+    def _on_account_selected(self, event=None):
+        """Combobox 选中事件。"""
+        selected = self.account_var.get()
+        if selected == "(新建)":
+            # 回退选中值（避免 combobox 停留在 "(新建)"）
+            prev = self._gui_state.get("current_account", "")
+            names = self._scan_accounts()
+            if prev and prev in names:
+                self.cmb_account.set(prev)
+            elif names:
+                self.cmb_account.set(names[0])
+            else:
+                self.cmb_account.set("")
+            # 触发登录流程
+            self._on_login()
+            return
+        # 跳过：已是当前账号
+        if selected == self._gui_state.get("current_account", ""):
+            return
+        # 切换到选中的账号
+        if selected:
+            self._switch_account(selected)
+
+    def _switch_account(self, name: str):
+        """切换到指定的命名账号: 复制 auth 文件 → 刷新浏览器 + 作品列表。"""
+        src = SCRIPT_DIR / f".auth_{name}.json"
+        if not src.exists():
+            messagebox.showerror("错误", f"账号文件不存在: {src.name}")
+            return
+        try:
+            shutil.copy2(str(src), str(AUTH_FILE))
+        except Exception as e:
+            messagebox.showerror("错误", f"切换账号失败: {e}")
+            return
+
+        self._gui_state["current_account"] = name
+        self._save_gui_state()
+        self._refresh_auth_status()
+
+        # 清缓存
+        self._last_publish_cache.clear()
+        self._platform_chapters_cache.clear()
+
+        # 刷新共享浏览器 + 作品列表
+        self._log(f"已切换到账号: {name}")
+        self.worker.submit(self._shared.refresh())
+        self._after(300, self._on_refresh_books)
 
     def _on_mode_change(self):
         mode = self.mode_var.get()
@@ -494,6 +601,7 @@ class FanqieGUI:
         ctrl_state = "disabled" if active else "normal"
         self.btn_books.configure(state=ctrl_state)
         self.cmb_book.configure(state="disabled" if active else "readonly")
+        self.cmb_account.configure(state="disabled" if active else "readonly")
         self.btn_open_manage.configure(state=ctrl_state)
 
     # -----------------------------------------------------------------------
@@ -520,8 +628,10 @@ class FanqieGUI:
 
         book_id = self.books[idx]["bookId"]
 
-        # 记住选择的作品（存到隐藏状态文件，不污染 config.json）
-        self._gui_state["last_book_id"] = book_id
+        # 记住选择的作品（按账号区分，存到隐藏状态文件）
+        acct = self._gui_state.get("current_account", "")
+        key = f"last_book_id_{acct}" if acct else "last_book_id"
+        self._gui_state[key] = book_id
         self._save_gui_state()
 
         # 修改模式: 走专用的章节列表获取（同时获取上次发布信息）
@@ -693,6 +803,29 @@ class FanqieGUI:
     # 登录
     # -----------------------------------------------------------------------
     def _on_login(self):
+        # 弹出对话框要求输入账号名称
+        raw = simpledialog.askstring(
+            "账号名称",
+            "请输入账号名称（如 作家A）：\n用于区分多个登录账号",
+            parent=self.root,
+        )
+        if not raw or not raw.strip():
+            return
+        name = self._sanitize_account_name(raw)
+        if not name:
+            messagebox.showerror("名称无效",
+                                 "账号名称包含非法字符或为保留名，请重新输入。")
+            return
+
+        # L2: 已存在同名账号时提示确认
+        named_path = SCRIPT_DIR / f".auth_{name}.json"
+        if named_path.exists():
+            if not messagebox.askyesno(
+                    "账号已存在",
+                    f"账号「{name}」已存在。\n继续将覆盖其登录状态，是否继续？"):
+                return
+
+        self._pending_account_name = name
         self._login_event = threading.Event()
 
         async def task():
@@ -708,6 +841,11 @@ class FanqieGUI:
                     await loop.run_in_executor(None, self._login_event.wait)
 
                     await save_auth(context)
+
+                    # 将活跃 auth 复制为命名文件
+                    named = SCRIPT_DIR / f".auth_{name}.json"
+                    shutil.copy2(str(AUTH_FILE), str(named))
+
                     await browser.close()
 
                 self._after(0, self._login_done, None)
@@ -726,11 +864,18 @@ class FanqieGUI:
         self._login_event.set()
 
     def _login_done(self, error):
-        self._refresh_auth_status()
+        name = getattr(self, "_pending_account_name", "")
+        self._pending_account_name = ""
         if error:
+            self._refresh_auth_status()
             self._log(f"登录失败: {error}")
         else:
-            self._log("登录状态已保存。")
+            if name:
+                self._gui_state["current_account"] = name
+                self._save_gui_state()
+            self._refresh_account_list()
+            self._refresh_auth_status()
+            self._log(f"登录状态已保存。账号: {name}" if name else "登录状态已保存。")
             # 刷新共享浏览器以加载新的登录状态
             self.worker.submit(self._shared.refresh())
             self._after(300, self._on_refresh_books)
@@ -782,8 +927,10 @@ class FanqieGUI:
             for b in books
         ]
         self.cmb_book["values"] = display
-        # 恢复上次选择的作品，找不到则默认第一部
-        last_id = self._gui_state.get("last_book_id", "")
+        # 恢复上次选择的作品（按账号区分），找不到则默认第一部
+        acct = self._gui_state.get("current_account", "")
+        key = f"last_book_id_{acct}" if acct else "last_book_id"
+        last_id = self._gui_state.get(key, "")
         target_idx = 0
         if last_id:
             for i, b in enumerate(books):
@@ -1118,6 +1265,16 @@ class FanqieGUI:
         self._set_uploading(False)
         self._last_publish_cache.clear()  # 上传后清除缓存，下次获取最新数据
         self._platform_chapters_cache.clear()
+
+        # 上传完成后将 .auth_state.json 回写到命名账号文件（保持 cookie 新鲜）
+        acct = self._gui_state.get("current_account", "")
+        if acct and AUTH_FILE.exists():
+            named = SCRIPT_DIR / f".auth_{acct}.json"
+            try:
+                shutil.copy2(str(AUTH_FILE), str(named))
+            except Exception:
+                pass
+
         if success >= 0:
             messagebox.showinfo("完成", f"成功: {success}  失败: {failed}")
 
