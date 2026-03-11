@@ -238,22 +238,54 @@ class FanqieGUI:
         self.btn_open_manage.pack(side="left", padx=(0, 6), pady=4)
 
         # --- 3. 章节目录 ---
-        frm = ttk.LabelFrame(self.root, text="章节目录")
-        frm.pack(fill="x", **pad)
+        frm_dir = ttk.LabelFrame(self.root, text="章节目录")
+        frm_dir.pack(fill="x", **pad)
+
+        row1 = ttk.Frame(frm_dir)
+        row1.pack(fill="x")
         self.dir_var = tk.StringVar()
         # 默认使用脚本目录下的 chapters/（不存在则自动创建）
         DEFAULT_CHAPTERS_DIR.mkdir(exist_ok=True)
         self.dir_var.set(str(DEFAULT_CHAPTERS_DIR))
-        ttk.Entry(frm, textvariable=self.dir_var, state="readonly").pack(
+        ttk.Entry(row1, textvariable=self.dir_var, state="readonly").pack(
             side="left", padx=6, pady=4, fill="x", expand=True)
-        ttk.Button(frm, text="浏览...", command=self._on_browse_dir).pack(
+        ttk.Button(row1, text="浏览...", command=self._on_browse_dir).pack(
             side="left", pady=4)
-        ttk.Button(frm, text="刷新", command=self._reload_chapters).pack(
+        ttk.Button(row1, text="刷新", command=self._reload_chapters).pack(
             side="left", padx=(4, 6), pady=4)
         self.unique_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            frm, text="自动去重标题", variable=self.unique_var,
+            row1, text="自动去重标题", variable=self.unique_var,
             command=self._reload_chapters).pack(side="left", padx=6)
+        self.filter_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row1, text="筛选修改日期",
+            variable=self.filter_var,
+            command=self._on_filter_toggle).pack(side="left", padx=6)
+
+        # 筛选选项行（勾选后展开）
+        row_filter = ttk.Frame(frm_dir)
+        self.filter_op_var = tk.StringVar(value="晚于")
+        self.cmb_filter_op = ttk.Combobox(
+            row_filter, textvariable=self.filter_op_var,
+            values=["早于", "晚于"], width=5, state="readonly")
+        self.cmb_filter_op.pack(side="left", padx=(6, 2))
+        self.cmb_filter_op.bind("<<ComboboxSelected>>",
+                                lambda _: self._reload_chapters())
+        self.filter_date_var = tk.StringVar(
+            value=datetime.now().strftime("%Y-%m-%d %H:%M"))
+        self.ent_filter_date = ttk.Entry(
+            row_filter, textvariable=self.filter_date_var, width=16)
+        self.ent_filter_date.pack(side="left", padx=2)
+        self.ent_filter_date.bind(
+            "<FocusOut>", lambda _: self._reload_chapters())
+        self.ent_filter_date.bind(
+            "<Return>", lambda _: self._reload_chapters())
+        ttk.Label(row_filter, text="(格式: 2025-01-01 08:00)",
+                  foreground="gray").pack(side="left", padx=2)
+        self.lbl_filter_info = ttk.Label(row_filter, text="", foreground="gray")
+        self.lbl_filter_info.pack(side="left", padx=6)
+        self._filter_row = row_filter
 
         # --- 4. 发布模式 ---
         frm_mode = ttk.LabelFrame(self.root, text="发布模式")
@@ -1042,6 +1074,14 @@ class FanqieGUI:
         self.dir_var.set(d)
         self._reload_chapters()
 
+    def _on_filter_toggle(self):
+        if self.filter_var.get():
+            self._filter_row.pack(fill="x", padx=6, pady=(0, 4))
+        else:
+            self._filter_row.pack_forget()
+            self.lbl_filter_info.configure(text="")
+        self._reload_chapters()
+
     def _reload_chapters(self):
         """从磁盘重新扫描并解析章节文件。仅在目录变更/用户点刷新时调用。"""
         dir_path = self.dir_var.get()
@@ -1058,6 +1098,41 @@ class FanqieGUI:
         if not self.files:
             self.parsed_chapters = []
             self._set_preview("目录中没有 .md/.txt 文件")
+            return
+
+        # 按修改日期筛选
+        if self.filter_var.get():
+            raw = self.filter_date_var.get().strip()
+            try:
+                # 支持 "2025-01-01 08:00" 或 "2025-01-01"
+                for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                    try:
+                        cutoff = datetime.strptime(raw, fmt)
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    raise ValueError("bad format")
+                op = self.filter_op_var.get()
+                total = len(self.files)
+                if op == "早于":
+                    self.files = [
+                        f for f in self.files
+                        if datetime.fromtimestamp(f.stat().st_mtime) < cutoff]
+                else:
+                    self.files = [
+                        f for f in self.files
+                        if datetime.fromtimestamp(f.stat().st_mtime) >= cutoff]
+                self.lbl_filter_info.configure(
+                    text=f"(筛选: {len(self.files)}/{total} 个文件)",
+                    foreground="gray")
+            except ValueError:
+                self.lbl_filter_info.configure(
+                    text="(日期格式错误)", foreground="red")
+
+        if not self.files:
+            self.parsed_chapters = []
+            self._set_preview("没有符合筛选条件的文件")
             return
 
         self.parsed_chapters = [parse_md_file(f) for f in self.files]
