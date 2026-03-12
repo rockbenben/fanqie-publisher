@@ -1202,7 +1202,6 @@ class FanqieGUI:
         lines = []
         matched_count = 0
         total_words = 0
-        self._matched_edit = []
 
         if platform_chapters:
             matched, unmatched = match_chapters(
@@ -1224,6 +1223,10 @@ class FanqieGUI:
                 lines.append(
                     f"  {i+1:3d}. {num_str} {title}  ({wc}字)  {status}")
         else:
+            self._matched_edit = []
+            # 缓存为空但有有效作品: 自动重新获取平台章节
+            if book_id and book_id not in self._platform_chapters_cache:
+                self._fetch_platform_chapters_for_edit()
             for i, (num, title, content) in enumerate(self.parsed_chapters):
                 wc = len(strip_md_formatting(content))
                 total_words += wc
