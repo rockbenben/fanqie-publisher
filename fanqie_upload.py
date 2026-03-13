@@ -26,6 +26,8 @@ import sys
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
+import logging
+from logging.handlers import RotatingFileHandler
 
 try:
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -65,6 +67,29 @@ DEFAULT_CONFIG = {
 
 # 平台修饰键 (macOS = Meta/Cmd, 其他 = Control)
 _MOD_KEY = "Meta" if sys.platform == "darwin" else "Control"
+_browser_timeout = DEFAULT_CONFIG["browser_timeout"]  # 模块级超时(ms)
+
+
+LOG_FILE = SCRIPT_DIR / "fanqie_error.log"
+
+logger = logging.getLogger("fanqie")
+
+
+def setup_logging(log_file=None, level=logging.INFO):
+    """初始化日志: 控制台 + 可选的滚动文件日志。"""
+    if logger.handlers:
+        return
+    logger.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    if log_file:
+        fh = RotatingFileHandler(
+            str(log_file), maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        fh.setLevel(logging.INFO)
+        logger.addHandler(fh)
 
 
 class DailyLimitReached(RuntimeError):
@@ -87,13 +112,19 @@ async def _check_daily_limit(page):
 # 配置管理
 # ---------------------------------------------------------------------------
 def load_config() -> dict:
+    global _browser_timeout
     cfg = DEFAULT_CONFIG.copy()
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg.update(json.load(f))
         except (json.JSONDecodeError, ValueError):
-            print(f"⚠ config.json 格式错误，使用默认配置")
+            logger.warning("config.json 格式错误，使用默认配置")
+    val = cfg.get("browser_timeout", DEFAULT_CONFIG["browser_timeout"])
+    if not isinstance(val, (int, float)) or val <= 0:
+        logger.warning(f"browser_timeout 无效({val})，使用默认值 {DEFAULT_CONFIG['browser_timeout']}")
+        val = DEFAULT_CONFIG["browser_timeout"]
+    _browser_timeout = int(val)
     return cfg
 
 
@@ -135,23 +166,24 @@ def _extract_chapter_num(text: str) -> str | None:
     """
     从文本中提取章节号（纯数字字符串）。
 
-    支持格式:
-        "001_标题"           -> "001"
+    支持格式（前导零自动去除）:
+        "001_标题"           -> "1"
+        "046_标题"           -> "46"
         "第27章_标题"        -> "27"
         "第 27 章 标题"      -> "27"
         "第十六章 发布会"    -> "16"
         "第一百二十三章 标题" -> "123"
-        "chapter-027"        -> "027"
+        "chapter-027"        -> "27"
         "Chapter 3 - Title"  -> "3"
     """
     # 1) 纯数字开头: 001_xxx, 027 xxx
     m = re.match(r"^(\d+)", text)
     if m:
-        return m.group(1)
+        return str(int(m.group(1)))
     # 2) 第X章 - 阿拉伯数字: 第27章, 第 27 章
     m = re.match(r"^第\s*(\d+)\s*章", text)
     if m:
-        return m.group(1)
+        return str(int(m.group(1)))
     # 3) 第X章 - 中文数字: 第十六章, 第一百二十三章
     m = re.match(r"^第([零〇一二两三四五六七八九十百千]+)章", text)
     if m:
@@ -161,7 +193,7 @@ def _extract_chapter_num(text: str) -> str | None:
     # 4) chapter-027, Chapter 3
     m = re.match(r"^chapter[_\-\s]*(\d+)", text, re.IGNORECASE)
     if m:
-        return m.group(1)
+        return str(int(m.group(1)))
     return None
 
 
@@ -207,7 +239,7 @@ def parse_md_file(fp: Path) -> tuple:
     except UnicodeDecodeError:
         text = fp.read_text(encoding="gbk", errors="replace").strip()
         if "\ufffd" in text:
-            print(f"  ⚠ {fp.name}: 编码异常，部分内容可能损坏")
+            logger.warning(f"{fp.name}: 编码异常，部分内容可能损坏")
     lines = text.split("\n")
 
     heading = None      # 原始 # 标题
@@ -370,8 +402,10 @@ async def dismiss_overlays(page):
         pass
 
 
-async def wait_for_editor_ready(page, timeout=15000):
+async def wait_for_editor_ready(page, timeout=None):
     """等待章节编辑器加载完成。"""
+    if timeout is None:
+        timeout = _browser_timeout
     await page.wait_for_load_state("networkidle", timeout=timeout)
     # 等待 ProseMirror 编辑器出现
     await page.wait_for_selector(".ProseMirror", timeout=timeout)
@@ -460,7 +494,7 @@ async def fill_chapter(page, chapter_num: str | None, title: str, content: str):
         if wc > 0:
             break
     if wc > 0:
-        print(f"    正文字数 {wc}")
+        logger.info(f"    正文字数 {wc}")
     else:
         raise RuntimeError("正文粘贴失败 (字数=0)，请重试")
 
@@ -473,7 +507,7 @@ async def save_draft(page):
     await save_btn.first.click()
     # 等待 "已保存" 出现
     try:
-        await page.wait_for_selector("text=已保存", timeout=10000)
+        await page.wait_for_selector("text=已保存", timeout=_browser_timeout)
     except PWTimeout:
         pass
     await page.wait_for_timeout(1000)
@@ -597,11 +631,14 @@ LAST_PUBLISH_JS = r"""() => {
 # ---------------------------------------------------------------------------
 # 章节列表提取（修改模式用）— 单次 JS 调用完成全部翻页
 # ---------------------------------------------------------------------------
-_EXTRACT_ALL_JS = r"""async () => {
+_EXTRACT_ALL_JS = r"""async (opts) => {
+    const WAIT_TIMEOUT = (opts && opts.waitTimeout) || 10000;
+    const MAX_TIME = (opts && opts.maxTime) || 120000;
+
     // 等待表格出现
     const t0 = Date.now();
     while (!document.querySelector('tr td')) {
-        if (Date.now() - t0 > 10000) break;
+        if (Date.now() - t0 > WAIT_TIMEOUT) break;
         await new Promise(r => requestAnimationFrame(r));
     }
 
@@ -621,7 +658,6 @@ _EXTRACT_ALL_JS = r"""async () => {
         if (!isNaN(n) && n > totalPages) totalPages = n;
     }
 
-    const MAX_TIME = 120000;
     const start = Date.now();
 
     for (let i = 0; i < 500 && Date.now() - start < MAX_TIME; i++) {
@@ -655,7 +691,16 @@ _EXTRACT_ALL_JS = r"""async () => {
             if (seenKeys.has(key)) continue;
             seenKeys.add(key);
 
-            allChapters.push({ title, chapterNum, editUrl, rowIndex: allChapters.length });
+            // 审核状态（待发布/已发布/审核中 等）
+            let status = '';
+            for (let ci = 1; ci < cells.length; ci++) {
+                const ct = cells[ci].textContent.trim();
+                if (/待发布|已发布|审核中|草稿|已拒绝/.test(ct)) {
+                    status = ct; break;
+                }
+            }
+
+            allChapters.push({ title, chapterNum, editUrl, status, rowIndex: allChapters.length });
             newCount++;
 
             // 发布日期
@@ -713,16 +758,20 @@ async def extract_chapters_from_page(
     返回 (chapters, last_publish_info)。
     last_publish_info: {date, time, chapter} 或 None。
     """
-    result = await page.evaluate(_EXTRACT_ALL_JS)
+    result = await page.evaluate(
+        _EXTRACT_ALL_JS,
+        # maxTime = 8x: 自动翻页可能需要遍历多页，总时长需大于单页超时
+        {"waitTimeout": _browser_timeout, "maxTime": _browser_timeout * 8},
+    )
     chapters = result.get("chapters", [])
     total_pages = result.get("totalPages", 0)
     page_count = result.get("pageCount", 0)
     last_pub = result.get("lastPublish")
 
     if total_pages:
-        print(f"  共 {page_count}/{total_pages} 页, {len(chapters)} 个章节")
+        logger.info(f"  共 {page_count}/{total_pages} 页, {len(chapters)} 个章节")
     elif chapters:
-        print(f"  共 {page_count} 页, {len(chapters)} 个章节")
+        logger.info(f"  共 {page_count} 页, {len(chapters)} 个章节")
 
     return chapters, last_pub
 
@@ -893,7 +942,7 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
         await page.wait_for_timeout(1000)
 
     # 兜底: 等发布设置出现
-    await page.wait_for_selector("text=发布设置", timeout=10000)
+    await page.wait_for_selector("text=发布设置", timeout=_browser_timeout)
 
     # --- 到达发布设置后，应用选项 ---
     await _apply_publish_options(page, use_ai=use_ai)
@@ -969,10 +1018,10 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
         }
         return 'not_found';
     }""")
-    print(f"    定时发布开关: {switched}")
+    logger.info(f"    定时发布开关: {switched}")
     # 等待日期输入框出现
     try:
-        await page.wait_for_selector("input[placeholder='请选择日期']", timeout=5000)
+        await page.wait_for_selector("input[placeholder='请选择日期']", timeout=_browser_timeout)
     except PWTimeout:
         pass
     await page.wait_for_timeout(300)
@@ -981,7 +1030,7 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
     #    键盘方式: 点击输入框 -> 全选 -> 输入日期 -> Enter 确认
     date_input = page.locator("input[placeholder='请选择日期']")
     if await date_input.count() == 0:
-        print("  ⚠ 未找到日期输入框，定时发布日期可能不正确")
+        logger.warning("未找到日期输入框，定时发布日期可能不正确")
     else:
         await date_input.click()
         await page.wait_for_timeout(300)
@@ -996,7 +1045,7 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
     # 4. 填写时间 (Arco TimePicker)
     time_input = page.locator("input[placeholder='请选择时间']")
     if await time_input.count() == 0:
-        print("  ⚠ 未找到时间输入框，定时发布时间可能不正确")
+        logger.warning("未找到时间输入框，定时发布时间可能不正确")
     else:
         await time_input.click()
         await page.wait_for_timeout(300)
@@ -1022,23 +1071,23 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
 # 命令: login
 # ---------------------------------------------------------------------------
 async def cmd_login():
-    print("正在打开浏览器，请在网页中完成登录...")
+    logger.info("正在打开浏览器，请在网页中完成登录...")
     async with async_playwright() as p:
         browser, context = await create_context(p, headless=False)
         page = await context.new_page()
         await page.goto(ZONE_URL)
         await page.wait_for_load_state("networkidle")
 
-        print()
-        print("=" * 50)
-        print("  请在浏览器中登录番茄作家账号")
-        print("  登录成功后回到此处按 Enter 保存会话")
-        print("=" * 50)
+        logger.info("")
+        logger.info("=" * 50)
+        logger.info("  请在浏览器中登录番茄作家账号")
+        logger.info("  登录成功后回到此处按 Enter 保存会话")
+        logger.info("=" * 50)
         await asyncio.get_running_loop().run_in_executor(None, input)
 
         await save_auth(context)
         await browser.close()
-        print("登录状态已保存。")
+        logger.info("登录状态已保存。")
 
 
 # ---------------------------------------------------------------------------
@@ -1046,7 +1095,7 @@ async def cmd_login():
 # ---------------------------------------------------------------------------
 async def cmd_books():
     if not AUTH_FILE.exists():
-        print("请先运行 login 命令登录。")
+        logger.warning("请先运行 login 命令登录。")
         return
 
     async with async_playwright() as p:
@@ -1059,19 +1108,19 @@ async def cmd_books():
 
         books = await page.evaluate(BOOKS_JS)
 
-        print()
+        logger.info("")
         if not books:
-            print("未找到作品，请检查登录状态 (重新运行 login)")
+            logger.error("未找到作品，请检查登录状态 (重新运行 login)")
         else:
-            print(f"找到 {len(books)} 部作品:")
-            print("-" * 60)
+            logger.info(f"找到 {len(books)} 部作品:")
+            logger.info("-" * 60)
             for i, b in enumerate(books):
-                print(f"  {i+1}. {b['name']}")
-                print(f"     ID: {b['bookId']}")
-                print(f"     {b['chapters']}章 | {b['words']}字 | {b['status']}")
-                print()
-            print("-" * 60)
-            print("上传时使用:  python fanqie_upload.py upload <目录> --book-id <ID>")
+                logger.info(f"  {i+1}. {b['name']}")
+                logger.info(f"     ID: {b['bookId']}")
+                logger.info(f"     {b['chapters']}章 | {b['words']}字 | {b['status']}")
+                logger.info("")
+            logger.info("-" * 60)
+            logger.info("上传时使用:  python fanqie_upload.py upload <目录> --book-id <ID>")
 
         await save_auth(context)
         await browser.close()
@@ -1082,7 +1131,7 @@ async def cmd_books():
 # ---------------------------------------------------------------------------
 async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
     if not AUTH_FILE.exists():
-        print("请先运行 login 命令登录。")
+        logger.warning("请先运行 login 命令登录。")
         return
 
     cfg = load_config()
@@ -1097,12 +1146,12 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
     use_ai = getattr(args, "use_ai", False)
 
     if not directory.is_dir():
-        print(f"目录不存在: {directory}")
+        logger.error(f"目录不存在: {directory}")
         return
 
     files = get_md_files(directory)
     if not files:
-        print(f"在 {directory} 中没有找到 .md/.txt 文件")
+        logger.warning(f"在 {directory} 中没有找到 .md/.txt 文件")
         return
 
     # 解析所有文件
@@ -1113,18 +1162,18 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
     dup_titles = {t: c for t, c in title_counts.items() if c > 1}
 
     if dup_titles:
-        print("\n⚠ 检测到重复标题 (番茄作家不允许同名章节):")
+        logger.warning("检测到重复标题 (番茄作家不允许同名章节):")
         for t, c in dup_titles.items():
             indices = [
                 i + 1 for i, (_, title, _) in enumerate(parsed) if title == t
             ]
-            print(f'  "{t}" × {c} 次  (第 {", ".join(map(str, indices))} 章)')
+            logger.info(f'  "{t}" × {c} 次  (第 {", ".join(map(str, indices))} 章)')
 
         if unique_titles:
             parsed = deduplicate_titles(parsed)
-            print("  -> 已自动追加章节号后缀去重")
+            logger.info("  -> 已自动追加章节号后缀去重")
         else:
-            print("  提示: 使用 --unique-titles 可自动追加章节号去重")
+            logger.info("  提示: 使用 --unique-titles 可自动追加章节号去重")
 
     # 计算排期
     schedule = None
@@ -1132,7 +1181,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         try:
             datetime.strptime(schedule_date, "%Y-%m-%d")
         except ValueError:
-            print(f"日期格式错误: {schedule_date}  (应为 YYYY-MM-DD)")
+            logger.error(f"日期格式错误: {schedule_date}  (应为 YYYY-MM-DD)")
             return
         schedule = compute_schedule(len(parsed), schedule_date, schedule_time, per_day)
 
@@ -1147,29 +1196,29 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         mode_str = "存草稿"
 
     # 预览文件列表
-    print(f"\n找到 {len(files)} 个 MD 文件:")
-    print("-" * 60)
+    logger.info(f"找到 {len(files)} 个 MD 文件:")
+    logger.info("-" * 60)
     total_words = 0
     for i, (num, title, content) in enumerate(parsed):
         wc = len(strip_md_formatting(content))
         total_words += wc
         num_str = f"第{num}章" if num else "   ?  "
         sched_str = f"  [{schedule[i][0]} {schedule[i][1]}]" if schedule else ""
-        print(f"  {i+1:3d}. {num_str} {title}  ({wc} 字){sched_str}")
-    print("-" * 60)
-    print(f"总计: {len(files)} 章, {total_words} 字")
-    print(f"目标: Book ID {book_id}")
-    print(f"模式: {mode_str}")
+        logger.info(f"  {i+1:3d}. {num_str} {title}  ({wc} 字){sched_str}")
+    logger.info("-" * 60)
+    logger.info(f"总计: {len(files)} 章, {total_words} 字")
+    logger.info(f"目标: Book ID {book_id}")
+    logger.info(f"模式: {mode_str}")
     if schedule:
         last_date = schedule[-1][0]
         total_days = (datetime.strptime(last_date, "%Y-%m-%d")
                       - datetime.strptime(schedule_date, "%Y-%m-%d")).days + 1
-        print(f"排期: {schedule_date} ~ {last_date} ({total_days} 天)")
-    print()
+        logger.info(f"排期: {schedule_date} ~ {last_date} ({total_days} 天)")
+    logger.info("")
 
     confirm = input("确认上传? (y/N): ").strip().lower()
     if confirm != "y":
-        print("已取消。")
+        logger.info("已取消。")
         return
 
     # 构造新建章节 URL（直接导航即可创建，无需点按钮）
@@ -1182,11 +1231,11 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         # 先验证登录态：打开新建章节页看是否能进入编辑器
         await page.goto(new_chapter_url)
         try:
-            await wait_for_editor_ready(page, timeout=20000)
+            await wait_for_editor_ready(page)
         except PWTimeout:
-            print("无法进入编辑器，请检查:")
-            print("  1. Book ID 是否正确")
-            print("  2. 登录状态是否有效 (重新运行 login)")
+            logger.error("无法进入编辑器，请检查:")
+            logger.info("  1. Book ID 是否正确")
+            logger.info("  2. 登录状态是否有效 (重新运行 login)")
             await page.screenshot(path=str(SCRIPT_DIR / "error_navigate.png"))
             await browser.close()
             return
@@ -1199,7 +1248,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
             chapter_num, title, content = parsed[i]
             num_str = f"第{chapter_num}章 " if chapter_num else ""
             sched_info = f" -> {schedule[i][0]} {schedule[i][1]}" if schedule else ""
-            print(f"\n[{i+1}/{len(files)}] {num_str}{title}{sched_info}")
+            logger.info(f"[{i+1}/{len(files)}] {num_str}{title}{sched_info}")
 
             ok = False
             daily_limit = False
@@ -1215,7 +1264,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                     if schedule:
                         date_str, time_str = schedule[i]
                         await publish_scheduled(page, date_str, time_str, use_ai=use_ai)
-                        print(f"  -> 定时发布 {date_str} {time_str}")
+                        logger.info(f"  -> 定时发布 {date_str} {time_str}")
                     elif publish:
                         await _navigate_to_publish_settings(page, use_ai=use_ai)
                         confirm_btn = page.locator("button", has_text="确认发布")
@@ -1224,29 +1273,29 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                         await confirm_btn.first.click()
                         await page.wait_for_timeout(2000)
                         await _check_daily_limit(page)
-                        print(f"  -> 已发布")
+                        logger.info(f"  -> 已发布")
                     else:
                         await save_draft(page)
-                        print(f"  -> 已存草稿")
+                        logger.info(f"  -> 已存草稿")
 
                     ok = True
                     break
 
                 except DailyLimitReached as e:
-                    print(f"\n⚠ {e}")
+                    logger.warning(f"{e}")
                     daily_limit = True
                     break
 
                 except Exception as e:
                     if attempt <= max_retries:
-                        print(f"  !! 第{attempt}次失败: {e}，重试中...")
+                        logger.warning(f"第{attempt}次失败: {e}，重试中...")
                         await page.wait_for_timeout(2000)
                     else:
-                        print(f"  !! 失败: {e}")
+                        logger.error(f"失败: {e}")
                         try:
                             err_path = SCRIPT_DIR / f"error_{i}_{file.stem}.png"
                             await page.screenshot(path=str(err_path))
-                            print(f"  截图: {err_path}")
+                            logger.error(f"截图: {err_path}")
                         except Exception:
                             pass
 
@@ -1265,11 +1314,11 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         await save_auth(context)
         await browser.close()
 
-        print()
-        print("=" * 40)
-        print(f"  上传完成!")
-        print(f"  成功: {success}  失败: {failed}")
-        print("=" * 40)
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info(f"  上传完成!")
+        logger.info(f"  成功: {success}  失败: {failed}")
+        logger.info("=" * 40)
 
 
 # ---------------------------------------------------------------------------
@@ -1298,23 +1347,241 @@ async def edit_one_chapter(
             await confirm_btn.first.click()
             await page.wait_for_timeout(2000)
             await _check_daily_limit(page)
-            print("  -> 已保存修改")
+            logger.info("  -> 已保存修改")
             return True
         except DailyLimitReached:
             raise
         except Exception as e:
             if attempt <= max_retries:
-                print(f"  !! 第{attempt}次失败: {e}，重试中...")
+                logger.warning(f"第{attempt}次失败: {e}，重试中...")
                 await page.wait_for_timeout(2000)
             else:
-                print(f"  !! 失败: {e}")
+                logger.error(f"失败: {e}")
                 try:
                     err_path = SCRIPT_DIR / f"error_edit_{ch_num}.png"
                     await page.screenshot(path=str(err_path))
-                    print(f"  截图: {err_path}")
+                    logger.error(f"截图: {err_path}")
                 except Exception:
                     pass
     return False
+
+
+async def reschedule_on_manage_page(
+    page,
+    book_id: str,
+    schedule_map: dict[str, tuple[str, str]],
+    *,
+    max_retries: int = 2,
+    delay: float = 1,
+    cancel_check=None,
+    progress_cb=None,
+) -> tuple[int, int]:
+    """在章节管理页上批量修改待发布章节的定时发布设置。
+
+    schedule_map: {章节标题: (date_str, time_str), ...}
+    cancel_check: 返回 True 时中止
+    progress_cb:  (done, total) 回调
+    返回 (success, failed)。
+    """
+    total = len(schedule_map)
+    success = 0
+    failed = 0
+    remaining = dict(schedule_map)  # 未处理的
+
+    chapter_manage_url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
+    await page.goto(chapter_manage_url)
+    await page.wait_for_load_state("networkidle")
+
+    # 等待表格出现
+    try:
+        await page.wait_for_selector("tr td", timeout=_browser_timeout)
+    except Exception:
+        logger.error("章节管理页表格未加载")
+        return 0, total
+
+    # 首次扫描: 诊断行结构，找出时钟图标的选择器
+    icon_selector = await page.evaluate(r"""() => {
+        // 遍历数据行，找到第一个中间列里的可点击元素
+        for (const row of document.querySelectorAll('tr')) {
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 3) continue;
+            // 跳过首列(标题)和末列(操作)
+            for (let i = 1; i < cells.length - 1; i++) {
+                const cell = cells[i];
+                // 按优先级尝试各种图标元素
+                const el = cell.querySelector('svg')
+                    || cell.querySelector('i[class]')
+                    || cell.querySelector('span[class*="icon"]')
+                    || cell.querySelector('button')
+                    || cell.querySelector('[role="button"]')
+                    || cell.querySelector('[role="img"]');
+                if (el) {
+                    const tag = el.tagName.toLowerCase();
+                    const cls = el.className || '';
+                    // 返回可复用的选择器信息
+                    if (tag === 'svg') return 'svg';
+                    if (tag === 'i' && cls) return 'i.' + cls.split(' ')[0];
+                    if (cls) return tag + '.' + cls.split(' ')[0];
+                    return tag;
+                }
+            }
+        }
+        return null;
+    }""")
+    logger.debug(f"  时钟图标元素: {icon_selector or '未检测到'}")
+
+    page_num = 0
+    while remaining:
+        page_num += 1
+        if cancel_check and cancel_check():
+            logger.info("用户取消修改定时。")
+            break
+
+        # 扫描当前页所有行的标题
+        page_titles = await page.evaluate(r"""() => {
+            const result = [];
+            for (const row of document.querySelectorAll('tr')) {
+                const cells = row.querySelectorAll('td');
+                if (cells.length < 3) continue;
+                const title = cells[0].textContent.trim();
+                if (title) result.push(title);
+            }
+            return result;
+        }""")
+
+        matched_on_page = [t for t in page_titles if t in remaining]
+
+        for title in matched_on_page:
+            if cancel_check and cancel_check():
+                logger.info("用户取消修改定时。")
+                break
+
+            date_str, time_str = remaining[title]
+            logger.info(f"[{success + failed + 1}/{total}] {title} -> {date_str} {time_str}")
+
+            ok = False
+            for attempt in range(1, max_retries + 2):
+                try:
+                    # 点击时钟图标: 在匹配行的中间列中查找可点击元素
+                    clicked = await page.evaluate(r"""(targetTitle) => {
+                        for (const row of document.querySelectorAll('tr')) {
+                            const cells = row.querySelectorAll('td');
+                            if (cells.length < 3) continue;
+                            if (cells[0].textContent.trim() !== targetTitle)
+                                continue;
+                            // 跳过首列和末列，在中间列中查找图标
+                            for (let i = 1; i < cells.length - 1; i++) {
+                                const cell = cells[i];
+                                const el = cell.querySelector('svg')
+                                    || cell.querySelector('i[class]')
+                                    || cell.querySelector('span[class*="icon"]')
+                                    || cell.querySelector('button')
+                                    || cell.querySelector('[role="button"]')
+                                    || cell.querySelector('[role="img"]');
+                                if (el) { el.click(); return true; }
+                            }
+                            return false;
+                        }
+                        return false;
+                    }""", title)
+
+                    if not clicked:
+                        raise RuntimeError("未找到时钟图标")
+
+                    # 等待"修改定时"对话框出现
+                    confirm_btn = page.locator(
+                        "button", has_text="确认修改")
+                    await confirm_btn.wait_for(timeout=_browser_timeout)
+                    await page.wait_for_timeout(300)
+
+                    # 填写日期
+                    date_input = page.locator(
+                        "input[placeholder='请选择日期']")
+                    await date_input.click()
+                    await page.wait_for_timeout(200)
+                    await page.keyboard.press(f"{_MOD_KEY}+a")
+                    await page.keyboard.type(date_str, delay=50)
+                    await page.keyboard.press("Enter")
+                    await page.wait_for_timeout(500)
+
+                    # 填写时间（点击时间输入框会自动关闭日期面板）
+                    time_input = page.locator(
+                        "input[placeholder='请选择时间']")
+                    await time_input.click()
+                    await page.wait_for_timeout(200)
+                    await page.keyboard.press(f"{_MOD_KEY}+a")
+                    await page.keyboard.type(time_str, delay=50)
+                    await page.keyboard.press("Enter")
+                    await page.wait_for_timeout(500)
+
+                    # 点击"确认修改"
+                    await confirm_btn.click()
+                    await page.wait_for_timeout(1000)
+
+                    logger.info(f"  -> 已修改定时 {date_str} {time_str}")
+                    ok = True
+                    break
+
+                except Exception as e:
+                    # 尝试关闭可能残留的弹窗
+                    try:
+                        await page.keyboard.press("Escape")
+                        await page.wait_for_timeout(300)
+                    except Exception:
+                        pass
+                    if attempt <= max_retries:
+                        logger.warning(f"第{attempt}次失败: {e}，重试中...")
+                        await page.wait_for_timeout(1000)
+                    else:
+                        logger.error(f"失败: {e}")
+                        try:
+                            err_path = SCRIPT_DIR / f"error_resched_{title[:20]}.png"
+                            await page.screenshot(path=str(err_path))
+                            logger.error(f"截图: {err_path}")
+                        except Exception:
+                            pass
+
+            if ok:
+                success += 1
+            else:
+                failed += 1
+            del remaining[title]
+
+            if progress_cb:
+                progress_cb(success + failed, total)
+
+            if delay > 0 and remaining:
+                await page.wait_for_timeout(int(delay * 1000))
+
+        # cancel_check 在内部 break 后也需要退出外层
+        if cancel_check and cancel_check():
+            break
+
+        if not remaining:
+            break
+
+        # 翻页
+        next_btn = page.locator(
+            "li.arco-pagination-item-next:not(.arco-pagination-item-disabled)")
+        if await next_btn.count() == 0:
+            break
+        first_title = await page.evaluate(
+            "() => document.querySelector('tr td')?.textContent?.trim() || ''")
+        await next_btn.click()
+        # 等待表格内容变化
+        for _ in range(30):
+            await page.wait_for_timeout(300)
+            cur = await page.evaluate(
+                "() => document.querySelector('tr td')?.textContent?.trim() || ''")
+            if cur and cur != first_title:
+                break
+
+    if remaining:
+        for title in remaining:
+            logger.error(f"未处理: {title}")
+        failed += len(remaining)
+
+    return success, failed
 
 
 # ---------------------------------------------------------------------------
@@ -1323,7 +1590,7 @@ async def edit_one_chapter(
 async def cmd_edit(directory: Path, book_id: str, args):
     """按章节号匹配并修改已有章节内容。"""
     if not AUTH_FILE.exists():
-        print("请先运行 login 命令登录。")
+        logger.warning("请先运行 login 命令登录。")
         return
 
     cfg = load_config()
@@ -1333,12 +1600,12 @@ async def cmd_edit(directory: Path, book_id: str, args):
     use_ai = getattr(args, "use_ai", False)
 
     if not directory.is_dir():
-        print(f"目录不存在: {directory}")
+        logger.error(f"目录不存在: {directory}")
         return
 
     files = get_md_files(directory)
     if not files:
-        print(f"在 {directory} 中没有找到 .md/.txt 文件")
+        logger.warning(f"在 {directory} 中没有找到 .md/.txt 文件")
         return
 
     parsed = [parse_md_file(f) for f in files]
@@ -1346,7 +1613,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
         parsed = deduplicate_titles(parsed)
 
     # 获取平台章节列表
-    print("正在获取平台章节列表...")
+    logger.info("正在获取平台章节列表...")
     chapter_manage_url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
 
     async with async_playwright() as p:
@@ -1359,41 +1626,41 @@ async def cmd_edit(directory: Path, book_id: str, args):
         platform_chapters, _ = await extract_chapters_from_page(page, book_id)
 
         if not platform_chapters:
-            print("未在平台找到章节。请检查 Book ID 和登录状态。")
+            logger.warning("未在平台找到章节。请检查 Book ID 和登录状态。")
             await browser.close()
             return
 
-        print(f"平台共有 {len(platform_chapters)} 个章节。")
+        logger.info(f"平台共有 {len(platform_chapters)} 个章节。")
 
         # 匹配
         matched, unmatched = match_chapters(parsed, platform_chapters)
 
         if not matched:
-            print("没有匹配到任何章节！请检查本地文件是否包含章节号。")
+            logger.warning("没有匹配到任何章节！请检查本地文件是否包含章节号。")
             await browser.close()
             return
 
         # 预览
-        print(f"\n匹配到 {len(matched)} 个章节:")
-        print("-" * 60)
+        logger.info(f"匹配到 {len(matched)} 个章节:")
+        logger.info("-" * 60)
         total_words = 0
         for local_idx, plat_ch, ch_num, title, content in matched:
             wc = len(strip_md_formatting(content))
             total_words += wc
-            print(f"  第{ch_num}章 {title} ({wc}字) -> {plat_ch['title']}")
-        print("-" * 60)
-        print(f"总计: {len(matched)} 章, {total_words} 字")
+            logger.info(f"  第{ch_num}章 {title} ({wc}字) -> {plat_ch['title']}")
+        logger.info("-" * 60)
+        logger.info(f"总计: {len(matched)} 章, {total_words} 字")
 
         if unmatched:
-            print(f"\n未匹配 (跳过) {len(unmatched)} 个本地文件:")
+            logger.warning(f"未匹配 (跳过) {len(unmatched)} 个本地文件:")
             for local_idx, ch_num, title in unmatched:
                 reason = "无章节号" if ch_num is None else "平台无此章"
-                print(f"  {title} ({reason})")
+                logger.info(f"  {title} ({reason})")
 
-        print()
+        logger.info("")
         confirm = input("确认修改? (y/N): ").strip().lower()
         if confirm != "y":
-            print("已取消。")
+            logger.info("已取消。")
             await browser.close()
             return
 
@@ -1403,11 +1670,11 @@ async def cmd_edit(directory: Path, book_id: str, args):
         total = len(matched)
 
         for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched):
-            print(f"\n[{i+1}/{total}] 修改第{ch_num}章 {title}")
+            logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
 
             edit_url = plat_ch.get("editUrl")
             if not edit_url:
-                print("  !! 无法获取编辑链接，跳过")
+                logger.error("无法获取编辑链接，跳过")
                 failed += 1
                 continue
 
@@ -1422,7 +1689,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
                 else:
                     failed += 1
             except DailyLimitReached as e:
-                print(f"\n⚠ {e}")
+                logger.warning(f"{e}")
                 failed += 1
                 break
 
@@ -1432,10 +1699,10 @@ async def cmd_edit(directory: Path, book_id: str, args):
         await save_auth(context)
         await browser.close()
 
-        print()
-        print("=" * 40)
-        print(f"  修改完成! 成功: {success}  失败: {failed}")
-        print("=" * 40)
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info(f"  修改完成! 成功: {success}  失败: {failed}")
+        logger.info("=" * 40)
 
 
 # ---------------------------------------------------------------------------
@@ -1507,6 +1774,7 @@ def main():
     )
 
     args = parser.parse_args()
+    setup_logging(LOG_FILE)
 
     if args.command == "login":
         asyncio.run(cmd_login())

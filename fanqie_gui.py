@@ -29,9 +29,11 @@ try:
         wait_for_editor_ready, fill_chapter,
         save_draft, publish_scheduled, _navigate_to_publish_settings,
         extract_chapters_from_page, match_chapters, edit_one_chapter,
+        reschedule_on_manage_page,
         AUTH_FILE, BASE_URL, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
         CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL, CONFIG_FILE, GUI_STATE_FILE,
         BOOKS_JS, LAST_PUBLISH_JS,
+        logger, setup_logging, LOG_FILE as UPLOAD_LOG_FILE, _browser_timeout,
     )
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 except ImportError as e:
@@ -49,7 +51,6 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 CHAPTER_MANAGE_URL = CHAPTER_MANAGE_URL_TPL
 DEFAULT_CHAPTERS_DIR = SCRIPT_DIR / "chapters"
-LOG_FILE = SCRIPT_DIR / "fanqie_error.log"
 
 # 高 DPI 支持 (Windows)
 if sys.platform == "win32":
@@ -61,22 +62,24 @@ if sys.platform == "win32":
 
 
 # ---------------------------------------------------------------------------
-# Stdout 重定向 — 捕获 print() 到 GUI 日志
+# 日志 Handler — 将 logger 输出写入 GUI 日志面板
 # ---------------------------------------------------------------------------
-class StdoutRedirector:
+class TextHandler(logging.Handler):
+    """将日志消息线程安全地追加到 Tkinter ScrolledText 控件。"""
+
     def __init__(self, widget, root):
+        super().__init__()
         self._widget = widget
         self._root = root
-        self._original = sys.stdout
 
-    def write(self, text):
-        if self._original:
-            self._original.write(text)
-        if text:
-            try:
-                self._root.after(0, self._append, text)
-            except tk.TclError:
-                pass
+    def emit(self, record):
+        msg = self.format(record)
+        if not msg.endswith("\n"):
+            msg += "\n"
+        try:
+            self._root.after(0, self._append, msg)
+        except tk.TclError:
+            pass
 
     def _append(self, text):
         try:
@@ -86,10 +89,6 @@ class StdoutRedirector:
             self._widget.configure(state="disabled")
         except tk.TclError:
             pass
-
-    def flush(self):
-        if self._original:
-            self._original.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -151,13 +150,13 @@ class _SharedBrowser:
         if self._browser:
             try:
                 await self._browser.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"关闭浏览器: {e}")
         if self._pw:
             try:
                 await self._pw.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"停止 Playwright: {e}")
         self._browser = self._context = self._pw = None
 
 
@@ -190,7 +189,7 @@ class FanqieGUI:
         self.uploading = False
         self._closing = False
         self._cancel_requested = False
-        self._redirector = None
+        self._log_handler = None
         self._last_publish_cache: dict[str, dict] = {}  # bookId -> {date, time}
         self._platform_chapters_cache: dict[str, list] = {}  # bookId -> [章节列表]
         self._matched_edit: list = []  # 修改模式匹配结果
@@ -219,6 +218,11 @@ class FanqieGUI:
         self.btn_login.pack(side="left", padx=6, pady=4)
         self.lbl_auth = ttk.Label(frm, text="")
         self.lbl_auth.pack(side="left", padx=6)
+        lbl_gh = ttk.Label(frm, text="GitHub", foreground="royalblue",
+                           cursor="hand2", font=("", 9, "underline"))
+        lbl_gh.pack(side="right", padx=8)
+        lbl_gh.bind("<Button-1>", lambda _: webbrowser.open(
+            "https://github.com/rockbenben/fanqie-publisher"))
         self._refresh_account_list()
         self._refresh_auth_status()
 
@@ -295,8 +299,9 @@ class FanqieGUI:
         row_radios.pack(fill="x", padx=6, pady=4)
         self.mode_var = tk.StringVar(value=self._cfg.get("default_mode", "schedule"))
         self._mode_radios: list[ttk.Radiobutton] = []
-        for text, val in [("存草稿", "draft"), ("立即发布", "publish"),
-                          ("定时发布", "schedule"), ("修改", "edit")]:
+        for text, val in [("定时发布", "schedule"), ("立即发布", "publish"),
+                          ("存草稿", "draft"), ("修改内容", "edit"),
+                          ("修改定时", "reschedule")]:
             rb = ttk.Radiobutton(
                 row_radios, text=text, variable=self.mode_var,
                 value=val, command=self._on_mode_change)
@@ -340,16 +345,9 @@ class FanqieGUI:
         self.time_var = tk.StringVar(value=self._cfg.get("default_time", "08:00"))
         ttk.Entry(r2, textvariable=self.time_var, width=24).pack(
             side="left", padx=4)
-        ttk.Label(r2, text="(多时间逗号分隔, 如 08:00,12:00)").pack(side="left")
+        ttk.Label(r2, text="(多时间逗号分隔, 如 07:00,12:00,20:00)").pack(side="left")
 
-        # 根据初始模式决定面板可见性
-        _init_mode = self.mode_var.get()
-        if _init_mode == "schedule":
-            self.sched_frame.pack(fill="x", padx=6, pady=4)
-        elif _init_mode in ("draft", "publish"):
-            self.lbl_last_publish.pack_forget()
-        if _init_mode == "draft":
-            self.chk_use_ai.pack_forget()
+        # 初始模式的面板可见性由 _on_mode_change 统一处理（在所有组件创建后调用）
 
         # 参数变化时刷新预览
         for var in (self.date_var, self.perday_var, self.time_var):
@@ -361,6 +359,32 @@ class FanqieGUI:
             var.trace_add("write", lambda *_: self._schedule_config_save())
         # 启动时同步: config 可能有 per_day=2 但 times=3 个
         self._sync_perday_from_times()
+
+        # 章节序号筛选（修改定时模式专用）
+        self.resched_filter_var = tk.BooleanVar(value=False)
+        self._resched_filter_row = ttk.Frame(frm_mode)
+        ttk.Checkbutton(
+            self._resched_filter_row, text="筛选章节序号",
+            variable=self.resched_filter_var,
+            command=self._refresh_preview).pack(side="left", padx=(12, 4))
+        self.resched_filter_op_var = tk.StringVar(value="≥")
+        self.cmb_resched_filter_op = ttk.Combobox(
+            self._resched_filter_row, textvariable=self.resched_filter_op_var,
+            values=["≤", "≥"], width=3, state="readonly")
+        self.cmb_resched_filter_op.pack(side="left", padx=2)
+        self.cmb_resched_filter_op.bind("<<ComboboxSelected>>",
+                                        lambda _: self._refresh_preview())
+        ttk.Label(self._resched_filter_row, text="第").pack(side="left", padx=(4, 0))
+        self.resched_filter_num_var = tk.StringVar(value="1")
+        self.ent_resched_filter_num = ttk.Entry(
+            self._resched_filter_row, textvariable=self.resched_filter_num_var, width=6)
+        self.ent_resched_filter_num.pack(side="left", padx=2)
+        ttk.Label(self._resched_filter_row, text="章").pack(side="left")
+        self.resched_filter_num_var.trace_add("write", lambda *_: self._refresh_preview())
+        self.ent_resched_filter_num.bind("<Return>", lambda _: self.txt_preview.focus_set())
+        self.lbl_resched_filter_info = ttk.Label(
+            self._resched_filter_row, text="", foreground="gray")
+        self.lbl_resched_filter_info.pack(side="left", padx=6)
 
         # --- 5. 章节预览 ---
         frm = ttk.LabelFrame(self.root, text="章节预览")
@@ -392,6 +416,9 @@ class FanqieGUI:
             frm, height=8, state="disabled",
             font=("Consolas", 9))
         self.txt_log.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # 所有组件创建完毕，统一设置初始模式的面板可见性
+        self._on_mode_change()
 
         # 启动时自动加载预览
         if self.dir_var.get():
@@ -516,36 +543,68 @@ class FanqieGUI:
 
     def _on_mode_change(self):
         mode = self.mode_var.get()
-        # 切离修改模式时恢复上传按钮
-        if mode != "edit" and not self.uploading:
-            self.btn_upload.configure(state="normal")
-        if mode == "schedule":
+
+        # --- 1. 先隐藏所有可选组件 ---
+        self.sched_frame.pack_forget()
+        self._resched_filter_row.pack_forget()
+        self.lbl_last_publish.pack_forget()
+        self.chk_use_ai.pack_forget()
+
+        # --- 2. 按模式显示组件（注意 pack 顺序决定布局顺序） ---
+        #   lbl_last_publish: schedule, edit, reschedule
+        #   sched_frame:      schedule, reschedule
+        #   _resched_filter_row: reschedule only
+        #   chk_use_ai:       schedule, publish, edit
+        if mode in ("schedule", "edit", "reschedule"):
             self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
+        if mode in ("schedule", "reschedule"):
             self.sched_frame.pack(fill="x", padx=6, pady=4)
+        if mode == "reschedule":
+            self._resched_filter_row.pack(fill="x", padx=6, pady=(0, 4))
+        if mode in ("schedule", "publish", "edit"):
             self.chk_use_ai.pack(side="left", padx=6)
-            self._on_book_changed()  # 触发获取上次发布时间
-        elif mode == "edit":
-            self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
-            self.sched_frame.pack_forget()
-            self.chk_use_ai.pack(side="left", padx=6)
-            # 未载入章节列表前禁用上传按钮
-            idx = self.cmb_book.current()
-            book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
-            if not (book_id and book_id in self._platform_chapters_cache):
-                self.btn_upload.configure(state="disabled")
+
+        # --- 3. 上传按钮文字和状态 ---
+        btn_text = {"edit": "开始修改", "reschedule": "开始修改"}.get(
+            mode, "开始上传")
+        if not self.uploading:
+            self.btn_upload.configure(text=btn_text)
+            if mode in ("edit", "reschedule"):
+                idx = self.cmb_book.current()
+                book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
+                if not (book_id and book_id in self._platform_chapters_cache):
+                    self.btn_upload.configure(state="disabled")
+                else:
+                    self.btn_upload.configure(state="normal")
+            else:
+                self.btn_upload.configure(state="normal")
+
+        # --- 4. 模式特有逻辑 ---
+        if mode == "schedule":
+            self._on_book_changed()
+        elif mode in ("edit", "reschedule"):
             self._fetch_platform_chapters_for_edit()
-        elif mode == "draft":
-            self.lbl_last_publish.pack_forget()
-            self.sched_frame.pack_forget()
-            self.chk_use_ai.pack_forget()  # 草稿模式不需要AI选项
-        else:
-            self.lbl_last_publish.pack_forget()
-            self.sched_frame.pack_forget()
-            self.chk_use_ai.pack(side="left", padx=6)
+
         self._refresh_preview()
         self._schedule_config_save()
 
+    def _install_log_handler(self):
+        """安装 GUI 日志 handler, 将 logger 输出显示到日志面板。"""
+        if self._log_handler is not None:
+            return
+        handler = TextHandler(self.txt_log, self.root)
+        handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
+        logger.addHandler(handler)
+        self._log_handler = handler
+
+    def _remove_log_handler(self):
+        """移除 GUI 日志 handler。"""
+        if self._log_handler is not None:
+            logger.removeHandler(self._log_handler)
+            self._log_handler = None
+
     def _log(self, msg):
+        """写入 GUI 日志面板（仅 GUI 内部消息用, 不经过 logger）。"""
         self.txt_log.configure(state="normal")
         self.txt_log.insert(tk.END, msg + "\n")
         self.txt_log.see(tk.END)
@@ -634,11 +693,14 @@ class FanqieGUI:
         self.uploading = active
         self._cancel_requested = False
         if active:
-            self.btn_upload.configure(state="normal", text="停止上传")
+            self.btn_upload.configure(state="normal", text="停止")
         else:
-            self.btn_upload.configure(state="normal", text="开始上传")
-            # 修改模式下如果未载入章节列表则禁用
-            if self.mode_var.get() == "edit":
+            mode = self.mode_var.get()
+            btn_text = {"edit": "开始修改", "reschedule": "开始修改"}.get(
+                mode, "开始上传")
+            self.btn_upload.configure(state="normal", text=btn_text)
+            # 修改/修改定时模式下如果未载入章节列表则禁用
+            if self.mode_var.get() in ("edit", "reschedule"):
                 idx = self.cmb_book.current()
                 book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
                 if not (book_id and book_id in self._platform_chapters_cache):
@@ -683,8 +745,8 @@ class FanqieGUI:
         self._gui_state[key] = book_id
         self._save_gui_state()
 
-        # 修改模式: 走专用的章节列表获取（同时获取上次发布信息）
-        if self.mode_var.get() == "edit":
+        # 修改/修改定时模式: 走专用的章节列表获取（同时获取上次发布信息）
+        if self.mode_var.get() in ("edit", "reschedule"):
             self.btn_upload.configure(state="disabled")
             self._fetch_platform_chapters_for_edit()
             return
@@ -714,7 +776,7 @@ class FanqieGUI:
                 await page.goto(url)
                 await page.wait_for_load_state("networkidle")
                 try:
-                    await page.wait_for_selector("tr td", timeout=5000)
+                    await page.wait_for_selector("tr td", timeout=_browser_timeout)
                 except PWTimeout:
                     pass
                 if self._fetch_gen != gen:
@@ -782,7 +844,7 @@ class FanqieGUI:
 
         if book_id in self._platform_chapters_cache:
             self._on_platform_chapters_fetched(
-                book_id, self._platform_chapters_cache[book_id], None)
+                book_id, self._platform_chapters_cache[book_id], error=None)
             return
 
         if not AUTH_FILE.exists():
@@ -844,7 +906,7 @@ class FanqieGUI:
         self.lbl_last_publish.configure(
             text=f"平台共 {len(chapters)} 个章节", foreground="#d35400")
         # 载入完成，恢复上传按钮
-        if not self.uploading and self.mode_var.get() == "edit":
+        if not self.uploading and self.mode_var.get() in ("edit", "reschedule"):
             self.btn_upload.configure(state="normal")
         self._refresh_preview()
 
@@ -1143,12 +1205,17 @@ class FanqieGUI:
 
     def _refresh_preview(self):
         """仅重新计算排期和刷新预览文本，不重新读取文件。"""
+        mode = self.mode_var.get()
+
+        # 修改定时模式: 不依赖本地文件，使用平台章节
+        if mode == "reschedule":
+            self._refresh_reschedule_preview()
+            return
+
         if not self.files or not self.parsed_chapters:
             return
 
-        mode = self.mode_var.get()
-
-        # 修改模式: 专用预览
+        # 修改内容模式: 专用预览
         if mode == "edit":
             self._refresh_edit_preview()
             return
@@ -1177,7 +1244,8 @@ class FanqieGUI:
                 sched_str = f"  [{schedule[i][0]} {schedule[i][1]}]"
             lines.append(f"  {i+1:3d}. {num_str} {title}  ({wc}字){sched_str}")
 
-        mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布"}
+        mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
+                       "edit": "修改内容", "reschedule": "修改定时"}
         summary = f"总计: {len(self.files)} 章, {total_words} 字 | 模式: {mode_labels[mode]}"
         if schedule:
             # 统计首天章数即为 effective per_day
@@ -1234,7 +1302,7 @@ class FanqieGUI:
                 lines.append(
                     f"  {i+1:3d}. {num_str} {title}  ({wc}字)  [待获取章节列表]")
 
-        summary = f"总计: {len(self.files)} 章, {total_words} 字 | 模式: 修改"
+        summary = f"总计: {len(self.files)} 章, {total_words} 字 | 模式: 修改内容"
         if platform_chapters:
             summary += f" | 匹配: {matched_count}/{len(self.files)}"
 
@@ -1242,6 +1310,94 @@ class FanqieGUI:
         self.progress["maximum"] = max(matched_count, 1)
         self.progress["value"] = 0
         self.lbl_progress.configure(text=f"0/{matched_count}")
+
+    def _filter_reschedule_chapters(self, chapters):
+        """按章节序号筛选待修改定时的章节。"""
+        if not self.resched_filter_var.get():
+            self.lbl_resched_filter_info.configure(text="")
+            return chapters
+        try:
+            num = int(self.resched_filter_num_var.get())
+        except (ValueError, tk.TclError):
+            self.lbl_resched_filter_info.configure(text="(序号无效)")
+            return chapters
+        op = self.resched_filter_op_var.get()
+        total = len(chapters)
+        if op == "≤":
+            filtered = [ch for ch in chapters if (ch.get("chapterNum") or 0) <= num]
+        else:  # ≥
+            filtered = [ch for ch in chapters if (ch.get("chapterNum") or 0) >= num]
+        self.lbl_resched_filter_info.configure(
+            text=f"筛选: {len(filtered)}/{total} 章")
+        return filtered
+
+    def _refresh_reschedule_preview(self):
+        """修改定时模式预览: 显示平台章节 + 计算的新排期。"""
+        idx = self.cmb_book.current()
+        book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
+
+        if not book_id:
+            self._set_preview("请先选择作品")
+            return
+
+        if book_id not in self._platform_chapters_cache:
+            self._set_preview("正在获取平台章节列表...")
+            self._fetch_platform_chapters_for_edit()
+            return
+
+        all_chapters = self._platform_chapters_cache[book_id]
+        if not all_chapters:
+            self._set_preview("平台无章节")
+            return
+
+        # 反转顺序（章节管理页最新在前）+ 只保留"待发布"章节
+        platform_chapters = [
+            ch for ch in reversed(all_chapters)
+            if "待发布" in ch.get("status", "")
+        ]
+        if not platform_chapters:
+            self._set_preview("无待发布章节（仅待发布状态的章节可修改定时）")
+            return
+
+        # 按章节序号筛选
+        platform_chapters = self._filter_reschedule_chapters(platform_chapters)
+        if not platform_chapters:
+            self._set_preview("筛选后无待发布章节")
+            return
+
+        # 计算排期
+        schedule = None
+        try:
+            date_str = self.date_var.get()
+            datetime.strptime(date_str, "%Y-%m-%d")
+            time_str = self.time_var.get().strip() or "08:00"
+            per_day = self.perday_var.get()
+            schedule = compute_schedule(
+                len(platform_chapters), date_str, time_str, per_day)
+        except (ValueError, tk.TclError):
+            pass
+
+        lines = []
+        for i, ch in enumerate(platform_chapters):
+            num = ch.get("chapterNum")
+            title = ch.get("title", "")
+            num_str = f"第{num}章" if num else "  ?  "
+            sched_str = ""
+            if schedule:
+                sched_str = f"  [{schedule[i][0]} {schedule[i][1]}]"
+            lines.append(f"  {i+1:3d}. {num_str} {title}{sched_str}")
+
+        count = len(platform_chapters)
+        summary = f"总计: {count} 章(待发布) | 模式: 修改定时"
+        if schedule:
+            first_day = schedule[0][0]
+            eff = sum(1 for d, _ in schedule if d == first_day)
+            summary += f" | 每天{eff}章 | 排期: {schedule[0][0]} ~ {schedule[-1][0]}"
+
+        self._set_preview(summary + "\n" + "-" * 60 + "\n" + "\n".join(lines))
+        self.progress["maximum"] = max(count, 1)
+        self.progress["value"] = 0
+        self.lbl_progress.configure(text=f"0/{count}")
 
     # -----------------------------------------------------------------------
     # 上传
@@ -1261,15 +1417,20 @@ class FanqieGUI:
         if idx < 0 or not self.books:
             messagebox.showwarning("提示", "请先刷新并选择作品")
             return
-        if not self.files or not self.parsed_chapters:
-            messagebox.showwarning("提示", "请先选择章节目录")
-            return
-
         mode = self.mode_var.get()
         book_id = self.books[idx]["bookId"]
         book_name = self.books[idx]["name"]
 
-        # 修改模式
+        # 修改定时模式: 不需要本地文件
+        if mode == "reschedule":
+            self._on_upload_reschedule(book_id, book_name)
+            return
+
+        if not self.files or not self.parsed_chapters:
+            messagebox.showwarning("提示", "请先选择章节目录")
+            return
+
+        # 修改内容模式
         if mode == "edit":
             self._on_upload_edit(book_id, book_name)
             return
@@ -1302,7 +1463,8 @@ class FanqieGUI:
 
         # 确认
         count = len(self.parsed_chapters)
-        mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布"}
+        mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
+                       "edit": "修改内容", "reschedule": "修改定时"}
         msg = f"即将上传 {count} 章到「{book_name}」\n模式: {mode_labels[mode]}"
         if schedule:
             msg += f"\n排期: {schedule[0][0]} ~ {schedule[-1][0]}"
@@ -1313,9 +1475,7 @@ class FanqieGUI:
         self._set_uploading(True)
         self.progress["value"] = 0
 
-        # 安装 stdout 重定向
-        self._redirector = StdoutRedirector(self.txt_log, self.root)
-        sys.stdout = self._redirector
+        self._install_log_handler()
 
         delay = self._cfg.get("delay_between_chapters", 3)
 
@@ -1333,9 +1493,9 @@ class FanqieGUI:
 
                     await page.goto(url)
                     try:
-                        await wait_for_editor_ready(page, timeout=20000)
+                        await wait_for_editor_ready(page)
                     except PWTimeout:
-                        print("无法进入编辑器，请检查 Book ID 和登录状态。")
+                        logger.error("无法进入编辑器，请检查 Book ID 和登录状态。")
                         await browser.close()
                         self._after(0, self._upload_done, 0, 0)
                         return
@@ -1347,7 +1507,7 @@ class FanqieGUI:
 
                     for i in range(total):
                         if self._cancel_requested:
-                            print("\n用户取消上传。")
+                            logger.info("用户取消上传。")
                             break
 
                         chapter_num, title, content = parsed[i]
@@ -1355,7 +1515,7 @@ class FanqieGUI:
                         sched_info = ""
                         if schedule:
                             sched_info = f" -> {schedule[i][0]} {schedule[i][1]}"
-                        print(f"\n[{i+1}/{total}] {num_str}{title}{sched_info}")
+                        logger.info(f"[{i+1}/{total}] {num_str}{title}{sched_info}")
 
                         ok = False
                         daily_limit = False
@@ -1370,7 +1530,7 @@ class FanqieGUI:
                                 if schedule:
                                     d, t = schedule[i]
                                     await publish_scheduled(page, d, t, use_ai=use_ai)
-                                    print(f"  -> 定时发布 {d} {t}")
+                                    logger.info(f"  -> 定时发布 {d} {t}")
                                 elif mode == "publish":
                                     await _navigate_to_publish_settings(page, use_ai=use_ai)
                                     btn = page.locator("button", has_text="确认发布")
@@ -1379,29 +1539,29 @@ class FanqieGUI:
                                     await btn.first.click()
                                     await page.wait_for_timeout(2000)
                                     await _check_daily_limit(page)
-                                    print("  -> 已发布")
+                                    logger.info("  -> 已发布")
                                 else:
                                     await save_draft(page)
-                                    print("  -> 已存草稿")
+                                    logger.info("  -> 已存草稿")
 
                                 ok = True
                                 break
 
                             except DailyLimitReached as e:
-                                print(f"\n⚠ {e}")
+                                logger.warning(f"{e}")
                                 daily_limit = True
                                 break
 
                             except Exception as e:
                                 if attempt <= max_retries:
-                                    print(f"  !! 第{attempt}次失败: {e}，重试中...")
+                                    logger.warning(f"第{attempt}次失败: {e}，重试中...")
                                     await page.wait_for_timeout(2000)
                                 else:
-                                    print(f"  !! 失败: {e}")
+                                    logger.error(f"失败: {e}")
                                     try:
                                         err = SCRIPT_DIR / f"error_{i}_{files[i].stem}.png"
                                         await page.screenshot(path=str(err))
-                                        print(f"  截图: {err}")
+                                        logger.error(f"  截图: {err}")
                                     except Exception:
                                         pass
 
@@ -1422,14 +1582,14 @@ class FanqieGUI:
                     await save_auth(context)
                     await browser.close()
 
-                print(f"\n{'='*40}")
-                print(f"  上传完成! 成功: {success}  失败: {failed}")
-                print(f"{'='*40}")
+                logger.info(f"{'='*40}")
+                logger.info(f"  上传完成! 成功: {success}  失败: {failed}")
+                logger.info(f"{'='*40}")
 
                 self._after(0, self._upload_done, success, failed)
 
             except Exception as e:
-                print(f"\n!! 上传异常: {e}")
+                logger.error(f"上传异常: {e}")
                 self._after(0, self._upload_done, -1, -1)
 
         self.worker.submit(task())
@@ -1439,9 +1599,7 @@ class FanqieGUI:
         self.lbl_progress.configure(text=f"{current}/{total}")
 
     def _upload_done(self, success, failed):
-        if self._redirector:
-            sys.stdout = self._redirector._original or sys.__stdout__
-        self._redirector = None
+        self._remove_log_handler()
         self._set_uploading(False)
         self._last_publish_cache.clear()  # 上传后清除缓存，下次获取最新数据
         self._platform_chapters_cache.clear()
@@ -1477,8 +1635,7 @@ class FanqieGUI:
         self.progress["value"] = 0
         self.progress["maximum"] = count
 
-        self._redirector = StdoutRedirector(self.txt_log, self.root)
-        sys.stdout = self._redirector
+        self._install_log_handler()
 
         delay = self._cfg.get("delay_between_chapters", 3)
         use_ai = self.use_ai_var.get()
@@ -1496,14 +1653,14 @@ class FanqieGUI:
 
                     for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched_copy):
                         if self._cancel_requested:
-                            print("\n用户取消修改。")
+                            logger.info("用户取消修改。")
                             break
 
-                        print(f"\n[{i+1}/{total}] 修改第{ch_num}章 {title}")
+                        logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
 
                         edit_url = plat_ch.get("editUrl")
                         if not edit_url:
-                            print("  !! 无法获取编辑链接，跳过")
+                            logger.error("无法获取编辑链接，跳过")
                             failed += 1
                             self._after(0, self._update_progress, i + 1, total)
                             continue
@@ -1520,7 +1677,7 @@ class FanqieGUI:
                             else:
                                 failed += 1
                         except DailyLimitReached as e:
-                            print(f"\n⚠ {e}")
+                            logger.warning(f"{e}")
                             failed += 1
                             break
 
@@ -1532,14 +1689,111 @@ class FanqieGUI:
                     await save_auth(context)
                     await browser.close()
 
-                print(f"\n{'='*40}")
-                print(f"  修改完成! 成功: {success}  失败: {failed}")
-                print(f"{'='*40}")
+                logger.info(f"{'='*40}")
+                logger.info(f"  修改完成! 成功: {success}  失败: {failed}")
+                logger.info(f"{'='*40}")
 
                 self._after(0, self._upload_done, success, failed)
 
             except Exception as e:
-                print(f"\n!! 修改异常: {e}")
+                logger.error(f"修改异常: {e}")
+                self._after(0, self._upload_done, -1, -1)
+
+        self.worker.submit(task())
+
+    # -----------------------------------------------------------------------
+    # 修改定时模式上传
+    # -----------------------------------------------------------------------
+    def _on_upload_reschedule(self, book_id, book_name):
+        """修改定时: 在章节管理页批量修改待发布章节的定时发布设置。"""
+        # 验证排期参数
+        try:
+            date_str = self.date_var.get()
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("日期错误", "请输入正确的日期: YYYY-MM-DD")
+            return
+        try:
+            per_day = max(1, self.perday_var.get())
+        except tk.TclError:
+            messagebox.showerror("参数错误", "请输入有效的每天章数")
+            return
+        time_str = self.time_var.get().strip() or "08:00"
+        if not _validate_times(time_str):
+            messagebox.showerror(
+                "时间格式错误",
+                "请输入有效的发布时间 (HH:MM)\n"
+                "多个时间用逗号分隔, 如: 08:00,12:00,20:00")
+            return
+
+        # 获取平台章节，反转顺序 + 只保留"待发布"
+        all_chapters = self._platform_chapters_cache.get(book_id, [])
+        if not all_chapters:
+            messagebox.showwarning("提示", "没有平台章节数据。\n请先选择作品并等待章节列表获取完成。")
+            return
+        platform_chapters = [
+            ch for ch in reversed(all_chapters)
+            if "待发布" in ch.get("status", "")
+        ]
+        if not platform_chapters:
+            messagebox.showinfo("提示", "没有待发布状态的章节可修改定时。")
+            return
+
+        # 按章节序号筛选
+        platform_chapters = self._filter_reschedule_chapters(platform_chapters)
+        if not platform_chapters:
+            messagebox.showinfo("提示", "筛选后无待发布章节可修改定时。")
+            return
+
+        # 计算排期并构建 schedule_map
+        schedule = compute_schedule(
+            len(platform_chapters), date_str, time_str, per_day)
+        schedule_map = {}
+        for i, ch in enumerate(platform_chapters):
+            schedule_map[ch["title"]] = schedule[i]
+
+        count = len(platform_chapters)
+        msg = (f"即将修改「{book_name}」的 {count} 个待发布章节的定时发布设置\n"
+               f"排期: {schedule[0][0]} ~ {schedule[-1][0]}")
+        if not messagebox.askyesno("确认修改定时", msg):
+            return
+
+        # 开始
+        self._set_uploading(True)
+        self.progress["value"] = 0
+        self.progress["maximum"] = count
+
+        self._install_log_handler()
+
+        delay = self._cfg.get("delay_between_chapters", 3)
+        smap = dict(schedule_map)
+
+        async def task():
+            try:
+                async with async_playwright() as p:
+                    browser, context = await create_context(p, headless=False)
+                    page = await context.new_page()
+
+                    success, failed = await reschedule_on_manage_page(
+                        page, book_id, smap,
+                        max_retries=self._cfg.get("max_retries", 2),
+                        delay=delay,
+                        cancel_check=lambda: self._cancel_requested,
+                        progress_cb=lambda done, total: self._after(
+                            0, self._update_progress, done, total),
+                    )
+
+                    await save_auth(context)
+                    await browser.close()
+
+                logger.info(f"{'='*40}")
+                logger.info(f"  修改定时完成! 成功: {success}  失败: {failed}")
+                logger.info(f"{'='*40}")
+
+                self._after(0, self._upload_done, success, failed)
+
+            except Exception as e:
+                logger.error(f"修改定时异常: {e}")
                 self._after(0, self._upload_done, -1, -1)
 
         self.worker.submit(task())
@@ -1552,15 +1806,13 @@ class FanqieGUI:
             if not messagebox.askyesno("确认", "上传正在进行中，确定退出吗？"):
                 return
         self._closing = True
-        # 恢复 stdout 以防重定向仍在生效
-        if self._redirector:
-            sys.stdout = self._redirector._original or sys.__stdout__
+        self._remove_log_handler()
         # 关闭共享浏览器
         try:
             future = self.worker.submit(self._shared.close())
             future.result(timeout=5)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"关闭共享浏览器: {e}")
         self.worker.stop()
         self.root.destroy()
 
@@ -1574,10 +1826,10 @@ class FanqieGUI:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(filename=str(LOG_FILE), level=logging.ERROR)
+    setup_logging(UPLOAD_LOG_FILE)
     try:
         app = FanqieGUI()
         app.run()
     except Exception:
-        logging.exception("启动异常")
+        logger.exception("启动异常")
         raise
