@@ -891,7 +891,7 @@ def match_chapters(
     unmatched = []
     for i, (num, title, content) in enumerate(local_parsed):
         int_num = int(num) if num else None
-        if int_num and int_num in platform_map:
+        if int_num is not None and int_num in platform_map:
             matched.append((i, platform_map[int_num], int_num, title, content))
         else:
             unmatched.append((i, num, title))
