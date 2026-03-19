@@ -70,6 +70,11 @@ _MOD_KEY = "Meta" if sys.platform == "darwin" else "Control"
 _browser_timeout = DEFAULT_CONFIG["browser_timeout"]  # 模块级超时(ms)
 
 
+def _safe_filename(name: str, max_len: int = 40) -> str:
+    """移除 Windows 文件名非法字符并截断。"""
+    return re.sub(r'[\\/:*?"<>|\r\n]', '_', name)[:max_len]
+
+
 LOG_FILE = SCRIPT_DIR / "fanqie_error.log"
 
 logger = logging.getLogger("fanqie")
@@ -105,7 +110,7 @@ async def _check_daily_limit(page):
     except DailyLimitReached:
         raise
     except Exception:
-        pass
+        logger.debug("_check_daily_limit 检测时出错(非致命)", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +131,11 @@ def load_config() -> dict:
         val = DEFAULT_CONFIG["browser_timeout"]
     _browser_timeout = int(val)
     return cfg
+
+
+def get_browser_timeout() -> int:
+    """返回当前 browser_timeout 值（ms），供外部模块使用。"""
+    return _browser_timeout
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +519,7 @@ async def save_draft(page):
     try:
         await page.wait_for_selector("text=已保存", timeout=_browser_timeout)
     except PWTimeout:
-        pass
+        logger.warning("未检测到保存确认，草稿可能未保存成功")
     await page.wait_for_timeout(1000)
 
 
@@ -748,6 +758,89 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
 
     return { chapters: allChapters, totalPages, pageCount, lastPublish: lastPub };
 }"""
+
+
+# ---------------------------------------------------------------------------
+# JS: 检测章节管理页的卷列表
+# ---------------------------------------------------------------------------
+DETECT_VOLUMES_JS = r"""async () => {
+    const selectEl = document.querySelector(
+        '.chapter-select-left .serial-select.byte-select:not(.chapter-status-select)');
+    if (!selectEl) return { hasVolumes: false, volumes: [], currentVolume: '' };
+
+    const valueEl = selectEl.querySelector('.byte-select-view-value');
+    const currentVolume = valueEl ? valueEl.textContent.trim() : '';
+
+    // 展开下拉读取选项，然后关闭
+    selectEl.click();
+    await new Promise(r => setTimeout(r, 500));
+
+    const volumes = [];
+    for (const opt of document.querySelectorAll(
+            '.byte-select-option.chapter-select-option')) {
+        volumes.push({
+            text: opt.textContent.trim(),
+            isActive: opt.classList.contains('byte-select-option-selected'),
+        });
+    }
+
+    // 关闭下拉
+    selectEl.click();
+    await new Promise(r => setTimeout(r, 300));
+
+    return { hasVolumes: volumes.length > 1, volumes, currentVolume };
+}"""
+
+
+# ---------------------------------------------------------------------------
+# JS: 选择指定卷（直接展开 → 点击目标 → 等待刷新）
+# ---------------------------------------------------------------------------
+SELECT_VOLUME_JS = r"""async (targetText) => {
+    const selectEl = document.querySelector(
+        '.chapter-select-left .serial-select.byte-select:not(.chapter-status-select)');
+    if (!selectEl) return false;
+
+    selectEl.click();
+    await new Promise(r => setTimeout(r, 500));
+
+    for (const opt of document.querySelectorAll(
+            '.byte-select-option.chapter-select-option')) {
+        if (opt.textContent.trim() === targetText) {
+            opt.click();
+            await new Promise(r => setTimeout(r, 800));
+            return true;
+        }
+    }
+
+    // 未找到目标卷，关闭下拉
+    selectEl.click();
+    await new Promise(r => setTimeout(r, 300));
+    return false;
+}"""
+
+
+async def detect_volumes(page) -> dict:
+    """检测章节管理页是否有多卷，返回 {hasVolumes, volumes, currentVolume}。"""
+    try:
+        return await page.evaluate(DETECT_VOLUMES_JS)
+    except Exception as e:
+        logger.debug(f"检测卷列表失败: {e}")
+        return {"hasVolumes": False, "volumes": [], "currentVolume": ""}
+
+
+async def select_volume(page, volume_text: str) -> bool:
+    """在章节管理页选择指定卷，返回是否成功。选择后等待表格刷新。"""
+    try:
+        ok = await page.evaluate(SELECT_VOLUME_JS, volume_text)
+        if ok:
+            await page.wait_for_timeout(1000)
+            logger.info(f"  已切换到: {volume_text}")
+        else:
+            logger.warning(f"  未找到卷: {volume_text}")
+        return ok
+    except Exception as e:
+        logger.warning(f"选择卷失败: {e}")
+        return False
 
 
 async def extract_chapters_from_page(
@@ -1023,14 +1116,14 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
     try:
         await page.wait_for_selector("input[placeholder='请选择日期']", timeout=_browser_timeout)
     except PWTimeout:
-        pass
+        raise RuntimeError("等待日期输入框超时")
     await page.wait_for_timeout(300)
 
     # 3. 填写日期 (Arco DatePicker)
     #    键盘方式: 点击输入框 -> 全选 -> 输入日期 -> Enter 确认
     date_input = page.locator("input[placeholder='请选择日期']")
     if await date_input.count() == 0:
-        logger.warning("未找到日期输入框，定时发布日期可能不正确")
+        raise RuntimeError("未找到日期输入框")
     else:
         await date_input.click()
         await page.wait_for_timeout(300)
@@ -1045,7 +1138,7 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
     # 4. 填写时间 (Arco TimePicker)
     time_input = page.locator("input[placeholder='请选择时间']")
     if await time_input.count() == 0:
-        logger.warning("未找到时间输入框，定时发布时间可能不正确")
+        raise RuntimeError("未找到时间输入框")
     else:
         await time_input.click()
         await page.wait_for_timeout(300)
@@ -1104,7 +1197,10 @@ async def cmd_books():
 
         await page.goto(BOOK_MANAGE_URL)
         await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(3000)
+        try:
+            await page.wait_for_selector('a[href*="chapter-manage/"]', timeout=5000)
+        except PWTimeout:
+            pass
 
         books = await page.evaluate(BOOKS_JS)
 
@@ -1375,12 +1471,14 @@ async def reschedule_on_manage_page(
     delay: float = 1,
     cancel_check=None,
     progress_cb=None,
+    volume_text: str = "",
 ) -> tuple[int, int]:
     """在章节管理页上批量修改待发布章节的定时发布设置。
 
     schedule_map: {章节标题: (date_str, time_str), ...}
     cancel_check: 返回 True 时中止
     progress_cb:  (done, total) 回调
+    volume_text:  多卷时选择的卷名（空字符串表示不切换）
     返回 (success, failed)。
     """
     total = len(schedule_map)
@@ -1398,6 +1496,10 @@ async def reschedule_on_manage_page(
     except Exception:
         logger.error("章节管理页表格未加载")
         return 0, total
+
+    # 多卷时切换到指定卷
+    if volume_text:
+        await select_volume(page, volume_text)
 
     # 首次扫描: 诊断行结构，找出时钟图标的选择器
     icon_selector = await page.evaluate(r"""() => {
@@ -1535,7 +1637,7 @@ async def reschedule_on_manage_page(
                     else:
                         logger.error(f"失败: {e}")
                         try:
-                            err_path = SCRIPT_DIR / f"error_resched_{title[:20]}.png"
+                            err_path = SCRIPT_DIR / f"error_resched_{_safe_filename(title, 20)}.png"
                             await page.screenshot(path=str(err_path))
                             logger.error(f"截图: {err_path}")
                         except Exception:

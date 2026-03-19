@@ -1,9 +1,0 @@
-{
-  "delay_between_chapters": 3,
-  "headless": false,
-  "max_retries": 2,
-  "default_mode": "schedule",
-  "default_per_day": 3,
-  "default_time": "07:00,12:00,20:00",
-  "browser_timeout": 15000
-}

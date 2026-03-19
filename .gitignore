@@ -15,6 +15,7 @@ venv/
 .venv/
 
 # Project
+config.json
 chapters/
 error_*.png
 fanqie_error.log
