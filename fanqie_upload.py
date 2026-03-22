@@ -1472,6 +1472,7 @@ async def reschedule_on_manage_page(
     cancel_check=None,
     progress_cb=None,
     volume_text: str = "",
+    volume_texts: list[str] | None = None,
 ) -> tuple[int, int]:
     """在章节管理页上批量修改待发布章节的定时发布设置。
 
@@ -1479,6 +1480,7 @@ async def reschedule_on_manage_page(
     cancel_check: 返回 True 时中止
     progress_cb:  (done, total) 回调
     volume_text:  多卷时选择的卷名（空字符串表示不切换）
+    volume_texts: 多卷索引模式时传入所有卷名列表（优先级高于 volume_text）
     返回 (success, failed)。
     """
     total = len(schedule_map)
@@ -1497,20 +1499,75 @@ async def reschedule_on_manage_page(
         logger.error("章节管理页表格未加载")
         return 0, total
 
-    # 多卷时切换到指定卷
+    # 多卷索引模式: 逐卷处理
+    if volume_texts:
+        for vi, vt in enumerate(volume_texts):
+            if not remaining:
+                break
+            if cancel_check and cancel_check():
+                break
+            logger.info(f"切换到分卷 ({vi+1}/{len(volume_texts)}): {vt}")
+            await select_volume(page, vt)
+            s, f = await _reschedule_current_volume(
+                page, remaining, total,
+                max_retries=max_retries, delay=delay,
+                cancel_check=cancel_check, progress_cb=progress_cb,
+                success_so_far=success, failed_so_far=failed)
+            success += s
+            failed += f
+        if remaining:
+            for title in remaining:
+                logger.error(f"未处理: {title}")
+            failed += len(remaining)
+        return success, failed
+
+    # 单卷模式
     if volume_text:
         await select_volume(page, volume_text)
 
-    # 首次扫描: 诊断行结构，找出时钟图标的选择器
+    s, f = await _reschedule_current_volume(
+        page, remaining, total,
+        max_retries=max_retries, delay=delay,
+        cancel_check=cancel_check, progress_cb=progress_cb,
+        success_so_far=success, failed_so_far=failed)
+    success += s
+    failed += f
+
+    if remaining:
+        for title in remaining:
+            logger.error(f"未处理: {title}")
+        failed += len(remaining)
+
+    return success, failed
+
+
+async def _reschedule_current_volume(
+    page,
+    remaining: dict[str, tuple[str, str]],
+    total: int,
+    *,
+    max_retries: int = 2,
+    delay: float = 1,
+    cancel_check=None,
+    progress_cb=None,
+    success_so_far: int = 0,
+    failed_so_far: int = 0,
+) -> tuple[int, int]:
+    """扫描当前卷的所有页面，处理 remaining 中匹配到的章节。
+
+    会直接从 remaining 中删除已处理的条目。
+    返回本轮 (success, failed)。
+    """
+    success = 0
+    failed = 0
+
+    # 诊断行结构，找出时钟图标的选择器
     icon_selector = await page.evaluate(r"""() => {
-        // 遍历数据行，找到第一个中间列里的可点击元素
         for (const row of document.querySelectorAll('tr')) {
             const cells = row.querySelectorAll('td');
             if (cells.length < 3) continue;
-            // 跳过首列(标题)和末列(操作)
             for (let i = 1; i < cells.length - 1; i++) {
                 const cell = cells[i];
-                // 按优先级尝试各种图标元素
                 const el = cell.querySelector('svg')
                     || cell.querySelector('i[class]')
                     || cell.querySelector('span[class*="icon"]')
@@ -1520,7 +1577,6 @@ async def reschedule_on_manage_page(
                 if (el) {
                     const tag = el.tagName.toLowerCase();
                     const cls = el.className || '';
-                    // 返回可复用的选择器信息
                     if (tag === 'svg') return 'svg';
                     if (tag === 'i' && cls) return 'i.' + cls.split(' ')[0];
                     if (cls) return tag + '.' + cls.split(' ')[0];
@@ -1559,7 +1615,8 @@ async def reschedule_on_manage_page(
                 break
 
             date_str, time_str = remaining[title]
-            logger.info(f"[{success + failed + 1}/{total}] {title} -> {date_str} {time_str}")
+            done_so_far = success_so_far + failed_so_far + success + failed
+            logger.info(f"[{done_so_far + 1}/{total}] {title} -> {date_str} {time_str}")
 
             ok = False
             for attempt in range(1, max_retries + 2):
@@ -1571,7 +1628,6 @@ async def reschedule_on_manage_page(
                             if (cells.length < 3) continue;
                             if (cells[0].textContent.trim() !== targetTitle)
                                 continue;
-                            // 跳过首列和末列，在中间列中查找图标
                             for (let i = 1; i < cells.length - 1; i++) {
                                 const cell = cells[i];
                                 const el = cell.querySelector('svg')
@@ -1650,7 +1706,7 @@ async def reschedule_on_manage_page(
             del remaining[title]
 
             if progress_cb:
-                progress_cb(success + failed, total)
+                progress_cb(success_so_far + failed_so_far + success + failed, total)
 
             if delay > 0 and remaining:
                 await page.wait_for_timeout(int(delay * 1000))
@@ -1677,11 +1733,6 @@ async def reschedule_on_manage_page(
                 "() => document.querySelector('tr td')?.textContent?.trim() || ''")
             if cur and cur != first_title:
                 break
-
-    if remaining:
-        for title in remaining:
-            logger.error(f"未处理: {title}")
-        failed += len(remaining)
 
     return success, failed
 

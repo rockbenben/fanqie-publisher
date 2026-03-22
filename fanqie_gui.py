@@ -190,6 +190,9 @@ class FanqieGUI:
         self._closing = False
         self._cancel_requested = False
         self._log_handler = None
+        # --- 缓存 ---
+        # 失效时机: 切换账号 / 刷新作品列表 / 上传完成 → _invalidate_caches("all")
+        #           切换作品 → 按需重新获取（缓存仍保留其他作品数据）
         self._last_publish_cache: dict[str, dict] = {}  # bookId -> {date, time}
         self._platform_chapters_cache: dict[str, list] = {}  # "bookId:vol" -> [章节列表]
         self._volumes_cache: dict[str, list | None] = {}  # bookId -> list | None(无卷)
@@ -242,8 +245,8 @@ class FanqieGUI:
             frm, text="章节管理 ↗", command=self._open_chapter_manage)
         self.btn_open_manage.pack(side="left", padx=(0, 6), pady=4)
 
-        # --- 3. 章节目录 ---
-        frm_dir = ttk.LabelFrame(self.root, text="章节目录")
+        # --- 3. 章节文件夹 ---
+        frm_dir = ttk.LabelFrame(self.root, text="章节文件夹")
         frm_dir.pack(fill="x", **pad)
 
         row1 = ttk.Frame(frm_dir)
@@ -260,11 +263,11 @@ class FanqieGUI:
             side="left", padx=(4, 6), pady=4)
         self.unique_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            row1, text="自动去重标题", variable=self.unique_var,
+            row1, text="自动处理重名", variable=self.unique_var,
             command=self._reload_chapters).pack(side="left", padx=6)
         self.filter_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            row1, text="筛选修改日期",
+            row1, text="按修改日期筛选",
             variable=self.filter_var,
             command=self._on_filter_toggle).pack(side="left", padx=6)
 
@@ -286,14 +289,14 @@ class FanqieGUI:
             "<FocusOut>", lambda _: self._reload_chapters())
         self.ent_filter_date.bind(
             "<Return>", lambda _: self._reload_chapters())
-        ttk.Label(row_filter, text="(格式: 2025-01-01 08:00)",
+        ttk.Label(row_filter, text="格式: YYYY-MM-DD 或 YYYY-MM-DD HH:MM",
                   foreground="gray").pack(side="left", padx=2)
         self.lbl_filter_info = ttk.Label(row_filter, text="", foreground="gray")
         self.lbl_filter_info.pack(side="left", padx=6)
         self._filter_row = row_filter
 
-        # --- 4. 发布模式 ---
-        frm_mode = ttk.LabelFrame(self.root, text="发布模式")
+        # --- 4. 操作模式 ---
+        frm_mode = ttk.LabelFrame(self.root, text="操作模式")
         frm_mode.pack(fill="x", **pad)
 
         row_radios = ttk.Frame(frm_mode)
@@ -302,7 +305,7 @@ class FanqieGUI:
         self._mode_radios: list[ttk.Radiobutton] = []
         for text, val in [("定时发布", "schedule"), ("立即发布", "publish"),
                           ("存草稿", "draft"), ("修改内容", "edit"),
-                          ("修改定时", "reschedule")]:
+                          ("修改排期", "reschedule")]:
             rb = ttk.Radiobutton(
                 row_radios, text=text, variable=self.mode_var,
                 value=val, command=self._on_mode_change)
@@ -319,13 +322,20 @@ class FanqieGUI:
 
         # 上次发布信息（所有模式可见）
         self.lbl_last_publish = ttk.Label(
-            frm_mode, text="上次定时发布: (选择作品后自动获取)", foreground="gray")
+            frm_mode, text="选择作品后自动获取", foreground="gray")
         self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
 
-        # 卷选择器（仅 edit/reschedule 模式 + 多卷时显示）
+        # 卷选择器 + 合并所有卷（同一行，仅 edit/reschedule 模式 + 多卷时显示）
         self._volume_frame = ttk.Frame(frm_mode)
-        ttk.Label(self._volume_frame, text="选择分卷:").pack(
-            side="left", padx=(6))
+        self.all_volumes_var = tk.BooleanVar(value=False)
+        self.chk_all_volumes = ttk.Checkbutton(
+            self._volume_frame, text="合并所有卷",
+            variable=self.all_volumes_var,
+            command=self._on_all_volumes_changed)
+        self.chk_all_volumes.pack(side="left", padx=(12, 4))
+        self._lbl_volume_sep = ttk.Label(
+            self._volume_frame, text="选择分卷:")
+        self._lbl_volume_sep.pack(side="left", padx=(12, 0))
         self.volume_var = tk.StringVar()
         self.cmb_volume = ttk.Combobox(
             self._volume_frame, textvariable=self.volume_var,
@@ -358,7 +368,8 @@ class FanqieGUI:
         self.time_var = tk.StringVar(value=self._cfg.get("default_time", "08:00"))
         ttk.Entry(r2, textvariable=self.time_var, width=24).pack(
             side="left", padx=4)
-        ttk.Label(r2, text="(多时间逗号分隔, 如 07:00,12:00,20:00)").pack(side="left")
+        ttk.Label(r2, text="多时间逗号分隔，如 07:00,12:00,20:00",
+                  foreground="gray").pack(side="left")
 
         # 初始模式的面板可见性由 _on_mode_change 统一处理（在所有组件创建后调用）
 
@@ -373,11 +384,11 @@ class FanqieGUI:
         # 启动时同步: config 可能有 per_day=2 但 times=3 个
         self._sync_perday_from_times()
 
-        # 章节序号筛选（修改内容/修改定时模式）
+        # 章节序号筛选（修改内容/修改排期模式）
         self.resched_filter_var = tk.BooleanVar(value=False)
         self._resched_filter_row = ttk.Frame(frm_mode)
         ttk.Checkbutton(
-            self._resched_filter_row, text="筛选章节序号",
+            self._resched_filter_row, text="按章节号筛选",
             variable=self.resched_filter_var,
             command=self._refresh_preview).pack(side="left", padx=(12, 4))
         self.resched_filter_op_var = tk.StringVar(value="≥")
@@ -438,6 +449,21 @@ class FanqieGUI:
             self.root.after(100, self._reload_chapters)
 
     # -----------------------------------------------------------------------
+    # 缓存管理
+    # -----------------------------------------------------------------------
+    def _invalidate_caches(self, scope: str = "all"):
+        """清除缓存。
+
+        scope:
+            "all"      — 全部清除（切换账号、刷新作品列表时调用）
+            "chapters" — 仅清除章节/发布缓存，保留卷结构（上传完成后调用）
+        """
+        self._last_publish_cache.clear()
+        self._platform_chapters_cache.clear()
+        if scope == "all":
+            self._volumes_cache.clear()
+
+    # -----------------------------------------------------------------------
     # UI 辅助
     # -----------------------------------------------------------------------
     def _after(self, ms, func, *args):
@@ -462,9 +488,9 @@ class FanqieGUI:
                     text=f"当前: {acct}", foreground="green")
             else:
                 self.lbl_auth.configure(
-                    text="登录状态: 已保存", foreground="green")
+                    text="已登录", foreground="green")
         else:
-            self.lbl_auth.configure(text="登录状态: 未登录", foreground="red")
+            self.lbl_auth.configure(text="未登录", foreground="red")
 
     # -----------------------------------------------------------------------
     # 多账号管理
@@ -545,10 +571,8 @@ class FanqieGUI:
         self._save_gui_state()
         self._refresh_auth_status()
 
-        # 清缓存
-        self._last_publish_cache.clear()
-        self._platform_chapters_cache.clear()
-        self._volumes_cache.clear()
+        # 切换账号: 清除全部缓存
+        self._invalidate_caches("all")
         self._hide_volumes()
 
         # 刷新共享浏览器 + 作品列表
@@ -568,13 +592,21 @@ class FanqieGUI:
 
         # --- 2. 按模式显示组件（注意 pack 顺序决定布局顺序） ---
         #   lbl_last_publish:   schedule, edit, reschedule
-        #   _volume_frame:      edit, reschedule (仅多卷时)
+        #   _volume_frame:      edit, reschedule (仅多卷时；勾选"合并所有卷"时隐藏分卷下拉)
         #   sched_frame:        schedule, reschedule
         #   _resched_filter_row: edit, reschedule
         #   chk_use_ai:         schedule, publish, edit
+        has_vols = bool(self.cmb_volume["values"])
         if mode in ("schedule", "edit", "reschedule"):
             self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
-        if mode in ("edit", "reschedule") and self.cmb_volume["values"]:
+        if mode in ("edit", "reschedule") and has_vols:
+            # 勾选"合并所有卷"时隐藏分卷下拉，只保留复选框
+            if self.all_volumes_var.get():
+                self._lbl_volume_sep.pack_forget()
+                self.cmb_volume.pack_forget()
+            else:
+                self._lbl_volume_sep.pack(side="left", padx=(12, 0))
+                self.cmb_volume.pack(side="left", padx=2, pady=4)
             self._volume_frame.pack(fill="x", padx=6, pady=(0, 4))
         if mode in ("schedule", "reschedule"):
             self.sched_frame.pack(fill="x", padx=6, pady=4)
@@ -722,7 +754,7 @@ class FanqieGUI:
             btn_text = {"edit": "开始修改", "reschedule": "开始修改"}.get(
                 mode, "开始上传")
             self.btn_upload.configure(state="normal", text=btn_text)
-            # 修改/修改定时模式下如果未载入章节列表则禁用
+            # 修改内容/修改排期模式下如果未载入章节列表则禁用
             if self.mode_var.get() in ("edit", "reschedule"):
                 idx = self.cmb_book.current()
                 book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
@@ -769,6 +801,10 @@ class FanqieGUI:
         self._gui_state[key] = book_id
         self._save_gui_state()
 
+        # 恢复"合并所有卷"状态（按作品持久化）
+        self.all_volumes_var.set(
+            self._gui_state.get(f"all_volumes_{book_id}", False))
+
         # 恢复卷选择器（如有缓存；None = 已检测过但无多卷）
         if book_id in self._volumes_cache:
             vols = self._volumes_cache[book_id]
@@ -779,7 +815,7 @@ class FanqieGUI:
         else:
             self._hide_volumes()
 
-        # 修改/修改定时模式: 走专用的章节列表获取（同时获取上次发布信息）
+        # 修改内容/修改排期模式: 走专用的章节列表获取（同时获取上次发布信息）
         if self.mode_var.get() in ("edit", "reschedule"):
             self.btn_upload.configure(state="disabled")
             self._fetch_platform_chapters_for_edit()
@@ -795,7 +831,7 @@ class FanqieGUI:
             return
 
         self.lbl_last_publish.configure(
-            text="上次定时发布: 获取中...", foreground="gray")
+            text="正在获取发布信息...", foreground="gray")
 
         gen = self._fetch_gen
         volumes_known = book_id in self._volumes_cache
@@ -847,7 +883,7 @@ class FanqieGUI:
             self._apply_last_publish(result)
         else:
             self.lbl_last_publish.configure(
-                text="上次定时发布: 未找到", foreground="gray")
+                text="暂无发布记录", foreground="gray")
 
     def _apply_last_publish(self, info):
         """将上次发布信息显示到 UI 并自动建议下一天起始日期。
@@ -858,9 +894,9 @@ class FanqieGUI:
         date_str = info["date"]
         time_str = info["time"]
         chapter = info.get("chapter", "")
-        label = f"上次定时发布: {date_str} {time_str}"
+        label = f"上次发布: {date_str} {time_str}"
         if chapter:
-            label += f"  ({chapter})"
+            label += f" ({chapter})"
         self.lbl_last_publish.configure(text=label, foreground="#d35400")
 
         # 自动建议: 起始日期 = 上次日期 + 1 天
@@ -894,7 +930,7 @@ class FanqieGUI:
         """填充卷选项，在 edit/reschedule 模式下显示（紧跟 lbl_last_publish 之后）。"""
         texts = [v["text"] for v in volumes]
         self.cmb_volume["values"] = texts
-        # 保留用户已有的选择（如果仍在列表中）
+        # 恢复优先级: 当前选择 > 平台活跃卷 > 首卷
         current = self.volume_var.get()
         if not (current and current in texts):
             active = [v["text"] for v in volumes if v.get("isActive")]
@@ -905,6 +941,12 @@ class FanqieGUI:
         # 仅 edit/reschedule 模式显示，用 after 保证位于 lbl_last_publish 之后
         if self.mode_var.get() in ("edit", "reschedule"):
             self._volume_frame.pack_forget()
+            if self.all_volumes_var.get():
+                self._lbl_volume_sep.pack_forget()
+                self.cmb_volume.pack_forget()
+            else:
+                self._lbl_volume_sep.pack(side="left", padx=(12, 0))
+                self.cmb_volume.pack(side="left", padx=2, pady=4)
             self._volume_frame.pack(
                 fill="x", padx=6, pady=(0, 4), after=self.lbl_last_publish)
 
@@ -927,12 +969,27 @@ class FanqieGUI:
             self.btn_upload.configure(state="disabled")
             self._fetch_platform_chapters_for_edit()
 
+    def _on_all_volumes_changed(self):
+        """用户切换了"合并所有卷"复选框，持久化并刷新。"""
+        # 持久化
+        idx = self.cmb_book.current()
+        if idx >= 0 and self.books:
+            book_id = self.books[idx]["bookId"]
+            self._gui_state[f"all_volumes_{book_id}"] = self.all_volumes_var.get()
+            self._save_gui_state()
+
+        self._fetch_gen += 1
+        # 刷新布局: 勾选时隐藏卷选择器，取消时显示
+        self._on_mode_change()
+
     def _get_selected_volume(self) -> str:
         """返回当前选中的卷名（无卷或未选择时返回空字符串）。"""
         return self.volume_var.get().strip()
 
     def _chapter_cache_key(self, book_id: str) -> str:
-        """章节缓存键: book_id + 当前选中的卷。"""
+        """章节缓存键: book_id + 当前选中的卷（或 __ALL__ 表示合并所有卷）。"""
+        if self.all_volumes_var.get():
+            return f"{book_id}:__ALL__"
         vol = self._get_selected_volume()
         return f"{book_id}:{vol}" if vol else book_id
 
@@ -956,11 +1013,12 @@ class FanqieGUI:
             return
 
         self.lbl_last_publish.configure(
-            text="正在获取平台章节列表...", foreground="gray")
+            text="正在获取章节列表...", foreground="gray")
 
         gen = self._fetch_gen
         selected_vol = self._get_selected_volume()
         volumes_known = book_id in self._volumes_cache
+        fetch_all_vols = self.all_volumes_var.get()
 
         async def task():
             page = None
@@ -980,15 +1038,34 @@ class FanqieGUI:
                         return
                     self._after(0, self._volumes_detected, book_id, vol_info)
                     has_vols = vol_info.get("hasVolumes")
+                    vol_list = vol_info.get("volumes", [])
                 else:
                     has_vols = bool(self._volumes_cache.get(book_id))
+                    vol_list = self._volumes_cache.get(book_id) or []
 
-                # 多卷时切换到指定卷
-                if selected_vol and has_vols:
-                    await select_volume(page, selected_vol)
-
-                chapters, last_pub = await extract_chapters_from_page(
-                    page, book_id)
+                # "合并所有卷" 模式: 遍历每个卷并合并章节
+                if fetch_all_vols and has_vols and vol_list:
+                    all_chapters = []
+                    last_pub = None
+                    for vi, vol in enumerate(vol_list):
+                        vol_name = vol["text"] if isinstance(vol, dict) else vol
+                        if self._fetch_gen != gen:
+                            return
+                        msg = f"正在索引分卷 ({vi+1}/{len(vol_list)}): {vol_name}..."
+                        self._after(0, lambda m=msg: self.lbl_last_publish.configure(
+                            text=m, foreground="gray"))
+                        await select_volume(page, vol_name)
+                        chs, lp = await extract_chapters_from_page(page, book_id)
+                        all_chapters.extend(chs)
+                        if lp and not last_pub:
+                            last_pub = lp
+                    chapters = all_chapters
+                else:
+                    # 单卷模式: 切换到指定卷
+                    if selected_vol and has_vols:
+                        await select_volume(page, selected_vol)
+                    chapters, last_pub = await extract_chapters_from_page(
+                        page, book_id)
 
                 if self._fetch_gen != gen:
                     return
@@ -1025,7 +1102,7 @@ class FanqieGUI:
         if last_pub and book_id not in self._last_publish_cache:
             self._last_publish_cache[book_id] = last_pub
         self.lbl_last_publish.configure(
-            text=f"平台共 {len(chapters)} 个章节", foreground="#d35400")
+            text=f"已索引 {len(chapters)} 个章节", foreground="#d35400")
         # 载入完成，恢复上传按钮
         if not self.uploading and self.mode_var.get() in ("edit", "reschedule"):
             self.btn_upload.configure(state="normal")
@@ -1039,11 +1116,13 @@ class FanqieGUI:
         if self._login_in_progress:
             messagebox.showinfo("提示", "登录正在进行中，请先完成或取消当前登录。")
             return
-        # 弹出对话框要求输入账号名称
+        # 弹出对话框要求输入账号名称，默认填充当前账号
+        current_acct = self._gui_state.get("current_account", "")
         raw = simpledialog.askstring(
             "账号名称",
             "请输入账号名称（如 作家A）：\n用于区分多个登录账号",
             parent=self.root,
+            initialvalue=current_acct,
         )
         if not raw or not raw.strip():
             return
@@ -1202,6 +1281,11 @@ class FanqieGUI:
                 page = await ctx.new_page()
                 await page.goto(BOOK_MANAGE_URL)
                 await page.wait_for_load_state("networkidle")
+                # 检测是否被重定向到登录页（会话失效）
+                cur_url = page.url
+                if "/login" in cur_url or "/writer/zone" not in cur_url and "book-manage" not in cur_url:
+                    self._after(0, self._books_fetched, [], "__SESSION_EXPIRED__")
+                    return
                 try:
                     await page.wait_for_selector('a[href*="chapter-manage/"]', timeout=5000)
                 except PWTimeout:
@@ -1210,7 +1294,12 @@ class FanqieGUI:
                 await save_auth(ctx)
                 self._after(0, self._books_fetched, books, None)
             except Exception as e:
-                self._after(0, self._books_fetched, [], str(e))
+                err_str = str(e)
+                # 超时大概率是会话失效导致页面跳转
+                if "Timeout" in err_str:
+                    self._after(0, self._books_fetched, [], "__SESSION_EXPIRED__")
+                else:
+                    self._after(0, self._books_fetched, [], err_str)
             finally:
                 if page:
                     try:
@@ -1222,13 +1311,21 @@ class FanqieGUI:
 
     def _books_fetched(self, books, error):
         self.btn_books.configure(state="normal")
+        if error == "__SESSION_EXPIRED__":
+            self._log("获取失败: 登录状态可能已失效")
+            acct = self._gui_state.get("current_account", "")
+            hint = f"，点击「登录/新建」重新登录{f'账号「{acct}」' if acct else ''}" if acct else ""
+            if messagebox.askyesno(
+                    "登录失效",
+                    f"无法访问作品管理页面，登录状态可能已过期。\n是否立即重新登录{hint}？"):
+                self._on_login()
+            return
         if error:
             self._log(f"获取失败: {error}")
             return
         self.books = books
-        self._last_publish_cache.clear()  # 清空缓存
-        self._platform_chapters_cache.clear()  # 修改模式章节缓存也一起清
-        self._volumes_cache.clear()
+        # 刷新作品列表: 清除全部缓存
+        self._invalidate_caches("all")
         self._hide_volumes()
         if not books:
             self._log("未找到作品，请检查登录状态。")
@@ -1291,32 +1388,33 @@ class FanqieGUI:
         # 按修改日期筛选
         if self.filter_var.get():
             raw = self.filter_date_var.get().strip()
-            try:
-                # 支持 "2025-01-01 08:00" 或 "2025-01-01"
-                for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                    try:
-                        cutoff = datetime.strptime(raw, fmt)
-                        break
-                    except ValueError:
-                        continue
-                else:
-                    raise ValueError("bad format")
-                op = self.filter_op_var.get()
-                total = len(self.files)
-                if op == "早于":
-                    self.files = [
-                        f for f in self.files
-                        if datetime.fromtimestamp(f.stat().st_mtime) < cutoff]
-                else:
-                    self.files = [
-                        f for f in self.files
-                        if datetime.fromtimestamp(f.stat().st_mtime) >= cutoff]
+            cutoff = None
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    cutoff = datetime.strptime(raw, fmt)
+                    break
+                except ValueError:
+                    continue
+            if cutoff is None:
                 self.lbl_filter_info.configure(
-                    text=f"(筛选: {len(self.files)}/{total} 个文件)",
-                    foreground="gray")
-            except ValueError:
-                self.lbl_filter_info.configure(
-                    text="(日期格式错误)", foreground="red")
+                    text=f"格式错误，应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM",
+                    foreground="red")
+                self.parsed_chapters = []
+                self._set_preview("日期筛选格式错误，请修正后重试")
+                return
+            op = self.filter_op_var.get()
+            total = len(self.files)
+            if op == "早于":
+                self.files = [
+                    f for f in self.files
+                    if datetime.fromtimestamp(f.stat().st_mtime) < cutoff]
+            else:
+                self.files = [
+                    f for f in self.files
+                    if datetime.fromtimestamp(f.stat().st_mtime) >= cutoff]
+            self.lbl_filter_info.configure(
+                text=f"筛选: {len(self.files)}/{total} 个文件",
+                foreground="gray")
 
         if not self.files:
             self.parsed_chapters = []
@@ -1333,7 +1431,7 @@ class FanqieGUI:
         """仅重新计算排期和刷新预览文本，不重新读取文件。"""
         mode = self.mode_var.get()
 
-        # 修改定时模式: 不依赖本地文件，使用平台章节
+        # 修改排期模式: 不依赖本地文件，使用平台章节
         if mode == "reschedule":
             self._refresh_reschedule_preview()
             return
@@ -1371,7 +1469,7 @@ class FanqieGUI:
             lines.append(f"  {i+1:3d}. {num_str} {title}  ({wc}字){sched_str}")
 
         mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
-                       "edit": "修改内容", "reschedule": "修改定时"}
+                       "edit": "修改内容", "reschedule": "修改排期"}
         summary = f"总计: {len(self.files)} 章, {total_words} 字 | 模式: {mode_labels[mode]}"
         if schedule:
             # 统计首天章数即为 effective per_day
@@ -1420,7 +1518,8 @@ class FanqieGUI:
                     self.lbl_resched_filter_info.configure(
                         text=f"筛选: {len(matched)}/{before} 章")
                 except (ValueError, tk.TclError):
-                    self.lbl_resched_filter_info.configure(text="(序号无效)")
+                    self.lbl_resched_filter_info.configure(
+                        text="序号无效，请输入数字", foreground="red")
             else:
                 self.lbl_resched_filter_info.configure(text="")
 
@@ -1435,11 +1534,11 @@ class FanqieGUI:
                 if i in matched_indices:
                     status = "[匹配]"
                 elif i in filtered_out_indices:
-                    status = "[跳过:筛选]"
+                    status = "[跳过·筛选]"
                 elif num is None:
-                    status = "[跳过:无章节号]"
+                    status = "[跳过·无章节号]"
                 else:
-                    status = "[跳过:平台无此章]"
+                    status = "[跳过·未找到]"
                 lines.append(
                     f"  {i+1:3d}. {num_str} {title}  ({wc}字)  {status}")
         else:
@@ -1461,14 +1560,15 @@ class FanqieGUI:
         self.lbl_progress.configure(text=f"0/{matched_count}")
 
     def _filter_reschedule_chapters(self, chapters):
-        """按章节序号筛选待修改定时的章节。"""
+        """按章节序号筛选待修改排期的章节。"""
         if not self.resched_filter_var.get():
             self.lbl_resched_filter_info.configure(text="")
             return chapters
         try:
             num = int(self.resched_filter_num_var.get())
         except (ValueError, tk.TclError):
-            self.lbl_resched_filter_info.configure(text="(序号无效)")
+            self.lbl_resched_filter_info.configure(
+                text="序号无效，请输入数字", foreground="red")
             return chapters
         op = self.resched_filter_op_var.get()
         total = len(chapters)
@@ -1481,7 +1581,7 @@ class FanqieGUI:
         return filtered
 
     def _refresh_reschedule_preview(self):
-        """修改定时模式预览: 显示平台章节 + 计算的新排期。"""
+        """修改排期模式预览: 显示平台章节 + 计算的新排期。"""
         self.lbl_resched_filter_info.configure(text="")
 
         idx = self.cmb_book.current()
@@ -1493,7 +1593,7 @@ class FanqieGUI:
 
         cache_key = self._chapter_cache_key(book_id)
         if cache_key not in self._platform_chapters_cache:
-            self._set_preview("正在获取平台章节列表...")
+            self._set_preview("正在获取章节列表...")
             return
 
         all_chapters = self._platform_chapters_cache[cache_key]
@@ -1507,7 +1607,7 @@ class FanqieGUI:
             if "待发布" in ch.get("status", "")
         ]
         if not platform_chapters:
-            self._set_preview("无待发布章节（仅待发布状态的章节可修改定时）")
+            self._set_preview("无待发布章节（仅「待发布」状态可修改排期）")
             return
 
         # 按章节序号筛选
@@ -1539,7 +1639,7 @@ class FanqieGUI:
             lines.append(f"  {i+1:3d}. {num_str} {title}{sched_str}")
 
         count = len(platform_chapters)
-        summary = f"总计: {count} 章(待发布) | 模式: 修改定时"
+        summary = f"总计: {count} 章(待发布) | 模式: 修改排期"
         if schedule:
             first_day = schedule[0][0]
             eff = sum(1 for d, _ in schedule if d == first_day)
@@ -1572,13 +1672,13 @@ class FanqieGUI:
         book_id = self.books[idx]["bookId"]
         book_name = self.books[idx]["name"]
 
-        # 修改定时模式: 不需要本地文件
+        # 修改排期模式: 不需要本地文件
         if mode == "reschedule":
             self._on_upload_reschedule(book_id, book_name)
             return
 
         if not self.files or not self.parsed_chapters:
-            messagebox.showwarning("提示", "请先选择章节目录")
+            messagebox.showwarning("提示", "请先选择章节文件夹")
             return
 
         # 修改内容模式
@@ -1615,7 +1715,7 @@ class FanqieGUI:
         # 确认
         count = len(self.parsed_chapters)
         mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
-                       "edit": "修改内容", "reschedule": "修改定时"}
+                       "edit": "修改内容", "reschedule": "修改排期"}
         msg = f"即将上传 {count} 章到「{book_name}」\n模式: {mode_labels[mode]}"
         if schedule:
             msg += f"\n排期: {schedule[0][0]} ~ {schedule[-1][0]}"
@@ -1752,8 +1852,8 @@ class FanqieGUI:
     def _upload_done(self, success, failed):
         self._remove_log_handler()
         self._set_uploading(False)
-        self._last_publish_cache.clear()  # 上传后清除缓存，下次获取最新数据
-        self._platform_chapters_cache.clear()
+        # 上传完成: 清除章节/发布缓存，卷结构不变无需清除
+        self._invalidate_caches("chapters")
 
         # 上传完成后将 .auth_state.json 回写到命名账号文件（保持 cookie 新鲜）
         acct = self._gui_state.get("current_account", "")
@@ -1765,20 +1865,20 @@ class FanqieGUI:
                 pass
 
         if success >= 0:
-            messagebox.showinfo("完成", f"成功: {success}  失败: {failed}")
+            messagebox.showinfo("操作完成", f"成功 {success} 章，失败 {failed} 章")
 
     # -----------------------------------------------------------------------
-    # 修改模式上传
+    # 修改内容
     # -----------------------------------------------------------------------
     def _on_upload_edit(self, book_id, book_name):
         if not self._matched_edit:
-            messagebox.showwarning("提示", "没有匹配到任何章节。\n请先选择作品并等待章节列表获取完成。")
+            messagebox.showwarning("无匹配章节", "未匹配到任何章节，请确认:\n1. 已选择正确的作品\n2. 章节列表已加载完成\n3. 本地文件包含有效章节号")
             return
 
         matched = self._matched_edit
         count = len(matched)
 
-        msg = f"即将修改「{book_name}」的 {count} 个章节\n模式: 修改已有章节"
+        msg = f"即将修改「{book_name}」的 {count} 个章节内容"
         if not messagebox.askyesno("确认修改", msg):
             return
 
@@ -1853,10 +1953,10 @@ class FanqieGUI:
         self.worker.submit(task())
 
     # -----------------------------------------------------------------------
-    # 修改定时模式上传
+    # 修改排期
     # -----------------------------------------------------------------------
     def _on_upload_reschedule(self, book_id, book_name):
-        """修改定时: 在章节管理页批量修改待发布章节的定时发布设置。"""
+        """修改排期: 在章节管理页批量修改待发布章节的排期设置。"""
         # 验证排期参数
         try:
             date_str = self.date_var.get()
@@ -1881,20 +1981,20 @@ class FanqieGUI:
         cache_key = self._chapter_cache_key(book_id)
         all_chapters = self._platform_chapters_cache.get(cache_key, [])
         if not all_chapters:
-            messagebox.showwarning("提示", "没有平台章节数据。\n请先选择作品并等待章节列表获取完成。")
+            messagebox.showwarning("无章节数据", "章节列表尚未加载，请等待加载完成后重试。")
             return
         platform_chapters = [
             ch for ch in reversed(all_chapters)
             if "待发布" in ch.get("status", "")
         ]
         if not platform_chapters:
-            messagebox.showinfo("提示", "没有待发布状态的章节可修改定时。")
+            messagebox.showinfo("提示", "没有「待发布」状态的章节可修改排期。")
             return
 
         # 按章节序号筛选
         platform_chapters = self._filter_reschedule_chapters(platform_chapters)
         if not platform_chapters:
-            messagebox.showinfo("提示", "筛选后无待发布章节可修改定时。")
+            messagebox.showinfo("提示", "筛选后无待发布章节可修改排期。")
             return
 
         # 计算排期并构建 schedule_map
@@ -1905,9 +2005,9 @@ class FanqieGUI:
             schedule_map[ch["title"]] = schedule[i]
 
         count = len(platform_chapters)
-        msg = (f"即将修改「{book_name}」的 {count} 个待发布章节的定时发布设置\n"
+        msg = (f"即将修改「{book_name}」{count} 个待发布章节的排期\n"
                f"排期: {schedule[0][0]} ~ {schedule[-1][0]}")
-        if not messagebox.askyesno("确认修改定时", msg):
+        if not messagebox.askyesno("确认修改排期", msg):
             return
 
         # 开始
@@ -1920,6 +2020,13 @@ class FanqieGUI:
         delay = self._cfg.get("delay_between_chapters", 3)
         smap = dict(schedule_map)
         vol = self._get_selected_volume()
+        # "合并所有卷"模式: 传入所有卷名列表
+        all_vol_names = None
+        if self.all_volumes_var.get():
+            vols = self._volumes_cache.get(book_id) or []
+            all_vol_names = [
+                v["text"] if isinstance(v, dict) else v for v in vols
+            ] or None
 
         async def task():
             try:
@@ -1935,19 +2042,20 @@ class FanqieGUI:
                         progress_cb=lambda done, total: self._after(
                             0, self._update_progress, done, total),
                         volume_text=vol,
+                        volume_texts=all_vol_names,
                     )
 
                     await save_auth(context)
                     await browser.close()
 
                 logger.info(f"{'='*40}")
-                logger.info(f"  修改定时完成! 成功: {success}  失败: {failed}")
+                logger.info(f"  修改排期完成! 成功: {success}  失败: {failed}")
                 logger.info(f"{'='*40}")
 
                 self._after(0, self._upload_done, success, failed)
 
             except Exception as e:
-                logger.error(f"修改定时异常: {e}")
+                logger.error(f"修改排期异常: {e}")
                 self._after(0, self._upload_done, -1, -1)
 
         self.worker.submit(task())
