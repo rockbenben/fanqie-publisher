@@ -964,8 +964,8 @@ def compute_schedule(
 
     规则:
       - 时间点数量 > per_day 时, 以时间点数量为准
-      - 时间点不足时, 从末尾 +1 分钟补齐, 最多到 23:59
-      - 超过 23:59 的槽位复用 23:59
+      - 时间点不足时, 均匀分配到各时间点, 同一时间内每章 +1 分钟
+      - 每个时间段上限为下一时间点前 1 分钟 (末尾为 23:59), 防止重叠
 
     返回: [(date_str, time_str), ...] 长度等于 file_count
     """
@@ -976,16 +976,24 @@ def compute_schedule(
         times = ["08:00"]
     # 时间点数量 > per_day 时，以时间点为准
     effective = max(per_day, len(times))
-    # 时间点不足时，从最后一个时间点起每隔 1 分钟补齐，上限 23:59
+    # 时间点不足时，均匀分配到各时间点，每个时间点内 +1 分钟递增
     if len(times) < effective:
-        last = datetime.strptime(times[-1], "%H:%M")
-        cap = datetime.strptime("23:59", "%H:%M")
-        while len(times) < effective:
-            nxt = last + timedelta(minutes=1)
-            if nxt > cap:
-                nxt = cap            # 跨午夜: 使用相同时间
-            last = nxt
-            times.append(nxt.strftime("%H:%M"))
+        n_times = len(times)
+        cap_global = datetime.strptime("23:59", "%H:%M")
+        parsed_times = [datetime.strptime(t, "%H:%M") for t in times]
+        expanded = []
+        for t_idx in range(n_times):
+            count = effective // n_times + (1 if t_idx < effective % n_times else 0)
+            base_t = parsed_times[t_idx]
+            # 每个时间段的上限: 下一时间点前 1 分钟, 末尾为 23:59
+            slot_cap = (parsed_times[t_idx + 1] - timedelta(minutes=1)
+                        if t_idx + 1 < n_times else cap_global)
+            for j in range(count):
+                nxt = base_t + timedelta(minutes=j)
+                if nxt > slot_cap:
+                    nxt = slot_cap
+                expanded.append(nxt.strftime("%H:%M"))
+        times = expanded
     schedule = []
     for i in range(file_count):
         day_offset = i // effective
