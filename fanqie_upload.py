@@ -286,8 +286,26 @@ def parse_md_file(fp: Path) -> tuple:
 
 
 def get_md_files(directory: Path) -> list:
-    files = [f for f in directory.iterdir() if f.suffix.lower() in (".md", ".txt")]
+    exts = (".md", ".txt")
+    files: list[Path] = []
+    subdirs: list[Path] = []
+    for item in directory.iterdir():
+        if item.is_dir():
+            subdirs.append(item)
+        elif item.is_file() and item.suffix.lower() in exts:
+            files.append(item)
     files.sort(key=natural_sort_key)
+    # 子文件夹中的文件也视为有效章节
+    subdirs.sort(key=natural_sort_key)
+    for sub in subdirs:
+        try:
+            sub_files = [f for f in sub.iterdir()
+                         if f.is_file() and f.suffix.lower() in exts]
+        except OSError:
+            logger.warning(f"无法访问子文件夹: {sub.name}")
+            continue
+        sub_files.sort(key=natural_sort_key)
+        files.extend(sub_files)
     return files
 
 
@@ -1247,7 +1265,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
     files = get_md_files(directory)
     if not files:
-        logger.warning(f"在 {directory} 中没有找到 .md/.txt 文件")
+        logger.warning(f"在 {directory} 及其子文件夹中没有找到 .md/.txt 文件")
         return
 
     # 解析所有文件
@@ -1758,7 +1776,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
 
     files = get_md_files(directory)
     if not files:
-        logger.warning(f"在 {directory} 中没有找到 .md/.txt 文件")
+        logger.warning(f"在 {directory} 及其子文件夹中没有找到 .md/.txt 文件")
         return
 
     parsed = [parse_md_file(f) for f in files]

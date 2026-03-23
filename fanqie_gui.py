@@ -252,9 +252,15 @@ class FanqieGUI:
         row1 = ttk.Frame(frm_dir)
         row1.pack(fill="x")
         self.dir_var = tk.StringVar()
-        # 默认使用脚本目录下的 chapters/（不存在则自动创建）
+        # 优先使用 config 中保存的路径，否则使用默认 chapters/
         DEFAULT_CHAPTERS_DIR.mkdir(exist_ok=True)
-        self.dir_var.set(str(DEFAULT_CHAPTERS_DIR))
+        saved_dir = self._cfg.get("chapters_dir", "")
+        if saved_dir and Path(saved_dir).is_dir():
+            self.dir_var.set(saved_dir)
+        else:
+            self.dir_var.set(str(DEFAULT_CHAPTERS_DIR))
+            if saved_dir:  # 保存的路径已失效，更新内存配置
+                self._cfg["chapters_dir"] = str(DEFAULT_CHAPTERS_DIR)
         ttk.Entry(row1, textvariable=self.dir_var, state="readonly").pack(
             side="left", padx=6, pady=4, fill="x", expand=True)
         ttk.Button(row1, text="浏览...", command=self._on_browse_dir).pack(
@@ -713,6 +719,7 @@ class FanqieGUI:
         """将当前 GUI 设置写入 config.json。"""
         self._cfg["default_mode"] = self.mode_var.get()
         self._cfg["default_time"] = self.time_var.get().strip() or "08:00"
+        self._cfg["chapters_dir"] = self.dir_var.get()
         try:
             self._cfg["default_per_day"] = self.perday_var.get()
         except tk.TclError:
@@ -1353,10 +1360,13 @@ class FanqieGUI:
     # 目录选择 + 预览
     # -----------------------------------------------------------------------
     def _on_browse_dir(self):
-        d = filedialog.askdirectory(title="选择章节 MD 文件目录")
+        d = filedialog.askdirectory(
+            title="选择章节 MD 文件目录",
+            initialdir=self.dir_var.get() or None)
         if not d:
             return
         self.dir_var.set(d)
+        self._schedule_config_save()
         self._reload_chapters()
 
     def _on_filter_toggle(self):
@@ -1379,10 +1389,16 @@ class FanqieGUI:
             self._set_preview("目录不存在")
             return
 
-        self.files = get_md_files(p)
+        try:
+            self.files = get_md_files(p)
+        except OSError as e:
+            self.files = []
+            self.parsed_chapters = []
+            self._set_preview(f"无法读取目录: {e}")
+            return
         if not self.files:
             self.parsed_chapters = []
-            self._set_preview("目录中没有 .md/.txt 文件")
+            self._set_preview("目录及子文件夹中没有 .md/.txt 文件")
             return
 
         # 按修改日期筛选
@@ -2068,6 +2084,10 @@ class FanqieGUI:
             if not messagebox.askyesno("确认", "上传正在进行中，确定退出吗？"):
                 return
         self._closing = True
+        # 刷新待保存的配置，防止防抖期间关闭导致丢失
+        if hasattr(self, "_config_save_after"):
+            self.root.after_cancel(self._config_save_after)
+            self._save_config()
         self._remove_log_handler()
         # 关闭共享浏览器
         try:
