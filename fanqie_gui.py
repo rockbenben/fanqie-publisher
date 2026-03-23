@@ -408,7 +408,7 @@ class FanqieGUI:
         ttk.Label(self._resched_filter_row, text="第").pack(side="left", padx=(4, 0))
         self.resched_filter_num_var = tk.StringVar(value="1")
         self.ent_resched_filter_num = ttk.Entry(
-            self._resched_filter_row, textvariable=self.resched_filter_num_var, width=6)
+            self._resched_filter_row, textvariable=self.resched_filter_num_var, width=8)
         self.ent_resched_filter_num.pack(side="left", padx=2)
         ttk.Label(self._resched_filter_row, text="章").pack(side="left")
         self.resched_filter_num_var.trace_add("write", lambda *_: self._refresh_preview())
@@ -639,12 +639,11 @@ class FanqieGUI:
         # --- 4. 模式特有逻辑 ---
         if mode in ("edit", "reschedule"):
             self._fetch_platform_chapters_for_edit()
-            # _on_platform_chapters_fetched 内会调 _refresh_preview，此处不重复
+            self._refresh_preview()
             self._schedule_config_save()
             return
 
         self._on_book_changed()
-        self._refresh_preview()
         self._schedule_config_save()
 
     def _install_log_handler(self):
@@ -824,56 +823,55 @@ class FanqieGUI:
         if self.mode_var.get() in ("edit", "reschedule"):
             self.btn_upload.configure(state="disabled")
             self._fetch_platform_chapters_for_edit()
-            return
-
-        # 有缓存直接用
-        if book_id in self._last_publish_cache:
+        elif book_id in self._last_publish_cache:
+            # 有缓存直接用（_apply_last_publish 会通过 date_var trace 触发预览刷新）
             self._apply_last_publish(self._last_publish_cache[book_id])
-            return
+        elif AUTH_FILE.exists():
+            # 后台获取（仅默认页，一般最新发布在首页即可看到）
+            self.lbl_last_publish.configure(
+                text="正在获取发布信息...", foreground="gray")
 
-        # 后台获取（仅默认页，一般最新发布在首页即可看到）
-        if not AUTH_FILE.exists():
-            return
+            gen = self._fetch_gen
+            volumes_known = book_id in self._volumes_cache
 
-        self.lbl_last_publish.configure(
-            text="正在获取发布信息...", foreground="gray")
-
-        gen = self._fetch_gen
-        volumes_known = book_id in self._volumes_cache
-
-        async def task():
-            page = None
-            try:
-                ctx = await self._shared.ensure()
-                page = await ctx.new_page()
-                if self._fetch_gen != gen:
-                    return
-                url = CHAPTER_MANAGE_URL.format(book_id=book_id)
-                await page.goto(url)
-                await page.wait_for_load_state("networkidle")
+            async def task():
+                page = None
                 try:
-                    await page.wait_for_selector("tr td", timeout=get_browser_timeout())
-                except PWTimeout:
-                    pass
-                if self._fetch_gen != gen:
-                    return
-                # 仅首次检测卷（结果会缓存，含 None 表示无多卷）
-                if not volumes_known:
-                    vol_info = await detect_volumes(page)
-                    self._after(0, self._volumes_detected, book_id, vol_info)
-                result = await page.evaluate(LAST_PUBLISH_JS)
-                self._after(0, self._last_publish_fetched, book_id, result)
-            except Exception:
-                if self._fetch_gen == gen:
-                    self._after(0, self._last_publish_fetched, book_id, None)
-            finally:
-                if page:
+                    ctx = await self._shared.ensure()
+                    page = await ctx.new_page()
+                    if self._fetch_gen != gen:
+                        return
+                    url = CHAPTER_MANAGE_URL.format(book_id=book_id)
+                    await page.goto(url)
+                    await page.wait_for_load_state("networkidle")
                     try:
-                        await page.close()
-                    except Exception:
+                        await page.wait_for_selector(
+                            "tr td", timeout=get_browser_timeout())
+                    except PWTimeout:
                         pass
+                    if self._fetch_gen != gen:
+                        return
+                    # 仅首次检测卷（结果会缓存，含 None 表示无多卷）
+                    if not volumes_known:
+                        vol_info = await detect_volumes(page)
+                        self._after(
+                            0, self._volumes_detected, book_id, vol_info)
+                    result = await page.evaluate(LAST_PUBLISH_JS)
+                    self._after(0, self._last_publish_fetched, book_id, result)
+                except Exception:
+                    if self._fetch_gen == gen:
+                        self._after(
+                            0, self._last_publish_fetched, book_id, None)
+                finally:
+                    if page:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
 
-        self.worker.submit(task())
+            self.worker.submit(task())
+
+        self._refresh_preview()
 
     def _last_publish_fetched(self, book_id, result):
         """后台获取完成，更新缓存和 UI。"""
@@ -973,6 +971,7 @@ class FanqieGUI:
         if mode in ("edit", "reschedule"):
             self.btn_upload.configure(state="disabled")
             self._fetch_platform_chapters_for_edit()
+            self._refresh_preview()
 
     def _on_all_volumes_changed(self):
         """用户切换了"合并所有卷"复选框，持久化并刷新。"""
@@ -1100,6 +1099,7 @@ class FanqieGUI:
         if error:
             self.lbl_last_publish.configure(
                 text=f"获取章节列表失败: {error}", foreground="red")
+            self._refresh_preview()
             return
 
         self._platform_chapters_cache[self._chapter_cache_key(book_id)] = chapters
@@ -1480,12 +1480,14 @@ class FanqieGUI:
 
         lines = []
         total_words = 0
+        kept_words = 0
         sched_idx = 0
         for i, (num, title, content) in enumerate(self.parsed_chapters):
             wc = len(strip_md_formatting(content))
             total_words += wc
             num_str = f"第{num}章" if num else "  ?  "
             if i in kept_set:
+                kept_words += wc
                 sched_str = ""
                 if schedule:
                     sched_str = f"  [{schedule[sched_idx][0]} {schedule[sched_idx][1]}]"
@@ -1498,9 +1500,10 @@ class FanqieGUI:
 
         mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
                        "edit": "修改内容", "reschedule": "修改排期"}
+        display_words = kept_words if filter_active else total_words
         count_str = (f"{kept_count}/{len(self.files)}" if filter_active
                      else str(len(self.files)))
-        summary = f"总计: {count_str} 章, {total_words} 字 | 模式: {mode_labels[mode]}"
+        summary = f"总计: {count_str} 章, {display_words} 字 | 模式: {mode_labels[mode]}"
         if schedule:
             # 统计首天章数即为 effective per_day
             first_day = schedule[0][0]
@@ -1579,27 +1582,50 @@ class FanqieGUI:
         """按章节序号筛选列表。
 
         key(item) 提取章节序号 (int 或 None, None 视为不匹配)。
+        支持单值 (≤/≥) 和范围 (如 5-10)。
         返回 (filtered_items, is_active)。同时更新筛选信息标签。
         """
+        # 默认恢复运算符下拉框（范围格式时会覆盖为 disabled）
+        self.cmb_resched_filter_op.configure(state="readonly")
+
         if not self.resched_filter_var.get():
             self.lbl_resched_filter_info.configure(text="", foreground="gray")
             return items, False
         try:
             raw = unicodedata.normalize("NFKC", self.resched_filter_num_var.get()).strip()
-            if not raw:
-                self.lbl_resched_filter_info.configure(text="", foreground="gray")
-                return items, False
-            threshold = int(raw)
-        except (ValueError, tk.TclError):
+        except tk.TclError:
+            return items, False
+        if not raw:
+            self.lbl_resched_filter_info.configure(text="", foreground="gray")
+            return items, False
+
+        total = len(items)
+
+        # 范围格式: "5-10" / "5~10"
+        m = re.match(r'^(\d+)\s*[-~]\s*(\d+)$', raw)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo > hi:
+                lo, hi = hi, lo
+            self.cmb_resched_filter_op.configure(state="disabled")
+            kept = [x for x in items
+                    if (n := key(x)) is not None and lo <= int(n) <= hi]
             self.lbl_resched_filter_info.configure(
-                text="序号无效，请输入数字", foreground="red")
+                text=f"筛选: {len(kept)}/{total} 章", foreground="gray")
+            return kept, True
+
+        # 单值格式: ≤ / ≥
+        try:
+            threshold = int(raw)
+        except ValueError:
+            self.lbl_resched_filter_info.configure(
+                text="请输入数字或范围(如 5-10)", foreground="red")
             return items, False
         op = self.resched_filter_op_var.get()
-        total = len(items)
         if op == "≤":
-            kept = [x for x in items if (n := key(x)) is not None and n <= threshold]
+            kept = [x for x in items if (n := key(x)) is not None and int(n) <= threshold]
         else:
-            kept = [x for x in items if (n := key(x)) is not None and n >= threshold]
+            kept = [x for x in items if (n := key(x)) is not None and int(n) >= threshold]
         self.lbl_resched_filter_info.configure(
             text=f"筛选: {len(kept)}/{total} 章", foreground="gray")
         return kept, True
