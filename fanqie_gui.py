@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import shutil
+import unicodedata
 import sys
 import threading
 import tkinter as tk
@@ -390,7 +391,7 @@ class FanqieGUI:
         # 启动时同步: config 可能有 per_day=2 但 times=3 个
         self._sync_perday_from_times()
 
-        # 章节序号筛选（修改内容/修改排期模式）
+        # 章节序号筛选
         self.resched_filter_var = tk.BooleanVar(value=False)
         self._resched_filter_row = ttk.Frame(frm_mode)
         ttk.Checkbutton(
@@ -597,14 +598,13 @@ class FanqieGUI:
         self.chk_use_ai.pack_forget()
 
         # --- 2. 按模式显示组件（注意 pack 顺序决定布局顺序） ---
-        #   lbl_last_publish:   schedule, edit, reschedule
+        #   lbl_last_publish:   all modes
         #   _volume_frame:      edit, reschedule (仅多卷时；勾选"合并所有卷"时隐藏分卷下拉)
         #   sched_frame:        schedule, reschedule
-        #   _resched_filter_row: edit, reschedule
+        #   _resched_filter_row: all modes
         #   chk_use_ai:         schedule, publish, edit
         has_vols = bool(self.cmb_volume["values"])
-        if mode in ("schedule", "edit", "reschedule"):
-            self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
+        self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
         if mode in ("edit", "reschedule") and has_vols:
             # 勾选"合并所有卷"时隐藏分卷下拉，只保留复选框
             if self.all_volumes_var.get():
@@ -616,8 +616,7 @@ class FanqieGUI:
             self._volume_frame.pack(fill="x", padx=6, pady=(0, 4))
         if mode in ("schedule", "reschedule"):
             self.sched_frame.pack(fill="x", padx=6, pady=4)
-        if mode in ("edit", "reschedule"):
-            self._resched_filter_row.pack(fill="x", padx=6, pady=(0, 4))
+        self._resched_filter_row.pack(fill="x", padx=6, pady=(0, 4))
         if mode in ("schedule", "publish", "edit"):
             self.chk_use_ai.pack(side="left", padx=6)
 
@@ -638,14 +637,13 @@ class FanqieGUI:
                 self.btn_upload.configure(state="normal")
 
         # --- 4. 模式特有逻辑 ---
-        if mode == "schedule":
-            self._on_book_changed()
-        elif mode in ("edit", "reschedule"):
+        if mode in ("edit", "reschedule"):
             self._fetch_platform_chapters_for_edit()
             # _on_platform_chapters_fetched 内会调 _refresh_preview，此处不重复
             self._schedule_config_save()
             return
 
+        self._on_book_changed()
         self._refresh_preview()
         self._schedule_config_save()
 
@@ -1460,7 +1458,15 @@ class FanqieGUI:
             self._refresh_edit_preview()
             return
 
-        # 计算排期
+        # 按章节序号筛选
+        all_indices = list(range(len(self.parsed_chapters)))
+        kept_indices, filter_active = self._filter_by_chapter_num(
+            all_indices, key=lambda i: self.parsed_chapters[i][0])
+        kept_set = set(kept_indices)
+
+        kept_count = len(kept_set)
+
+        # 计算排期（仅筛选后的章节）
         schedule = None
         if mode == "schedule":
             try:
@@ -1468,25 +1474,33 @@ class FanqieGUI:
                 datetime.strptime(date_str, "%Y-%m-%d")
                 time_str = self.time_var.get().strip() or "08:00"
                 per_day = self.perday_var.get()
-                schedule = compute_schedule(
-                    len(self.parsed_chapters), date_str, time_str, per_day)
+                schedule = compute_schedule(kept_count, date_str, time_str, per_day)
             except (ValueError, tk.TclError):
                 pass
 
         lines = []
         total_words = 0
+        sched_idx = 0
         for i, (num, title, content) in enumerate(self.parsed_chapters):
             wc = len(strip_md_formatting(content))
             total_words += wc
             num_str = f"第{num}章" if num else "  ?  "
-            sched_str = ""
-            if schedule:
-                sched_str = f"  [{schedule[i][0]} {schedule[i][1]}]"
-            lines.append(f"  {i+1:3d}. {num_str} {title}  ({wc}字){sched_str}")
+            if i in kept_set:
+                sched_str = ""
+                if schedule:
+                    sched_str = f"  [{schedule[sched_idx][0]} {schedule[sched_idx][1]}]"
+                sched_idx += 1
+                lines.append(f"  {i+1:3d}. {num_str} {title}  ({wc}字){sched_str}")
+            else:
+                status = "[跳过·无章节号]" if num is None else "[跳过·筛选]"
+                lines.append(
+                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)  {status}")
 
         mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
                        "edit": "修改内容", "reschedule": "修改排期"}
-        summary = f"总计: {len(self.files)} 章, {total_words} 字 | 模式: {mode_labels[mode]}"
+        count_str = (f"{kept_count}/{len(self.files)}" if filter_active
+                     else str(len(self.files)))
+        summary = f"总计: {count_str} 章, {total_words} 字 | 模式: {mode_labels[mode]}"
         if schedule:
             # 统计首天章数即为 effective per_day
             first_day = schedule[0][0]
@@ -1494,13 +1508,13 @@ class FanqieGUI:
             summary += f" | 每天{eff}章 | 排期: {date_str} ~ {schedule[-1][0]}"
 
         self._set_preview(summary + "\n" + "-" * 60 + "\n" + "\n".join(lines))
-        self.progress["maximum"] = len(self.files)
+        self.progress["maximum"] = max(kept_count, 1)
         self.progress["value"] = 0
-        self.lbl_progress.configure(text=f"0/{len(self.files)}")
+        self.lbl_progress.configure(text=f"0/{kept_count}")
 
     def _refresh_edit_preview(self):
         """修改模式专用预览: 显示匹配状态。"""
-        self.lbl_resched_filter_info.configure(text="")
+        self.lbl_resched_filter_info.configure(text="", foreground="gray")
 
         idx = self.cmb_book.current()
         book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
@@ -1519,25 +1533,11 @@ class FanqieGUI:
                 self.parsed_chapters, platform_chapters)
 
             # 按章节序号筛选
-            filtered_out_indices: set[int] = set()
-            if self.resched_filter_var.get():
-                try:
-                    fnum = int(self.resched_filter_num_var.get())
-                    op = self.resched_filter_op_var.get()
-                    before = len(matched)
-                    if op == "≤":
-                        kept = [m for m in matched if m[2] <= fnum]
-                    else:
-                        kept = [m for m in matched if m[2] >= fnum]
-                    filtered_out_indices = {m[0] for m in matched} - {m[0] for m in kept}
-                    matched = kept
-                    self.lbl_resched_filter_info.configure(
-                        text=f"筛选: {len(matched)}/{before} 章")
-                except (ValueError, tk.TclError):
-                    self.lbl_resched_filter_info.configure(
-                        text="序号无效，请输入数字", foreground="red")
-            else:
-                self.lbl_resched_filter_info.configure(text="")
+            all_matched_indices = {m[0] for m in matched}
+            matched, filter_active = self._filter_by_chapter_num(
+                matched, key=lambda m: m[2])
+            filtered_out_indices = (all_matched_indices - {m[0] for m in matched}
+                                    if filter_active else set())
 
             self._matched_edit = matched
             matched_count = len(matched)
@@ -1575,30 +1575,38 @@ class FanqieGUI:
         self.progress["value"] = 0
         self.lbl_progress.configure(text=f"0/{matched_count}")
 
-    def _filter_reschedule_chapters(self, chapters):
-        """按章节序号筛选待修改排期的章节。"""
+    def _filter_by_chapter_num(self, items, key):
+        """按章节序号筛选列表。
+
+        key(item) 提取章节序号 (int 或 None, None 视为不匹配)。
+        返回 (filtered_items, is_active)。同时更新筛选信息标签。
+        """
         if not self.resched_filter_var.get():
-            self.lbl_resched_filter_info.configure(text="")
-            return chapters
+            self.lbl_resched_filter_info.configure(text="", foreground="gray")
+            return items, False
         try:
-            num = int(self.resched_filter_num_var.get())
+            raw = unicodedata.normalize("NFKC", self.resched_filter_num_var.get()).strip()
+            if not raw:
+                self.lbl_resched_filter_info.configure(text="", foreground="gray")
+                return items, False
+            threshold = int(raw)
         except (ValueError, tk.TclError):
             self.lbl_resched_filter_info.configure(
                 text="序号无效，请输入数字", foreground="red")
-            return chapters
+            return items, False
         op = self.resched_filter_op_var.get()
-        total = len(chapters)
+        total = len(items)
         if op == "≤":
-            filtered = [ch for ch in chapters if (ch.get("chapterNum") or 0) <= num]
-        else:  # ≥
-            filtered = [ch for ch in chapters if (ch.get("chapterNum") or 0) >= num]
+            kept = [x for x in items if (n := key(x)) is not None and n <= threshold]
+        else:
+            kept = [x for x in items if (n := key(x)) is not None and n >= threshold]
         self.lbl_resched_filter_info.configure(
-            text=f"筛选: {len(filtered)}/{total} 章")
-        return filtered
+            text=f"筛选: {len(kept)}/{total} 章", foreground="gray")
+        return kept, True
 
     def _refresh_reschedule_preview(self):
         """修改排期模式预览: 显示平台章节 + 计算的新排期。"""
-        self.lbl_resched_filter_info.configure(text="")
+        self.lbl_resched_filter_info.configure(text="", foreground="gray")
 
         idx = self.cmb_book.current()
         book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
@@ -1627,7 +1635,8 @@ class FanqieGUI:
             return
 
         # 按章节序号筛选
-        platform_chapters = self._filter_reschedule_chapters(platform_chapters)
+        platform_chapters, _ = self._filter_by_chapter_num(
+            platform_chapters, key=lambda ch: ch.get("chapterNum"))
         if not platform_chapters:
             self._set_preview("筛选后无待发布章节")
             return
@@ -1704,6 +1713,20 @@ class FanqieGUI:
 
         use_ai = self.use_ai_var.get()
 
+        # 复制数据避免主线程修改
+        parsed = list(self.parsed_chapters)
+        files = list(self.files)
+
+        # 按章节序号筛选
+        all_indices = list(range(len(parsed)))
+        kept_indices, _ = self._filter_by_chapter_num(
+            all_indices, key=lambda i: parsed[i][0])
+        parsed = [parsed[i] for i in kept_indices]
+        files = [files[i] for i in kept_indices]
+        if not parsed:
+            messagebox.showwarning("提示", "筛选后无可上传章节")
+            return
+
         # 定时发布参数
         schedule = None
         if mode == "schedule":
@@ -1726,10 +1749,10 @@ class FanqieGUI:
                     "多个时间用逗号分隔, 如: 08:00,12:00,20:00")
                 return
             schedule = compute_schedule(
-                len(self.parsed_chapters), date_str, time_str, per_day)
+                len(parsed), date_str, time_str, per_day)
 
         # 确认
-        count = len(self.parsed_chapters)
+        count = len(parsed)
         mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
                        "edit": "修改内容", "reschedule": "修改排期"}
         msg = f"即将上传 {count} 章到「{book_name}」\n模式: {mode_labels[mode]}"
@@ -1745,10 +1768,6 @@ class FanqieGUI:
         self._install_log_handler()
 
         delay = self._cfg.get("delay_between_chapters", 3)
-
-        # 复制数据避免主线程修改
-        parsed = list(self.parsed_chapters)
-        files = list(self.files)
 
         async def task():
             try:
@@ -2008,7 +2027,8 @@ class FanqieGUI:
             return
 
         # 按章节序号筛选
-        platform_chapters = self._filter_reschedule_chapters(platform_chapters)
+        platform_chapters, _ = self._filter_by_chapter_num(
+            platform_chapters, key=lambda ch: ch.get("chapterNum"))
         if not platform_chapters:
             messagebox.showinfo("提示", "筛选后无待发布章节可修改排期。")
             return
