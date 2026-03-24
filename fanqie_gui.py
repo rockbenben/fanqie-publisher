@@ -187,6 +187,7 @@ class FanqieGUI:
         self.books: list[dict] = []
         self.parsed_chapters: list[tuple] = []
         self.files: list[Path] = []
+        self._word_counts: list[int] = []
         self.uploading = False
         self._closing = False
         self._cancel_requested = False
@@ -1098,7 +1099,8 @@ class FanqieGUI:
 
         if error:
             self.lbl_last_publish.configure(
-                text=f"获取章节列表失败: {error}", foreground="red")
+                text=f"获取章节列表失败: {error}（重新选择作品可重试）",
+                foreground="red")
             self._refresh_preview()
             return
 
@@ -1377,6 +1379,7 @@ class FanqieGUI:
 
     def _reload_chapters(self):
         """从磁盘重新扫描并解析章节文件。仅在目录变更/用户点刷新时调用。"""
+        self._word_counts = []
         dir_path = self.dir_var.get()
         if not dir_path:
             return
@@ -1438,6 +1441,9 @@ class FanqieGUI:
         self.parsed_chapters = [parse_md_file(f) for f in self.files]
         if self.unique_var.get():
             self.parsed_chapters = deduplicate_titles(self.parsed_chapters)
+        # 缓存字数，避免预览刷新时重复调用 strip_md_formatting
+        self._word_counts = [
+            len(strip_md_formatting(c)) for _, _, c in self.parsed_chapters]
 
         self._refresh_preview()
 
@@ -1483,7 +1489,7 @@ class FanqieGUI:
         kept_words = 0
         sched_idx = 0
         for i, (num, title, content) in enumerate(self.parsed_chapters):
-            wc = len(strip_md_formatting(content))
+            wc = self._word_counts[i] if i < len(self._word_counts) else len(strip_md_formatting(content))
             total_words += wc
             num_str = f"第{num}章" if num else "  ?  "
             if i in kept_set:
@@ -1547,7 +1553,7 @@ class FanqieGUI:
             matched_indices = {m[0] for m in matched}
 
             for i, (num, title, content) in enumerate(self.parsed_chapters):
-                wc = len(strip_md_formatting(content))
+                wc = self._word_counts[i] if i < len(self._word_counts) else len(strip_md_formatting(content))
                 total_words += wc
                 num_str = f"第{num}章" if num else "  ?  "
                 if i in matched_indices:
@@ -1563,7 +1569,7 @@ class FanqieGUI:
         else:
             self._matched_edit = []
             for i, (num, title, content) in enumerate(self.parsed_chapters):
-                wc = len(strip_md_formatting(content))
+                wc = self._word_counts[i] if i < len(self._word_counts) else len(strip_md_formatting(content))
                 total_words += wc
                 num_str = f"第{num}章" if num else "  ?  "
                 lines.append(
@@ -1637,18 +1643,24 @@ class FanqieGUI:
         idx = self.cmb_book.current()
         book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
 
+        def _early_return(text):
+            self._set_preview(text)
+            self.progress["maximum"] = 1
+            self.progress["value"] = 0
+            self.lbl_progress.configure(text="")
+
         if not book_id:
-            self._set_preview("请先选择作品")
+            _early_return("请先选择作品")
             return
 
         cache_key = self._chapter_cache_key(book_id)
         if cache_key not in self._platform_chapters_cache:
-            self._set_preview("正在获取章节列表...")
+            _early_return("正在获取章节列表...")
             return
 
         all_chapters = self._platform_chapters_cache[cache_key]
         if not all_chapters:
-            self._set_preview("平台无章节")
+            _early_return("平台无章节")
             return
 
         # 反转顺序（章节管理页最新在前）+ 只保留"待发布"章节
@@ -1657,14 +1669,14 @@ class FanqieGUI:
             if "待发布" in ch.get("status", "")
         ]
         if not platform_chapters:
-            self._set_preview("无待发布章节（仅「待发布」状态可修改排期）")
+            _early_return("无待发布章节（仅「待发布」状态可修改排期）")
             return
 
         # 按章节序号筛选
         platform_chapters, _ = self._filter_by_chapter_num(
             platform_chapters, key=lambda ch: ch.get("chapterNum"))
         if not platform_chapters:
-            self._set_preview("筛选后无待发布章节")
+            _early_return("筛选后无待发布章节")
             return
 
         # 计算排期
@@ -1744,8 +1756,9 @@ class FanqieGUI:
         files = list(self.files)
 
         # 按章节序号筛选
+        total_before_filter = len(parsed)
         all_indices = list(range(len(parsed)))
-        kept_indices, _ = self._filter_by_chapter_num(
+        kept_indices, filter_active = self._filter_by_chapter_num(
             all_indices, key=lambda i: parsed[i][0])
         parsed = [parsed[i] for i in kept_indices]
         files = [files[i] for i in kept_indices]
@@ -1758,10 +1771,16 @@ class FanqieGUI:
         if mode == "schedule":
             try:
                 date_str = self.date_var.get()
-                datetime.strptime(date_str, "%Y-%m-%d")
+                start_dt = datetime.strptime(date_str, "%Y-%m-%d")
             except ValueError:
                 messagebox.showerror("日期错误", "请输入正确的日期: YYYY-MM-DD")
                 return
+            if start_dt.date() < datetime.now().date():
+                if not messagebox.askyesno(
+                        "日期提醒",
+                        f"起始日期 {date_str} 已过去，"
+                        f"平台可能拒绝定时发布到过去的日期。\n是否继续？"):
+                    return
             try:
                 per_day = max(1, self.perday_var.get())
             except tk.TclError:
@@ -1781,7 +1800,9 @@ class FanqieGUI:
         count = len(parsed)
         mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
                        "edit": "修改内容", "reschedule": "修改排期"}
-        msg = f"即将上传 {count} 章到「{book_name}」\n模式: {mode_labels[mode]}"
+        count_str = (f"{count}/{total_before_filter} 章（已筛选）"
+                     if filter_active else f"{count} 章")
+        msg = f"即将上传 {count_str} 到「{book_name}」\n模式: {mode_labels[mode]}"
         if schedule:
             msg += f"\n排期: {schedule[0][0]} ~ {schedule[-1][0]}"
         if not messagebox.askyesno("确认上传", msg):
@@ -1789,6 +1810,7 @@ class FanqieGUI:
 
         # 开始
         self._set_uploading(True)
+        self.progress["maximum"] = max(count, 1)
         self.progress["value"] = 0
 
         self._install_log_handler()
@@ -2021,10 +2043,16 @@ class FanqieGUI:
         # 验证排期参数
         try:
             date_str = self.date_var.get()
-            datetime.strptime(date_str, "%Y-%m-%d")
+            start_dt = datetime.strptime(date_str, "%Y-%m-%d")
         except ValueError:
             messagebox.showerror("日期错误", "请输入正确的日期: YYYY-MM-DD")
             return
+        if start_dt.date() < datetime.now().date():
+            if not messagebox.askyesno(
+                    "日期提醒",
+                    f"起始日期 {date_str} 已过去，"
+                    f"平台可能拒绝定时发布到过去的日期。\n是否继续？"):
+                return
         try:
             per_day = max(1, self.perday_var.get())
         except tk.TclError:
@@ -2063,8 +2091,17 @@ class FanqieGUI:
         schedule = compute_schedule(
             len(platform_chapters), date_str, time_str, per_day)
         schedule_map = {}
+        dup_titles = []
         for i, ch in enumerate(platform_chapters):
-            schedule_map[ch["title"]] = schedule[i]
+            title = ch["title"]
+            if title in schedule_map:
+                dup_titles.append(title)
+            schedule_map[title] = schedule[i]
+        if dup_titles:
+            names = "、".join(dict.fromkeys(dup_titles))  # 去重保序
+            messagebox.showwarning(
+                "同名章节",
+                f"存在同名章节: {names}\n同名章节的排期可能不准确，建议先在平台修改章节标题。")
 
         count = len(platform_chapters)
         msg = (f"即将修改「{book_name}」{count} 个待发布章节的排期\n"
@@ -2158,6 +2195,14 @@ if __name__ == "__main__":
     try:
         app = FanqieGUI()
         app.run()
-    except Exception:
+    except Exception as e:
         logger.exception("启动异常")
-        raise
+        # pythonw 下 raise 无可见输出，改用 messagebox 告知用户
+        try:
+            _r = tk.Tk()
+            _r.withdraw()
+            messagebox.showerror(
+                "启动异常",
+                f"程序异常退出:\n{e}\n\n详细日志: {UPLOAD_LOG_FILE}")
+        except Exception:
+            pass

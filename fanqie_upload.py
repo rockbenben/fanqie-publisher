@@ -183,6 +183,8 @@ def _extract_chapter_num(text: str) -> str | None:
         "第 27 章 标题"      -> "27"
         "第十六章 发布会"    -> "16"
         "第一百二十三章 标题" -> "123"
+        "第27回 黛玉葬花"    -> "27"
+        "第十六话 出发"      -> "16"
         "chapter-027"        -> "27"
         "Chapter 3 - Title"  -> "3"
     """
@@ -190,12 +192,12 @@ def _extract_chapter_num(text: str) -> str | None:
     m = re.match(r"^(\d+)", text)
     if m:
         return str(int(m.group(1)))
-    # 2) 第X章 - 阿拉伯数字: 第27章, 第 27 章
-    m = re.match(r"^第\s*(\d+)\s*章", text)
+    # 2) 第X章/回/节/话 - 阿拉伯数字: 第27章, 第 27 章, 第27回
+    m = re.match(r"^第\s*(\d+)\s*[章回节话]", text)
     if m:
         return str(int(m.group(1)))
-    # 3) 第X章 - 中文数字: 第十六章, 第一百二十三章
-    m = re.match(r"^第([零〇一二两三四五六七八九十百千]+)章", text)
+    # 3) 第X章/回/节/话 - 中文数字: 第十六章, 第一百二十三回
+    m = re.match(r"^第([零〇一二两三四五六七八九十百千]+)[章回节话]", text)
     if m:
         num = _cn_to_int(m.group(1))
         if num > 0:
@@ -213,15 +215,18 @@ def _strip_chapter_prefix(text: str) -> str:
 
     "第 27 章 重新开始"  -> "重新开始"
     "第27章重新开始"      -> "重新开始"
+    "第27回 黛玉葬花"    -> "黛玉葬花"
+    "第十六话 出发"      -> "出发"
     "001 新的旅程"        -> "新的旅程"
+    "001：新的旅程"       -> "新的旅程"
     "chapter-3 出发"      -> "出发"
     "Chapter 3 - Hello"  -> "Hello"
     """
     original = text.strip()
     patterns = [
-        r"^第\s*\d+\s*章[\s:：_\-]*",             # 第 27 章 / 第27章
-        r"^第[零〇一二两三四五六七八九十百千]+章[\s:：_\-]*",  # 第十六章 / 第一百二十三章
-        r"^\d+[\s_\-]+",                           # 001_xxx / 001 xxx（必须有分隔符）
+        r"^第\s*\d+\s*[章回节话][\s:：_\-]*",     # 第 27 章 / 第27章 / 第27回
+        r"^第[零〇一二两三四五六七八九十百千]+[章回节话][\s:：_\-]*",  # 第十六章 / 第一百二十三回
+        r"^\d+[\s:：_\-]+",                        # 001_xxx / 001:标题 / 001：标题
         r"^chapter[\s_\-]*\d+[\s_\-]*",            # chapter-3 / Chapter 3 -
     ]
     for pat in patterns:
@@ -318,6 +323,8 @@ def strip_md_formatting(text: str) -> str:
     # 移除加粗/斜体
     text = re.sub(r"\*{1,3}(.*?)\*{1,3}", r"\1", text)
     text = re.sub(r"_{1,3}(.*?)_{1,3}", r"\1", text)
+    # 移除删除线
+    text = re.sub(r"~~(.*?)~~", r"\1", text)
     # 移除标题标记
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     # 移除引用标记
@@ -327,6 +334,19 @@ def strip_md_formatting(text: str) -> str:
     # 移除代码块标记
     text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
     text = re.sub(r"`([^`]*)`", r"\1", text)
+    # 移除 HTML 注释
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    # 移除 HTML 标签
+    text = re.sub(r"<[^>]+>", "", text)
+    # 移除任务列表标记 (- [ ] / - [x]，须在普通列表标记之前处理)
+    text = re.sub(r"^\s*[-*+]\s+\[[ xX]\]\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+[.)]\s+\[[ xX]\]\s*", "", text, flags=re.MULTILINE)
+    # 移除无序列表标记 (- / * / + 开头)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    # 移除有序列表标记 (1. / 2) 等)
+    text = re.sub(r"^\s*\d+[.)]\s+", "", text, flags=re.MULTILINE)
+    # 合并连续空行为单个空行
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
@@ -353,16 +373,22 @@ def deduplicate_titles(
         return parsed_chapters
 
     # 给重复的标题加后缀
+    # used 跟踪所有已使用的标题，防止后缀后仍然碰撞
+    used: set[str] = {t for _, t, _ in parsed_chapters if t not in dup_titles}
     seen: dict[str, int] = {}
     result = []
     for chapter_num, title, content in parsed_chapters:
-        if title in dup_titles:
-            suffix = chapter_num if chapter_num else str(seen.get(title, 1))
-            new_title = f"{title}（{suffix}）"
-            seen[title] = seen.get(title, 1) + 1
-            result.append((chapter_num, new_title, content))
-        else:
+        if title not in dup_titles:
             result.append((chapter_num, title, content))
+            continue
+        suffix = chapter_num if chapter_num else str(seen.get(title, 1))
+        new_title = f"{title}（{suffix}）"
+        seen[title] = seen.get(title, 1) + 1
+        while new_title in used:
+            new_title = f"{title}（{seen[title]}）"
+            seen[title] += 1
+        used.add(new_title)
+        result.append((chapter_num, new_title, content))
     return result
 
 
@@ -711,7 +737,7 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
 
             // 章节号
             let chapterNum = null;
-            let m = title.match(/^第\s*(\d+)\s*章/);
+            let m = title.match(/^第\s*(\d+)\s*[章回节话]/);
             if (m) chapterNum = parseInt(m[1], 10);
             else { m = title.match(/^(\d+)/); if (m) chapterNum = parseInt(m[1], 10); }
 
@@ -940,15 +966,20 @@ def _validate_times(raw: str) -> list[str]:
     输入: 逗号分隔的时间 (如 "20:00, 08:00, 12:00")
     输出: 合法的 HH:MM 列表, 已排序去重 (如 ["08:00", "12:00", "20:00"])
     不合法的条目静默丢弃。
+
+    兼容: 全角标点 (，：；)、单位数小时 (8:00 -> 08:00)。
     """
+    # 标准化分隔符: 全角逗号/分号 → 半角逗号
+    raw = raw.replace("\uff0c", ",").replace("\uff1b", ",").replace(";", ",")
     result = []
     for t in raw.split(","):
-        t = t.strip()
-        if not re.match(r"^\d{2}:\d{2}$", t):
+        t = t.strip().replace("\uff1a", ":")  # 全角冒号 → 半角
+        m = re.match(r"^(\d{1,2}):(\d{2})$", t)
+        if not m:
             continue
-        h, m = int(t[:2]), int(t[3:])
-        if 0 <= h <= 23 and 0 <= m <= 59:
-            result.append(t)
+        h, mi = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            result.append(f"{h:02d}:{mi:02d}")
     # 字符串排序对 HH:MM 格式等同时间排序; dict.fromkeys 保序去重
     return list(dict.fromkeys(sorted(result)))
 
