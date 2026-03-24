@@ -19,6 +19,7 @@ config.json
 chapters/
 error_*.png
 fanqie_error.log
+fanqie_error.log.*
 
 # IDE
 .idea/
