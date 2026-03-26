@@ -1693,13 +1693,11 @@ class FanqieGUI:
 
         lines = []
         for i, ch in enumerate(platform_chapters):
-            num = ch.get("chapterNum")
             title = ch.get("title", "")
-            num_str = f"第{num}章" if num else "  ?  "
             sched_str = ""
             if schedule:
                 sched_str = f"  [{schedule[i][0]} {schedule[i][1]}]"
-            lines.append(f"  {i+1:3d}. {num_str} {title}{sched_str}")
+            lines.append(f"  {i+1:3d}. {title}{sched_str}")
 
         count = len(platform_chapters)
         summary = f"总计: {count} 章(待发布) | 模式: 修改排期"
