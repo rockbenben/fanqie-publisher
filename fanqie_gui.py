@@ -1868,8 +1868,11 @@ class FanqieGUI:
                                     btn = page.locator("button", has_text="确认发布")
                                     if await btn.count() == 0:
                                         raise RuntimeError("未找到确认发布按钮")
-                                    await btn.first.click()
-                                    await page.wait_for_timeout(2000)
+                                    await btn.first.click(no_wait_after=True)
+                                    try:
+                                        await btn.first.wait_for(state="hidden", timeout=get_browser_timeout())
+                                    except Exception:
+                                        await page.wait_for_timeout(2000)
                                     await _check_daily_limit(page)
                                     logger.info("  -> 已发布")
                                 else:

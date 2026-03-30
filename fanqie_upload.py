@@ -629,28 +629,38 @@ BOOKS_JS = r"""() => {
     const links = document.querySelectorAll('a[href*="chapter-manage/"]');
     for (const link of links) {
         const href = link.getAttribute('href') || '';
-        const m = href.match(/chapter-manage\/(\d+)&([^?]*)/);
+        const m = href.match(/chapter-manage\/(\d+)(?:&([^?]*))?/);
         if (!m) continue;
         const bookId = m[1];
         let name;
-        try { name = decodeURIComponent(m[2]); }
-        catch { name = m[2]; }
+        if (m[2]) {
+            try { name = decodeURIComponent(m[2]); }
+            catch { name = m[2]; }
+        } else {
+            name = '';
+        }
         let container = link;
         for (let i = 0; i < 12; i++) {
             if (!container.parentElement) break;
             container = container.parentElement;
-            if (container.textContent.length > 30 &&
-                container.textContent.includes('万字')) break;
+            const ct = container.textContent || '';
+            if (ct.length > 30 &&
+                (ct.includes('万字') || /\d+\s*章/.test(ct))) break;
         }
         const text = container.textContent || '';
         const chapterMatch = text.match(/(\d+)\s*章/);
         const wordMatch = text.match(/([\d.]+)\s*万字/);
         const statusMatch = text.match(/(连载中|已完结)/);
         const signMatch = text.match(/(已签约|未签约)/);
+        if (!name) {
+            const linkText = link.textContent.trim();
+            if (linkText) name = linkText;
+            else name = '未命名作品';
+        }
         results.push({
             bookId, name,
-            chapters: chapterMatch ? chapterMatch[1] : '?',
-            words: wordMatch ? wordMatch[1] + '万' : '?',
+            chapters: chapterMatch ? chapterMatch[1] : '0',
+            words: wordMatch ? wordMatch[1] + '万' : '0',
             status: (statusMatch ? statusMatch[1] : '') +
                     (signMatch ? ' · ' + signMatch[1] : ''),
         });
@@ -1212,8 +1222,12 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
     confirm_btn = page.locator("button", has_text="确认发布")
     if await confirm_btn.count() == 0:
         raise RuntimeError("未找到确认发布按钮")
-    await confirm_btn.first.click()
-    await page.wait_for_timeout(2000)
+    await confirm_btn.first.click(no_wait_after=True)
+    # 等待发布对话框关闭（确认发布按钮消失即为成功）
+    try:
+        await confirm_btn.first.wait_for(state="hidden", timeout=_browser_timeout)
+    except Exception:
+        await page.wait_for_timeout(2000)
     await _check_daily_limit(page)
 
 
@@ -1423,8 +1437,11 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                         confirm_btn = page.locator("button", has_text="确认发布")
                         if await confirm_btn.count() == 0:
                             raise RuntimeError("未找到确认发布按钮")
-                        await confirm_btn.first.click()
-                        await page.wait_for_timeout(2000)
+                        await confirm_btn.first.click(no_wait_after=True)
+                        try:
+                            await confirm_btn.first.wait_for(state="hidden", timeout=_browser_timeout)
+                        except Exception:
+                            await page.wait_for_timeout(2000)
                         await _check_daily_limit(page)
                         logger.info(f"  -> 已发布")
                     else:
@@ -1497,8 +1514,11 @@ async def edit_one_chapter(
             confirm_btn = page.locator("button", has_text="确认发布")
             if await confirm_btn.count() == 0:
                 raise RuntimeError("未找到确认发布按钮")
-            await confirm_btn.first.click()
-            await page.wait_for_timeout(2000)
+            await confirm_btn.first.click(no_wait_after=True)
+            try:
+                await confirm_btn.first.wait_for(state="hidden", timeout=_browser_timeout)
+            except Exception:
+                await page.wait_for_timeout(2000)
             await _check_daily_limit(page)
             logger.info("  -> 已保存修改")
             return True
@@ -1730,8 +1750,11 @@ async def _reschedule_current_volume(
                     await page.wait_for_timeout(500)
 
                     # 点击"确认修改"
-                    await confirm_btn.click()
-                    await page.wait_for_timeout(1000)
+                    await confirm_btn.click(no_wait_after=True)
+                    try:
+                        await confirm_btn.wait_for(state="hidden", timeout=_browser_timeout)
+                    except Exception:
+                        await page.wait_for_timeout(1000)
 
                     logger.info(f"  -> 已修改定时 {date_str} {time_str}")
                     ok = True
