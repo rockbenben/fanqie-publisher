@@ -188,6 +188,8 @@ class FanqieGUI:
         self.parsed_chapters: list[tuple] = []
         self.files: list[Path] = []
         self._word_counts: list[int] = []
+        self._all_files: list[Path] = []      # 目录全部文件（扫描缓存）
+        self._all_parsed: list[tuple] = []    # 对应的解析结果缓存
         self.uploading = False
         self._closing = False
         self._cancel_requested = False
@@ -272,7 +274,7 @@ class FanqieGUI:
         self.unique_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             row1, text="自动处理重名", variable=self.unique_var,
-            command=self._reload_chapters).pack(side="left", padx=6)
+            command=self._apply_date_filter).pack(side="left", padx=6)
         self.filter_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             row1, text="按修改日期筛选",
@@ -287,16 +289,16 @@ class FanqieGUI:
             values=["早于", "晚于"], width=5, state="readonly")
         self.cmb_filter_op.pack(side="left", padx=(6, 2))
         self.cmb_filter_op.bind("<<ComboboxSelected>>",
-                                lambda _: self._reload_chapters())
+                                lambda _: self._apply_date_filter())
         self.filter_date_var = tk.StringVar(
             value=datetime.now().strftime("%Y-%m-%d %H:%M"))
         self.ent_filter_date = ttk.Entry(
             row_filter, textvariable=self.filter_date_var, width=16)
         self.ent_filter_date.pack(side="left", padx=2)
         self.ent_filter_date.bind(
-            "<FocusOut>", lambda _: self._reload_chapters())
+            "<FocusOut>", lambda _: self._apply_date_filter())
         self.ent_filter_date.bind(
-            "<Return>", lambda _: self._reload_chapters())
+            "<Return>", lambda _: self._apply_date_filter())
         ttk.Label(row_filter, text="格式: YYYY-MM-DD 或 YYYY-MM-DD HH:MM",
                   foreground="gray").pack(side="left", padx=2)
         self.lbl_filter_info = ttk.Label(row_filter, text="", foreground="gray")
@@ -1375,34 +1377,41 @@ class FanqieGUI:
         else:
             self._filter_row.pack_forget()
             self.lbl_filter_info.configure(text="")
-        self._reload_chapters()
+        self._apply_date_filter()
 
     def _reload_chapters(self):
         """从磁盘重新扫描并解析章节文件。仅在目录变更/用户点刷新时调用。"""
-        self._word_counts = []
+        self._all_files = []
+        self._all_parsed = []
         dir_path = self.dir_var.get()
         if not dir_path:
+            self.files, self.parsed_chapters, self._word_counts = [], [], []
             return
         p = Path(dir_path)
         if not p.is_dir():
-            self.files = []
-            self.parsed_chapters = []
+            self.files, self.parsed_chapters, self._word_counts = [], [], []
             self._set_preview("目录不存在")
             return
 
         try:
-            self.files = get_md_files(p)
+            self._all_files = get_md_files(p)
         except OSError as e:
-            self.files = []
-            self.parsed_chapters = []
+            self.files, self.parsed_chapters, self._word_counts = [], [], []
             self._set_preview(f"无法读取目录: {e}")
             return
-        if not self.files:
-            self.parsed_chapters = []
+        if not self._all_files:
+            self.files, self.parsed_chapters, self._word_counts = [], [], []
             self._set_preview("目录及子文件夹中没有 .md/.txt 文件")
             return
 
-        # 按修改日期筛选
+        self._all_parsed = [parse_md_file(f) for f in self._all_files]
+        self._apply_date_filter()
+
+    def _apply_date_filter(self):
+        """应用日期筛选 + 去重 + 刷新预览（复用已缓存的解析结果，不重新读取文件）。"""
+        if not self._all_files:
+            return
+
         if self.filter_var.get():
             raw = self.filter_date_var.get().strip()
             cutoff = None
@@ -1414,34 +1423,46 @@ class FanqieGUI:
                     continue
             if cutoff is None:
                 self.lbl_filter_info.configure(
-                    text=f"格式错误，应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM",
+                    text="格式错误，应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM",
                     foreground="red")
-                self.parsed_chapters = []
+                self.files, self.parsed_chapters, self._word_counts = [], [], []
                 self._set_preview("日期筛选格式错误，请修正后重试")
                 return
             op = self.filter_op_var.get()
-            total = len(self.files)
-            if op == "早于":
-                self.files = [
-                    f for f in self.files
-                    if datetime.fromtimestamp(f.stat().st_mtime) < cutoff]
-            else:
-                self.files = [
-                    f for f in self.files
-                    if datetime.fromtimestamp(f.stat().st_mtime) >= cutoff]
+            total = len(self._all_files)
+            kept, mtimes = [], []
+            for i, f in enumerate(self._all_files):
+                try:
+                    mt = datetime.fromtimestamp(f.stat().st_mtime)
+                except OSError:
+                    continue
+                mtimes.append(mt)
+                if (op == "早于" and mt < cutoff) or (op != "早于" and mt >= cutoff):
+                    kept.append(i)
+            self.files = [self._all_files[i] for i in kept]
+            self.parsed_chapters = [self._all_parsed[i] for i in kept]
+            if not self.files:
+                self._word_counts = []
+                self.lbl_filter_info.configure(
+                    text=f"筛选: 0/{total} 个文件", foreground="orange")
+                if mtimes:
+                    lo = min(mtimes).strftime("%Y-%m-%d %H:%M")
+                    hi = max(mtimes).strftime("%Y-%m-%d %H:%M")
+                    self._set_preview(
+                        f"没有符合筛选条件的文件\n"
+                        f"条件: {op} {raw} | 文件日期: {lo} ~ {hi}")
+                else:
+                    self._set_preview("没有符合筛选条件的文件")
+                return
             self.lbl_filter_info.configure(
                 text=f"筛选: {len(self.files)}/{total} 个文件",
                 foreground="gray")
+        else:
+            self.files = list(self._all_files)
+            self.parsed_chapters = list(self._all_parsed)
 
-        if not self.files:
-            self.parsed_chapters = []
-            self._set_preview("没有符合筛选条件的文件")
-            return
-
-        self.parsed_chapters = [parse_md_file(f) for f in self.files]
         if self.unique_var.get():
             self.parsed_chapters = deduplicate_titles(self.parsed_chapters)
-        # 缓存字数，避免预览刷新时重复调用 strip_md_formatting
         self._word_counts = [
             len(strip_md_formatting(c)) for _, _, c in self.parsed_chapters]
 
@@ -1488,21 +1509,32 @@ class FanqieGUI:
         total_words = 0
         kept_words = 0
         sched_idx = 0
+        skip_no_num = 0
+        skip_filter = 0
         for i, (num, title, content) in enumerate(self.parsed_chapters):
             wc = self._word_counts[i] if i < len(self._word_counts) else len(strip_md_formatting(content))
             total_words += wc
-            num_str = f"第{num}章" if num else "  ?  "
             if i in kept_set:
                 kept_words += wc
+                num_str = f"第{num}章" if num else "  ?  "
                 sched_str = ""
                 if schedule:
                     sched_str = f"  [{schedule[sched_idx][0]} {schedule[sched_idx][1]}]"
                 sched_idx += 1
-                lines.append(f"  {i+1:3d}. {num_str} {title}  ({wc}字){sched_str}")
+                lines.append(f"  {sched_idx:3d}. {num_str} {title}  ({wc}字){sched_str}")
             else:
-                status = "[跳过·无章节号]" if num is None else "[跳过·筛选]"
-                lines.append(
-                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)  {status}")
+                if num is None:
+                    skip_no_num += 1
+                else:
+                    skip_filter += 1
+        if skip_no_num or skip_filter:
+            parts = []
+            if skip_no_num:
+                parts.append(f"{skip_no_num} 无章节号")
+            if skip_filter:
+                parts.append(f"{skip_filter} 筛选")
+            lines.append(
+                f"  [跳过 {skip_no_num + skip_filter} 章: {', '.join(parts)}]")
 
         mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
                        "edit": "修改内容", "reschedule": "修改排期"}
@@ -1552,20 +1584,35 @@ class FanqieGUI:
             matched_count = len(matched)
             matched_indices = {m[0] for m in matched}
 
+            show_idx = 0
+            skip_filter = 0
+            skip_no_num = 0
+            skip_not_found = 0
             for i, (num, title, content) in enumerate(self.parsed_chapters):
                 wc = self._word_counts[i] if i < len(self._word_counts) else len(strip_md_formatting(content))
                 total_words += wc
-                num_str = f"第{num}章" if num else "  ?  "
                 if i in matched_indices:
-                    status = "[匹配]"
+                    show_idx += 1
+                    num_str = f"第{num}章" if num else "  ?  "
+                    lines.append(
+                        f"  {show_idx:3d}. {num_str} {title}  ({wc}字)")
                 elif i in filtered_out_indices:
-                    status = "[跳过·筛选]"
+                    skip_filter += 1
                 elif num is None:
-                    status = "[跳过·无章节号]"
+                    skip_no_num += 1
                 else:
-                    status = "[跳过·未找到]"
+                    skip_not_found += 1
+            skip_total = skip_filter + skip_no_num + skip_not_found
+            if skip_total:
+                parts = []
+                if skip_no_num:
+                    parts.append(f"{skip_no_num} 无章节号")
+                if skip_filter:
+                    parts.append(f"{skip_filter} 筛选")
+                if skip_not_found:
+                    parts.append(f"{skip_not_found} 未找到")
                 lines.append(
-                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)  {status}")
+                    f"  [跳过 {skip_total} 章: {', '.join(parts)}]")
         else:
             self._matched_edit = []
             for i, (num, title, content) in enumerate(self.parsed_chapters):
