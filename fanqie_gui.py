@@ -1982,9 +1982,14 @@ class FanqieGUI:
 
     def _upload_done(self, success, failed):
         self._remove_log_handler()
-        self._set_uploading(False)
-        # 上传完成: 清除章节/发布缓存，卷结构不变无需清除
+        # 先清缓存再切换上传状态，使 _set_uploading 在缓存为空时正确禁用按钮
         self._invalidate_caches("chapters")
+        self._set_uploading(False)
+
+        # 修改/排期模式：缓存已清，主动重拉一次平台章节，避免后续切换筛选器时
+        # _refresh_edit_preview 拿不到平台章节而把 _matched_edit 置空
+        if self.mode_var.get() in ("edit", "reschedule"):
+            self._fetch_platform_chapters_for_edit()
 
         # 上传完成后将 .auth_state.json 回写到命名账号文件（保持 cookie 新鲜）
         acct = self._gui_state.get("current_account", "")
