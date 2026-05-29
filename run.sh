@@ -23,9 +23,10 @@ fi
 if ! python3 -c "import playwright" &>/dev/null; then
     echo "[*] Installing dependencies..."
     python3 -m pip install -r requirements.txt || { echo "[!] pip install failed"; exit 1; }
-    echo "[*] Installing browser engine..."
-    python3 -m playwright install chromium || { echo "[!] Browser engine install failed"; exit 1; }
-    echo "[*] Done!"
 fi
+
+# 幂等：浏览器版本已对则秒退，不对/缺失则自动下载
+# 解决 Playwright 升级后浏览器没同步的"Executable doesn't exist"问题
+python3 -m playwright install chromium || { echo "[!] Browser engine install failed"; exit 1; }
 
 python3 fanqie_gui.py
