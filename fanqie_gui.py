@@ -25,7 +25,7 @@ try:
         load_config,
         parse_md_file, get_md_files, strip_md_formatting,
         deduplicate_titles, compute_schedule, _validate_times,
-        DailyLimitReached, _check_daily_limit,
+        DailyLimitReached, _check_daily_limit, _wait_publish_result,
         create_context, save_auth,
         wait_for_editor_ready, fill_chapter,
         save_draft, publish_scheduled, _navigate_to_publish_settings,
@@ -204,6 +204,14 @@ class FanqieGUI:
         self._shared = _SharedBrowser()  # 复用的无头浏览器
         self._fetch_gen = 0  # 防抖: 每次切换作品/卷递增
         self._login_in_progress = False  # 防止并发登录
+        # --- 定时执行 ---
+        self.timer_enabled = False        # 定时是否启动
+        self._timer_target = None         # datetime: 目标执行时刻
+        self._timer_after_id = None       # 轮询 after id
+        self._timer_waiting_busy = False  # 已到点但有任务在运行，等待空闲
+        self._timer_prerefresh_done = False  # 触发前 60 秒目录刷新是否已执行
+        self._auto_run = False            # 守护同步弹窗阶段（定时触发时为 True）
+        self._auto_run_pending = False    # 跨异步任务，供 _upload_done 抑制完成弹窗
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -419,6 +427,32 @@ class FanqieGUI:
         self.lbl_resched_filter_info = ttk.Label(
             self._resched_filter_row, text="", foreground="gray")
         self.lbl_resched_filter_info.pack(side="left", padx=6)
+
+        # --- 4.5 定时执行 ---
+        frm_timer = ttk.LabelFrame(self.root, text="定时执行（到点自动执行当前所选操作，单次）")
+        frm_timer.pack(fill="x", **pad)
+        row_timer = ttk.Frame(frm_timer)
+        row_timer.pack(fill="x", padx=6, pady=4)
+        ttk.Label(row_timer, text="执行时间:").pack(side="left")
+        # 回填上次时间；若已过期或无效，回退到当前时间 +1 小时
+        _saved_timer = self._parse_timer_input(self._cfg.get("timer_time", ""))
+        if _saved_timer is None or _saved_timer <= datetime.now():
+            default_timer = (datetime.now() + timedelta(hours=1)).strftime(
+                "%Y-%m-%d %H:%M")
+        else:
+            default_timer = _saved_timer.strftime("%Y-%m-%d %H:%M")
+        self.timer_time_var = tk.StringVar(value=default_timer)
+        self.ent_timer = ttk.Entry(
+            row_timer, textvariable=self.timer_time_var, width=18)
+        self.ent_timer.pack(side="left", padx=4)
+        ttk.Label(row_timer, text="格式: YYYY-MM-DD HH:MM",
+                  foreground="gray").pack(side="left", padx=2)
+        self.btn_timer = ttk.Button(
+            row_timer, text="启动定时", command=self._toggle_timer)
+        self.btn_timer.pack(side="left", padx=8)
+        self.lbl_timer_status = ttk.Label(
+            row_timer, text="定时未启动", foreground="gray")
+        self.lbl_timer_status.pack(side="left", padx=6)
 
         # --- 5. 章节预览 ---
         frm = ttk.LabelFrame(self.root, text="章节预览")
@@ -720,6 +754,8 @@ class FanqieGUI:
         self._cfg["default_mode"] = self.mode_var.get()
         self._cfg["default_time"] = self.time_var.get().strip() or "08:00"
         self._cfg["chapters_dir"] = self.dir_var.get()
+        if hasattr(self, "timer_time_var"):
+            self._cfg["timer_time"] = self.timer_time_var.get().strip()
         try:
             self._cfg["default_per_day"] = self.perday_var.get()
         except tk.TclError:
@@ -1006,6 +1042,10 @@ class FanqieGUI:
     def _fetch_platform_chapters_for_edit(self):
         idx = self.cmb_book.current()
         if idx < 0 or not self.books:
+            # 无作品可获取：恢复按钮可用，避免停留在禁用态卡死用户
+            # （真正的前置校验由 _on_upload 统一兜底提示）
+            if not self.uploading:
+                self.btn_upload.configure(state="normal")
             return
 
         book_id = self.books[idx]["bookId"]
@@ -1017,6 +1057,11 @@ class FanqieGUI:
             return
 
         if not AUTH_FILE.exists():
+            # 未登录：不会发起抓取，恢复按钮可用，否则修改/排期模式按钮永久禁用
+            self.lbl_last_publish.configure(
+                text="请先登录后再获取章节列表", foreground="#d35400")
+            if not self.uploading:
+                self.btn_upload.configure(state="normal")
             return
 
         self.lbl_last_publish.configure(
@@ -1025,6 +1070,7 @@ class FanqieGUI:
         gen = self._fetch_gen
         selected_vol = self._get_selected_volume()
         volumes_known = book_id in self._volumes_cache
+        known_vols = self._volumes_cache.get(book_id)  # 主线程快照，供工作线程使用
         fetch_all_vols = self.all_volumes_var.get()
 
         async def task():
@@ -1280,6 +1326,11 @@ class FanqieGUI:
         if not AUTH_FILE.exists():
             messagebox.showwarning("提示", "请先登录")
             return
+        # 防重入：多个入口可能近乎同时调度刷新（切账号 + 登录完成），
+        # 避免并发任务竞争 self.books / 共享浏览器上下文
+        if getattr(self, "_books_loading", False):
+            return
+        self._books_loading = True
         self.btn_books.configure(state="disabled")
         self._log("正在获取作品列表...")
 
@@ -1288,27 +1339,29 @@ class FanqieGUI:
             try:
                 ctx = await self._shared.ensure()
                 page = await ctx.new_page()
-                await page.goto(BOOK_MANAGE_URL)
-                await page.wait_for_load_state("networkidle")
-                # 检测是否被重定向到登录页（会话失效）
-                cur_url = page.url
-                if "/login" in cur_url or "/writer/zone" not in cur_url and "book-manage" not in cur_url:
+                # domcontentloaded 比 networkidle 可靠: 平台埋点/轮询会拖死 networkidle
+                # 致使 goto 超时被误判为会话失效。
+                try:
+                    await page.goto(BOOK_MANAGE_URL, wait_until="domcontentloaded")
+                except PWTimeout:
+                    pass  # 即便 goto 超时, 后续仍可能拿到作品
+                # 仅在被重定向到登录页时直接判失效
+                if "/login" in page.url:
                     self._after(0, self._books_fetched, [], "__SESSION_EXPIRED__")
                     return
                 try:
-                    await page.wait_for_selector('a[href*="chapter-manage/"]', timeout=5000)
+                    await page.wait_for_selector('a[href*="chapter-manage/"]', timeout=10000)
                 except PWTimeout:
                     pass
                 books = await page.evaluate(BOOKS_JS)
                 await save_auth(ctx)
                 self._after(0, self._books_fetched, books, None)
             except Exception as e:
-                err_str = str(e)
-                # 超时大概率是会话失效导致页面跳转
-                if "Timeout" in err_str:
+                # 异常分支再次确认 URL: 落在登录页才判失效, 否则透传错误
+                if page and "/login" in (page.url or ""):
                     self._after(0, self._books_fetched, [], "__SESSION_EXPIRED__")
                 else:
-                    self._after(0, self._books_fetched, [], err_str)
+                    self._after(0, self._books_fetched, [], str(e))
             finally:
                 if page:
                     try:
@@ -1319,6 +1372,7 @@ class FanqieGUI:
         self.worker.submit(task())
 
     def _books_fetched(self, books, error):
+        self._books_loading = False
         self.btn_books.configure(state="normal")
         if error == "__SESSION_EXPIRED__":
             self._log("获取失败: 登录状态可能已失效")
@@ -1761,6 +1815,196 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     # 上传
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # 定时执行
+    # -----------------------------------------------------------------------
+    TIMER_PREREFRESH_SEC = 60  # 触发前多少秒刷新一次章节目录
+
+    def _ask_yes_no(self, title, msg):
+        """确认对话框。定时(无人值守)模式下不弹窗，记日志并默认继续。"""
+        if self._auto_run:
+            logger.info(f"[定时] {title}：{msg}（自动继续）")
+            return True
+        return messagebox.askyesno(title, msg)
+
+    def _notify(self, level, title, msg):
+        """提示对话框。定时模式下用日志替代弹窗。level: info/warning/error。"""
+        if self._auto_run:
+            logfn = {"error": logger.error,
+                     "warning": logger.warning}.get(level, logger.info)
+            logfn(f"[定时] {title}：{msg}")
+            return
+        {"info": messagebox.showinfo,
+         "warning": messagebox.showwarning,
+         "error": messagebox.showerror}[level](title, msg)
+
+    @staticmethod
+    def _fmt_hms(secs):
+        secs = max(0, int(secs))
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    @staticmethod
+    def _parse_timer_input(raw):
+        """解析定时时间字符串，成功返回 datetime，失败返回 None。"""
+        raw = (raw or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _timer_preflight_issues(self):
+        """返回启动定时前发现的潜在问题列表（用于无人值守前的即时提醒）。"""
+        issues = []
+        if not AUTH_FILE.exists():
+            issues.append("尚未登录")
+        idx = self.cmb_book.current()
+        has_book = idx >= 0 and bool(self.books)
+        if not has_book:
+            issues.append("尚未选择作品")
+        mode = self.mode_var.get()
+        if mode in ("edit", "reschedule"):
+            # 修改/排期模式依赖平台章节列表是否已加载完成
+            ck = self._chapter_cache_key(self.books[idx]["bookId"]) if has_book else None
+            if not (ck and ck in self._platform_chapters_cache):
+                issues.append("平台章节列表尚未加载完成（请等待加载或重选作品）")
+            elif mode == "edit" and not self._matched_edit:
+                issues.append("没有匹配到可修改的章节")
+        elif not self.files:
+            # 上传类模式需要本地章节文件
+            issues.append("尚未选择章节文件夹或无可用章节")
+        return issues
+
+    def _toggle_timer(self):
+        if self.timer_enabled:
+            self._stop_timer()
+        else:
+            self._start_timer()
+
+    def _start_timer(self):
+        target = self._parse_timer_input(self.timer_time_var.get())
+        if target is None:
+            messagebox.showerror(
+                "时间格式错误", "请输入正确的时间，格式: YYYY-MM-DD HH:MM")
+            return
+        if target <= datetime.now():
+            messagebox.showwarning("时间无效", "执行时间必须晚于当前时间。")
+            return
+        # 防御：取消可能残留的轮询，避免重复 after 链
+        if self._timer_after_id is not None:
+            try:
+                self.root.after_cancel(self._timer_after_id)
+            except Exception:
+                pass
+            self._timer_after_id = None
+        # 无人值守前置检查：常见疏漏（未登录/未选作品/未选章节）提前提醒
+        issues = self._timer_preflight_issues()
+        if issues:
+            if not messagebox.askyesno(
+                    "启动定时确认",
+                    "检测到以下问题，到点可能无法执行：\n  · "
+                    + "\n  · ".join(issues)
+                    + "\n\n请在执行时间前处理。仍要启动定时吗？"):
+                return
+        self._timer_target = target
+        self.timer_enabled = True
+        self._timer_prerefresh_done = False
+        self.btn_timer.configure(text="取消定时")
+        self.ent_timer.configure(state="disabled")
+        self._save_config()
+        logger.info(
+            f"[定时] 已启动，将于 {target:%Y-%m-%d %H:%M} 自动执行"
+            f"（模式={self.mode_var.get()}）。请保持程序运行。")
+        self._timer_tick()
+
+    def _stop_timer(self, triggered=False):
+        self.timer_enabled = False
+        self._timer_waiting_busy = False
+        self._timer_prerefresh_done = False
+        if self._timer_after_id is not None:
+            try:
+                self.root.after_cancel(self._timer_after_id)
+            except Exception:
+                pass
+            self._timer_after_id = None
+        self.btn_timer.configure(text="启动定时")
+        self.ent_timer.configure(state="normal")
+        if triggered:
+            self.lbl_timer_status.configure(text="✅ 已触发执行", foreground="green")
+        else:
+            self.lbl_timer_status.configure(text="定时未启动", foreground="gray")
+
+    def _timer_tick(self):
+        if self._closing:
+            return
+        if not self.timer_enabled or self._timer_target is None:
+            return
+        now = datetime.now()
+        if now >= self._timer_target:
+            # 到点但有任务在运行 / 正在登录：保持等待，待其完成后再执行（不丢弃本次定时）
+            busy_reason = None
+            if self.uploading:
+                busy_reason = "有任务正在运行"
+            elif self._login_in_progress:
+                busy_reason = "正在登录"
+            if busy_reason:
+                if not self._timer_waiting_busy:
+                    self._timer_waiting_busy = True
+                    logger.info(f"[定时] 已到执行时间，但{busy_reason}，等待其完成后再执行。")
+                self.lbl_timer_status.configure(
+                    text=f"⏰ 已到时间，等待（{busy_reason}）…", foreground="#d35400")
+                self._timer_after_id = self.root.after(1000, self._timer_tick)
+                return
+            self._stop_timer(triggered=True)
+            self._trigger_scheduled_run()
+            return
+        remaining = (self._timer_target - now).total_seconds()
+        # 触发前 60 秒刷新一次章节目录，确保使用最新文件（等待期间目录可能有更新）
+        if (remaining <= self.TIMER_PREREFRESH_SEC
+                and not self._timer_prerefresh_done
+                and not self.uploading):
+            self._timer_prerefresh_done = True
+            logger.info("[定时] 触发前刷新章节目录…")
+            try:
+                self._reload_chapters()
+                logger.info("[定时] 目录刷新完成。")
+            except Exception as e:
+                logger.warning(f"[定时] 目录刷新失败: {e}")
+        prefix = "🔄 已刷新目录 ｜ " if self._timer_prerefresh_done else ""
+        self.lbl_timer_status.configure(
+            text=(f"⏰ {prefix}将于 {self._timer_target:%Y-%m-%d %H:%M} 执行"
+                  f" ｜ 倒计时 {self._fmt_hms(remaining)}"),
+            foreground="#d35400")
+        self._timer_after_id = self.root.after(1000, self._timer_tick)
+
+    def _trigger_scheduled_run(self):
+        """定时到点：自动执行一次当前界面配置的操作。"""
+        if self.uploading:
+            # 正常路径下 _timer_tick 已拦截忙碌情况；此处为防御性兜底。
+            logger.info("[定时] 触发时已有任务在运行，本次跳过。")
+            return
+        # 先装好日志面板 handler，确保无人值守时的诊断信息（含校验失败原因）可见。
+        # 任务真正启动后由 _on_upload/_upload_done 接管 handler 生命周期；
+        # 若同步阶段就失败未启动任务，则在下方 finally 中撤回。
+        self._install_log_handler()
+        logger.info(f"[定时] 到达执行时间，自动开始（模式={self.mode_var.get()}）。")
+        self._auto_run = True
+        self._auto_run_pending = True
+        try:
+            self._on_upload()
+        finally:
+            self._auto_run = False
+            # 同步阶段未能启动任务（校验失败等）→ 清除 pending，避免污染后续手动操作
+            if not self.uploading:
+                self._auto_run_pending = False
+                self.lbl_timer_status.configure(
+                    text="⚠️ 已触发但未启动（见日志）", foreground="red")
+                logger.info("[定时] 本次未启动任务（请检查上方日志中的原因）。")
+                self._remove_log_handler()
+
     def _on_upload(self):
         if self.uploading:
             # 正在上传中 -> 请求取消
@@ -1770,11 +2014,11 @@ class FanqieGUI:
 
         # 验证
         if not AUTH_FILE.exists():
-            messagebox.showwarning("提示", "请先登录")
+            self._notify("warning", "提示", "请先登录")
             return
         idx = self.cmb_book.current()
         if idx < 0 or not self.books:
-            messagebox.showwarning("提示", "请先刷新并选择作品")
+            self._notify("warning", "提示", "请先刷新并选择作品")
             return
         mode = self.mode_var.get()
         book_id = self.books[idx]["bookId"]
@@ -1786,7 +2030,7 @@ class FanqieGUI:
             return
 
         if not self.files or not self.parsed_chapters:
-            messagebox.showwarning("提示", "请先选择章节文件夹")
+            self._notify("warning", "提示", "请先选择章节文件夹")
             return
 
         # 修改内容模式
@@ -1808,7 +2052,7 @@ class FanqieGUI:
         parsed = [parsed[i] for i in kept_indices]
         files = [files[i] for i in kept_indices]
         if not parsed:
-            messagebox.showwarning("提示", "筛选后无可上传章节")
+            self._notify("warning", "提示", "筛选后无可上传章节")
             return
 
         # 定时发布参数
@@ -1818,10 +2062,10 @@ class FanqieGUI:
                 date_str = self.date_var.get()
                 start_dt = datetime.strptime(date_str, "%Y-%m-%d")
             except ValueError:
-                messagebox.showerror("日期错误", "请输入正确的日期: YYYY-MM-DD")
+                self._notify("error", "日期错误", "请输入正确的日期: YYYY-MM-DD")
                 return
             if start_dt.date() < datetime.now().date():
-                if not messagebox.askyesno(
+                if not self._ask_yes_no(
                         "日期提醒",
                         f"起始日期 {date_str} 已过去，"
                         f"平台可能拒绝定时发布到过去的日期。\n是否继续？"):
@@ -1829,12 +2073,12 @@ class FanqieGUI:
             try:
                 per_day = max(1, self.perday_var.get())
             except tk.TclError:
-                messagebox.showerror("参数错误", "请输入有效的每天章数")
+                self._notify("error", "参数错误", "请输入有效的每天章数")
                 return
             time_str = self.time_var.get().strip() or "08:00"
             if not _validate_times(time_str):
-                messagebox.showerror(
-                    "时间格式错误",
+                self._notify(
+                    "error", "时间格式错误",
                     "请输入有效的发布时间 (HH:MM)\n"
                     "多个时间用逗号分隔, 如: 08:00,12:00,20:00")
                 return
@@ -1850,7 +2094,7 @@ class FanqieGUI:
         msg = f"即将上传 {count_str} 到「{book_name}」\n模式: {mode_labels[mode]}"
         if schedule:
             msg += f"\n排期: {schedule[0][0]} ~ {schedule[-1][0]}"
-        if not messagebox.askyesno("确认上传", msg):
+        if not self._ask_yes_no("确认上传", msg):
             return
 
         # 开始
@@ -1916,11 +2160,7 @@ class FanqieGUI:
                                     if await btn.count() == 0:
                                         raise RuntimeError("未找到确认发布按钮")
                                     await btn.first.click(no_wait_after=True)
-                                    try:
-                                        await btn.first.wait_for(state="hidden", timeout=get_browser_timeout())
-                                    except Exception:
-                                        await page.wait_for_timeout(2000)
-                                    await _check_daily_limit(page)
+                                    await _wait_publish_result(page, btn.first)
                                     logger.info("  -> 已发布")
                                 else:
                                     await save_draft(page)
@@ -1981,6 +2221,8 @@ class FanqieGUI:
         self.lbl_progress.configure(text=f"{current}/{total}")
 
     def _upload_done(self, success, failed):
+        auto = self._auto_run_pending
+        self._auto_run_pending = False
         self._remove_log_handler()
         # 先清缓存再切换上传状态，使 _set_uploading 在缓存为空时正确禁用按钮
         self._invalidate_caches("chapters")
@@ -2001,21 +2243,31 @@ class FanqieGUI:
                 pass
 
         if success >= 0:
-            messagebox.showinfo("操作完成", f"成功 {success} 章，失败 {failed} 章")
+            if auto:
+                logger.info(f"[定时] 操作完成：成功 {success} 章，失败 {failed} 章")
+                self.lbl_timer_status.configure(
+                    text=f"✅ 定时执行完成：成功 {success} 失败 {failed}",
+                    foreground="green")
+            else:
+                messagebox.showinfo("操作完成", f"成功 {success} 章，失败 {failed} 章")
+        elif auto:
+            # success < 0 表示运行期异常
+            self.lbl_timer_status.configure(
+                text="❌ 定时执行出错（见日志）", foreground="red")
 
     # -----------------------------------------------------------------------
     # 修改内容
     # -----------------------------------------------------------------------
     def _on_upload_edit(self, book_id, book_name):
         if not self._matched_edit:
-            messagebox.showwarning("无匹配章节", "未匹配到任何章节，请确认:\n1. 已选择正确的作品\n2. 章节列表已加载完成\n3. 本地文件包含有效章节号")
+            self._notify("warning", "无匹配章节", "未匹配到任何章节，请确认:\n1. 已选择正确的作品\n2. 章节列表已加载完成\n3. 本地文件包含有效章节号")
             return
 
         matched = self._matched_edit
         count = len(matched)
 
         msg = f"即将修改「{book_name}」的 {count} 个章节内容"
-        if not messagebox.askyesno("确认修改", msg):
+        if not self._ask_yes_no("确认修改", msg):
             return
 
         self._set_uploading(True)
@@ -2098,10 +2350,10 @@ class FanqieGUI:
             date_str = self.date_var.get()
             start_dt = datetime.strptime(date_str, "%Y-%m-%d")
         except ValueError:
-            messagebox.showerror("日期错误", "请输入正确的日期: YYYY-MM-DD")
+            self._notify("error", "日期错误", "请输入正确的日期: YYYY-MM-DD")
             return
         if start_dt.date() < datetime.now().date():
-            if not messagebox.askyesno(
+            if not self._ask_yes_no(
                     "日期提醒",
                     f"起始日期 {date_str} 已过去，"
                     f"平台可能拒绝定时发布到过去的日期。\n是否继续？"):
@@ -2109,12 +2361,12 @@ class FanqieGUI:
         try:
             per_day = max(1, self.perday_var.get())
         except tk.TclError:
-            messagebox.showerror("参数错误", "请输入有效的每天章数")
+            self._notify("error", "参数错误", "请输入有效的每天章数")
             return
         time_str = self.time_var.get().strip() or "08:00"
         if not _validate_times(time_str):
-            messagebox.showerror(
-                "时间格式错误",
+            self._notify(
+                "error", "时间格式错误",
                 "请输入有效的发布时间 (HH:MM)\n"
                 "多个时间用逗号分隔, 如: 08:00,12:00,20:00")
             return
@@ -2123,21 +2375,21 @@ class FanqieGUI:
         cache_key = self._chapter_cache_key(book_id)
         all_chapters = self._platform_chapters_cache.get(cache_key, [])
         if not all_chapters:
-            messagebox.showwarning("无章节数据", "章节列表尚未加载，请等待加载完成后重试。")
+            self._notify("warning", "无章节数据", "章节列表尚未加载，请等待加载完成后重试。")
             return
         platform_chapters = [
             ch for ch in reversed(all_chapters)
             if "待发布" in ch.get("status", "")
         ]
         if not platform_chapters:
-            messagebox.showinfo("提示", "没有「待发布」状态的章节可修改排期。")
+            self._notify("info", "提示", "没有「待发布」状态的章节可修改排期。")
             return
 
         # 按章节序号筛选
         platform_chapters, _ = self._filter_by_chapter_num(
             platform_chapters, key=lambda ch: ch.get("chapterNum"))
         if not platform_chapters:
-            messagebox.showinfo("提示", "筛选后无待发布章节可修改排期。")
+            self._notify("info", "提示", "筛选后无待发布章节可修改排期。")
             return
 
         # 计算排期并构建 schedule_map
@@ -2146,20 +2398,27 @@ class FanqieGUI:
         schedule_map = {}
         dup_titles = []
         for i, ch in enumerate(platform_chapters):
-            title = ch["title"]
+            title = ch.get("title", "")
             if title in schedule_map:
                 dup_titles.append(title)
             schedule_map[title] = schedule[i]
         if dup_titles:
             names = "、".join(dict.fromkeys(dup_titles))  # 去重保序
-            messagebox.showwarning(
-                "同名章节",
+            # 无人值守(定时)模式下同名章节会导致排期被覆盖、错配，直接中止本次
+            if self._auto_run:
+                self._notify(
+                    "error", "同名章节",
+                    f"存在同名章节: {names}，排期可能错配，定时执行已中止。"
+                    f"请先在平台修改章节标题后再试。")
+                return
+            self._notify(
+                "warning", "同名章节",
                 f"存在同名章节: {names}\n同名章节的排期可能不准确，建议先在平台修改章节标题。")
 
         count = len(platform_chapters)
         msg = (f"即将修改「{book_name}」{count} 个待发布章节的排期\n"
                f"排期: {schedule[0][0]} ~ {schedule[-1][0]}")
-        if not messagebox.askyesno("确认修改排期", msg):
+        if not self._ask_yes_no("确认修改排期", msg):
             return
 
         # 开始
@@ -2220,6 +2479,21 @@ class FanqieGUI:
             if not messagebox.askyesno("确认", "上传正在进行中，确定退出吗？"):
                 return
         self._closing = True
+        # 若正在等待登录，唤醒被阻塞的登录线程并标记取消，
+        # 否则后台线程会一直阻塞在 _login_event.wait()，残留线程与浏览器进程
+        if self._login_in_progress:
+            self._login_cancelled = True
+            try:
+                self._login_event.set()
+            except Exception:
+                pass
+        # 取消挂起的定时轮询
+        if self._timer_after_id is not None:
+            try:
+                self.root.after_cancel(self._timer_after_id)
+            except Exception:
+                pass
+            self._timer_after_id = None
         # 刷新待保存的配置，防止防抖期间关闭导致丢失
         if hasattr(self, "_config_save_after"):
             self.root.after_cancel(self._config_save_after)
