@@ -113,6 +113,38 @@ async def _check_daily_limit(page):
         logger.debug("_check_daily_limit 检测时出错(非致命)", exc_info=True)
 
 
+async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None):
+    """点击「确认发布」后，等待对话框关闭或上限提示出现。
+
+    平台「已到达当日发布字数上限」是 Arco Message toast，~3 秒自动消失。
+    必须趁 toast 还在时检测，不能等 wait_for(state="hidden") 超时后再看。
+    每 200ms 轮询：先看上限文案 (时机敏感)，再看按钮是否消失。
+
+    - 按钮消失 → 返回
+    - 出现上限文案 → 抛 DailyLimitReached
+    - 超时仍未消失也未见上限 → 抛 RuntimeError (交由重试逻辑处理)
+    """
+    if timeout is None:
+        timeout = _browser_timeout
+    limit_locator = page.locator("text=已到达当日发布字数上限")
+    iterations = max(1, timeout // 200)
+    for _ in range(iterations):
+        try:
+            if await limit_locator.count() > 0:
+                raise DailyLimitReached("已到达当日发布字数上限，无法继续发布")
+        except DailyLimitReached:
+            raise
+        except Exception:
+            pass
+        try:
+            if not await confirm_btn.is_visible():
+                return
+        except Exception:
+            return
+        await page.wait_for_timeout(200)
+    raise RuntimeError("确认发布按钮未消失，发布可能失败")
+
+
 # ---------------------------------------------------------------------------
 # 配置管理
 # ---------------------------------------------------------------------------
@@ -122,8 +154,13 @@ def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg.update(json.load(f))
-        except (json.JSONDecodeError, ValueError):
+                data = json.load(f)
+            if isinstance(data, dict):
+                cfg.update(data)
+            else:
+                # 合法 JSON 但不是对象（如 [] / 数字）→ 用默认配置，避免 update 抛 TypeError
+                logger.warning("config.json 顶层不是对象，使用默认配置")
+        except (json.JSONDecodeError, ValueError, TypeError, OSError):
             logger.warning("config.json 格式错误，使用默认配置")
     val = cfg.get("browser_timeout", DEFAULT_CONFIG["browser_timeout"])
     if not isinstance(val, (int, float)) or val <= 0:
@@ -188,8 +225,9 @@ def _extract_chapter_num(text: str) -> str | None:
         "chapter-027"        -> "27"
         "Chapter 3 - Title"  -> "3"
     """
-    # 1) 纯数字开头: 001_xxx, 027 xxx
-    m = re.match(r"^(\d+)", text)
+    # 1) 纯数字开头: 001_xxx, 027 xxx, "39 标题", "39章/话"
+    #    要求数字后是结尾/分隔符/章回节话，避免把 "2023年的夏天" 误判成章节号 2023
+    m = re.match(r"^(\d+)(?=$|[\s:：_\-.、章回节话])", text)
     if m:
         return str(int(m.group(1)))
     # 2) 第X章/回/节/话 - 阿拉伯数字: 第27章, 第 27 章, 第27回
@@ -936,10 +974,20 @@ def match_chapters(
     """
     # 平台章节按 chapterNum(int) 建字典
     platform_map: dict[int, dict] = {}
+    dup_nums: list = []
     for ch in platform_chapters:
         num = ch.get("chapterNum")
-        if num is not None and num not in platform_map:
-            platform_map[num] = ch
+        if num is None:
+            continue
+        if num in platform_map:
+            # 多卷作品分卷重新编号时可能出现重复章节号，保留首个会导致改错章节
+            dup_nums.append(num)
+            continue
+        platform_map[num] = ch
+    if dup_nums:
+        logger.warning(
+            f"平台存在重复章节号 {sorted(set(dup_nums))}（可能是多卷分别编号）；"
+            f"按章节号匹配时仅取首个，建议按卷分别操作以免改错章节。")
 
     matched = []
     unmatched = []
@@ -1042,7 +1090,45 @@ def compute_schedule(
         slot = i % effective
         t = times[slot]
         schedule.append((d.strftime("%Y-%m-%d"), t))
-    return schedule
+
+    # 去重保护：时间点过近 / 临近午夜且每天章数过多时，槽位 +分钟 可能被截顶为
+    # 相同时刻；平台拒绝同一时间的重复定时。为同日内重复时刻分配唯一分钟：
+    # 先向后顺延到 23:59，若无空位则向前回填到 00:00，仍冲突才告警。
+    DAY_MIN = 24 * 60
+    used_by_day: dict[str, set] = {}
+    collided = False
+    fixed = []
+    for d, t in schedule:
+        day_used = used_by_day.setdefault(d, set())
+        if t not in day_used:
+            day_used.add(t)
+            fixed.append((d, t))
+            continue
+        collided = True
+        base_min = int(t[:2]) * 60 + int(t[3:])
+        chosen = None
+        for m in range(base_min, DAY_MIN):          # 向后顺延
+            if f"{m // 60:02d}:{m % 60:02d}" not in day_used:
+                chosen = m
+                break
+        if chosen is None:                          # 向后排满 → 向前回填
+            for m in range(base_min - 1, -1, -1):
+                if f"{m // 60:02d}:{m % 60:02d}" not in day_used:
+                    chosen = m
+                    break
+        if chosen is None:
+            logger.warning(
+                f"排期时间冲突: {d} 当天分钟槽位已排满，平台可能拒绝该章定时发布。"
+                f"建议减少每天章数或调整发布时间点。")
+            day_used.add(t)
+            fixed.append((d, t))
+        else:
+            nt = f"{chosen // 60:02d}:{chosen % 60:02d}"
+            day_used.add(nt)
+            fixed.append((d, nt))
+    if collided:
+        logger.warning("检测到排期时间重复，已自动调整以保证同日时刻唯一。")
+    return fixed
 
 
 async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
@@ -1223,12 +1309,7 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
     if await confirm_btn.count() == 0:
         raise RuntimeError("未找到确认发布按钮")
     await confirm_btn.first.click(no_wait_after=True)
-    # 等待发布对话框关闭（确认发布按钮消失即为成功）
-    try:
-        await confirm_btn.first.wait_for(state="hidden", timeout=_browser_timeout)
-    except Exception:
-        await page.wait_for_timeout(2000)
-    await _check_daily_limit(page)
+    await _wait_publish_result(page, confirm_btn.first)
 
 
 # ---------------------------------------------------------------------------
@@ -1515,11 +1596,7 @@ async def edit_one_chapter(
             if await confirm_btn.count() == 0:
                 raise RuntimeError("未找到确认发布按钮")
             await confirm_btn.first.click(no_wait_after=True)
-            try:
-                await confirm_btn.first.wait_for(state="hidden", timeout=_browser_timeout)
-            except Exception:
-                await page.wait_for_timeout(2000)
-            await _check_daily_limit(page)
+            await _wait_publish_result(page, confirm_btn.first)
             logger.info("  -> 已保存修改")
             return True
         except DailyLimitReached:
