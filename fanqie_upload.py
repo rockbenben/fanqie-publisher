@@ -456,23 +456,28 @@ async def save_auth(context):
     await context.storage_state(path=str(AUTH_FILE))
 
 
-async def dismiss_overlays(page):
+async def dismiss_overlays(page, draft_action="放弃"):
     """
     关闭可能遮挡按钮的弹窗:
-      1. "提示" 草稿恢复弹窗 -> 点 "放弃"
+      1. "提示" 草稿恢复弹窗 -> 点 draft_action 指定的按钮
       2. React Tour 新手引导  -> 用 JS 直接移除
     注意: fill_chapter 已改用 page.evaluate 操作 DOM，不受弹窗影响。
           此函数主要确保 "存草稿"/"下一步" 等按钮可以被 Playwright 点击。
+
+    draft_action: 草稿恢复弹窗按哪个按钮。
+      - "放弃"    : 丢弃草稿，从空白/已发布内容开始（新建章节用，因为 fill 不清空）。
+      - "继续编辑": 仅关闭弹窗、保留已加载草稿。但草稿若一直存在，点它后弹窗会反复
+                    重新弹出而关不掉，故修改流程不再使用，统一改用"放弃"。
     """
     await page.wait_for_timeout(800)
 
-    # 1. 草稿恢复弹窗: "有刚刚更新的草稿，是否继续编辑？" -> 放弃
+    # 1. 草稿恢复弹窗: "有刚刚更新的草稿/章节，是否继续编辑？"
     try:
         draft_hint = page.locator("text=是否继续编辑")
         if await draft_hint.count() > 0:
-            abandon_btn = page.locator("button", has_text="放弃")
-            if await abandon_btn.count() > 0:
-                await abandon_btn.first.click()
+            action_btn = page.locator("button", has_text=draft_action)
+            if await action_btn.count() > 0:
+                await action_btn.first.click()
                 await page.wait_for_timeout(800)
     except Exception:
         pass
@@ -494,8 +499,12 @@ async def dismiss_overlays(page):
         pass
 
 
-async def wait_for_editor_ready(page, timeout=None):
-    """等待章节编辑器加载完成。"""
+async def wait_for_editor_ready(page, timeout=None, draft_action="放弃"):
+    """等待章节编辑器加载完成。
+
+    draft_action: 草稿恢复弹窗的处理方式，透传给 dismiss_overlays。
+                  新建/修改章节均传"放弃"（修改流程丢弃残留草稿后再 clear+fill 重填）。
+    """
     if timeout is None:
         timeout = _browser_timeout
     await page.wait_for_load_state("networkidle", timeout=timeout)
@@ -505,7 +514,7 @@ async def wait_for_editor_ready(page, timeout=None):
     await page.wait_for_selector("input[placeholder='请输入标题']", timeout=timeout)
     await page.wait_for_timeout(500)
     # 关闭弹窗/引导层
-    await dismiss_overlays(page)
+    await dismiss_overlays(page, draft_action=draft_action)
 
 
 async def _get_word_count(page) -> int:
@@ -1131,7 +1140,7 @@ def compute_schedule(
     return fixed
 
 
-async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
+async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_action="放弃"):
     """
     从编辑器完整走到"发布设置"对话框。
 
@@ -1142,55 +1151,73 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
          纠错面板 -> 忽略全部 -> 再次下一步 -> 对话框序列
 
     本函数统一处理两种情况。
-    """
-    # --- Step 1: 点击"下一步" ---
-    await click_next_step(page)
 
-    # --- Step 2: 循环处理所有可能出现的弹窗/面板 ---
-    for _ in range(10):
+    draft_action: 草稿恢复弹窗"是否继续编辑"延迟弹出并遮挡"下一步"时，按此按钮关闭它。
+                  统一传"放弃"丢弃残留草稿（避免点"继续编辑"保留草稿、每次重载都重新
+                  弹出而关不掉）。这是状态机分支 2 的确定性处理，避免走不到"发布设置"超时。
+    """
+    # 统一状态机：轮询页面状态并按状态推进，直到到达"发布设置"。
+    # 初次"下一步"与被吞后的自愈走同一条 "仍在编辑器 -> 点下一步" 分支；
+    # 草稿恢复弹窗由分支 2 用非阻塞的 .count()+click 处理（不用 add_locator_handler：
+    # 它会让每个动作都强制等弹窗消失、关不掉时死等 30s 超时）。
+    for _ in range(14):
         # 平台当日字数上限检测
         await _check_daily_limit(page)
 
-        # 已经到达发布设置?
+        # 1) 已到达发布设置 -> 应用选项后完成
         if await page.locator("text=发布设置").count() > 0:
             await _apply_publish_options(page, use_ai=use_ai)
             return
 
-        # 纠错面板: 如果出现"忽略全部"按钮 -> 点击它，再点"下一步"
+        # 2) 草稿恢复弹窗"是否继续编辑" -> 按 draft_action 关闭
+        if await page.locator("text=是否继续编辑").count() > 0:
+            draft_btn = page.locator("button", has_text=draft_action)
+            if await draft_btn.count() > 0:
+                await draft_btn.first.click()
+                await page.wait_for_timeout(500)
+                continue
+
+        # 3) 智能纠错面板 -> "忽略全部"
         try:
             ignore_btn = page.locator("button", has_text="忽略全部")
             if await ignore_btn.count() > 0 and await ignore_btn.first.is_visible():
                 await ignore_btn.first.click()
-                await page.wait_for_timeout(800)
-                await click_next_step(page)
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(600)
                 continue
         except Exception:
             pass
 
-        # 错别字确认: "检测到你还有错别字未修改，是否确定提交?"
+        # 4) 错别字确认"是否确定提交" -> 提交
         if await page.locator("text=是否确定提交").count() > 0:
             submit_btn = page.locator("button", has_text="提交")
             if await submit_btn.count() > 0:
                 await submit_btn.first.click()
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(800)
                 continue
 
-        # 内容风险检测: "是否进行内容风险检测?" -> 取消跳过
+        # 5) 内容风险检测"是否进行内容风险检测" -> 取消跳过
         if await page.locator("text=是否进行内容风险检测").count() > 0:
             cancel_btn = page.locator("button", has_text="取消")
             if await cancel_btn.count() > 0:
                 await cancel_btn.first.click()
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(800)
                 continue
 
-        # 还没匹配到任何已知状态，等一下再检查
-        await page.wait_for_timeout(1000)
+        # 6) 仍停在编辑器（含首次进入、以及"下一步"被吞的情况）-> 点"下一步"推进。
+        #    仅当编辑器的 next 按钮可见时才点，避免误点其它流程的"下一步"。
+        editor_next = page.locator("button.auto-editor-next")
+        try:
+            if await editor_next.count() > 0 and await editor_next.first.is_visible():
+                await click_next_step(page)
+                continue
+        except Exception:
+            pass
 
-    # 兜底: 等发布设置出现
+        # 7) 未知中间态 -> 短等后重查
+        await page.wait_for_timeout(800)
+
+    # 兜底: 仍未到达发布设置则等待超时，交由上层重试
     await page.wait_for_selector("text=发布设置", timeout=_browser_timeout)
-
-    # --- 到达发布设置后，应用选项 ---
     await _apply_publish_options(page, use_ai=use_ai)
 
 
@@ -1586,11 +1613,17 @@ async def edit_one_chapter(
     for attempt in range(1, max_retries + 2):
         try:
             await page.goto(edit_url)
-            await wait_for_editor_ready(page)
+            # 修改已有章节: 草稿恢复弹窗点"放弃"丢弃残留草稿（随后 clear+fill 会重填
+            # 新内容）。点"继续编辑"会保留草稿，导致每次重载都重新弹出、关不掉而卡死；
+            # 丢弃后虽会重载一次编辑器，但"下一步"竞态已由状态机自愈分支兜底。
+            await wait_for_editor_ready(page, draft_action="放弃")
             await dismiss_edit_hint(page)
             await clear_editor(page)
             await fill_chapter(page, str(ch_num), title, content)
-            await _navigate_to_publish_settings(page, use_ai=use_ai)
+            # fill 之后给编辑器留出 settle 时间，避免随后点"下一步"被瞬时遮罩/
+            # 重渲染吞掉（修改流程特有的竞态；新建流程不需要，故不放进共用函数）。
+            await page.wait_for_timeout(800)
+            await _navigate_to_publish_settings(page, use_ai=use_ai, draft_action="放弃")
             await _check_daily_limit(page)
             confirm_btn = page.locator("button", has_text="确认发布")
             if await confirm_btn.count() == 0:
