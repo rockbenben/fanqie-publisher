@@ -25,12 +25,20 @@ if errorlevel 1 (
 
 REM ---- launch GUI in foreground (keep console; do NOT use pythonw/start /min) ----
 echo Using Python: %PYEXE%
+
+REM minimize THIS console (not hide) so the GUI takes focus; window stays alive
+REM so the abnormal-exit pause below is still reachable by restoring it.
+powershell -NoProfile -Command "Add-Type -Name Win -Namespace Con -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern System.IntPtr GetConsoleWindow(); [DllImport(\"user32.dll\")] public static extern bool ShowWindow(System.IntPtr h, int n);'; [Con.Win]::ShowWindow([Con.Win]::GetConsoleWindow(), 6) | Out-Null" >nul 2>nul
+
 %PYEXE% fanqie_gui.py
+set "EXITCODE=!errorlevel!"
 
 REM pause only on abnormal exit so errors stay visible (no more flash-and-close)
-if errorlevel 1 (
+if !EXITCODE! neq 0 (
+    REM restore the minimized console so the error is visible again
+    powershell -NoProfile -Command "Add-Type -Name Win2 -Namespace Con -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern System.IntPtr GetConsoleWindow(); [DllImport(\"user32.dll\")] public static extern bool ShowWindow(System.IntPtr h, int n);'; [Con.Win2]::ShowWindow([Con.Win2]::GetConsoleWindow(), 9) | Out-Null" >nul 2>nul
     echo.
-    echo [Program exited abnormally, code !errorlevel!] See error above; screenshot it for me.
+    echo [Program exited abnormally, code !EXITCODE!] See error above; screenshot it for me.
     pause
 )
 endlocal
