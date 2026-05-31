@@ -2298,6 +2298,7 @@ class FanqieGUI:
 
                     success = 0
                     failed = 0
+                    skipped = 0
                     total = len(matched_copy)
 
                     for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched_copy):
@@ -2307,10 +2308,17 @@ class FanqieGUI:
 
                         logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
 
+                        status = plat_ch.get("status", "")
+                        if "审核中" in status:
+                            logger.warning(f"  状态「{status}」审核中，不可编辑，跳过")
+                            skipped += 1
+                            self._after(0, self._update_progress, i + 1, total)
+                            continue
+
                         edit_url = plat_ch.get("editUrl")
                         if not edit_url:
-                            logger.error("无法获取编辑链接，跳过")
-                            failed += 1
+                            logger.error("无法获取编辑链接，跳过（可能审核中或平台未提供编辑入口）")
+                            skipped += 1
                             self._after(0, self._update_progress, i + 1, total)
                             continue
 
@@ -2339,7 +2347,8 @@ class FanqieGUI:
                     await browser.close()
 
                 logger.info(f"{'='*40}")
-                logger.info(f"  修改完成! 成功: {success}  失败: {failed}")
+                skip_str = f"  跳过: {skipped}" if skipped else ""
+                logger.info(f"  修改完成! 成功: {success}  失败: {failed}{skip_str}")
                 logger.info(f"{'='*40}")
 
                 self._after(0, self._upload_done, success, failed)

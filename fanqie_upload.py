@@ -476,9 +476,9 @@ async def dismiss_overlays(page, draft_action="放弃"):
           此函数主要确保 "存草稿"/"下一步" 等按钮可以被 Playwright 点击。
 
     draft_action: 草稿恢复弹窗按哪个按钮。
-      - "放弃"    : 丢弃草稿，从空白/已发布内容开始（新建章节用，因为 fill 不清空）。
-      - "继续编辑": 仅关闭弹窗、保留已加载草稿。但草稿若一直存在，点它后弹窗会反复
-                    重新弹出而关不掉，故修改流程不再使用，统一改用"放弃"。
+      - "放弃"    : 丢弃草稿。开页时用——清掉上次遗留的旧草稿，从已发布内容开始。
+      - "继续编辑": 保留草稿。填入新内容后点"下一步"再弹此窗时用——此时草稿正是我们
+                    刚填的新内容，必须保留，否则本次编辑会被丢掉（见 edit_one_chapter）。
     """
     await page.wait_for_timeout(800)
 
@@ -534,12 +534,22 @@ async def _get_word_count(page) -> int:
         el = page.locator("text=正文字数")
         if await el.count() > 0:
             txt = await el.text_content()
-            m = re.search(r"(\d+)", txt)
+            # 去掉千分位逗号，避免 "1,234" 被截成 1。
+            m = re.search(r"(\d[\d,]*)", txt)
             if m:
-                return int(m.group(1))
+                return int(m.group(1).replace(",", ""))
     except Exception:
         pass
     return 0
+
+
+def _prepare_body(content: str) -> str:
+    """正文入框前的预处理: 去 Markdown 标记 + 去空行(空段落)。
+
+    番茄编辑器粘贴纯文本时, 空行会生成多余空段落, 故逐行剔除纯空白行,
+    段落之间用单个换行衔接。"""
+    text = strip_md_formatting(content)
+    return "\n".join(ln for ln in text.splitlines() if ln.strip())
 
 
 async def fill_chapter(page, chapter_num: str | None, title: str, content: str):
@@ -549,7 +559,7 @@ async def fill_chapter(page, chapter_num: str | None, title: str, content: str):
     全部通过 page.evaluate 直接操作 DOM，不使用 Playwright 的
     locator.click()/fill()，这样即使有弹窗/引导层遮挡也不会失败。
     """
-    plain_content = strip_md_formatting(content)
+    plain_content = _prepare_body(content)
 
     await page.evaluate(
         """([chapterNum, title, content]) => {
@@ -572,7 +582,8 @@ async def fill_chapter(page, chapter_num: str | None, title: str, content: str):
                 }
             }
 
-            // 2. 填写标题
+            // 2. 填写标题（合成 nativeSetter+input+change；CDP 实测在真实 React 字段
+            //    上能 stick 不回灌，与正文一样可靠）
             const titleInput = document.querySelector(
                 'input[placeholder="请输入标题"]'
             );
@@ -645,25 +656,12 @@ async def clear_editor(page):
             HTMLInputElement.prototype, 'value'
         ).set;
 
-        // 清空标题
+        // 清空标题（章节号不动：已发布章节的号是现成的，修改模式不该改它）
         const titleInput = document.querySelector('input[placeholder="请输入标题"]');
         if (titleInput) {
             nativeSetter.call(titleInput, '');
             titleInput.dispatchEvent(new Event('input', { bubbles: true }));
             titleInput.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-
-        // 清空章节号
-        const inputs = document.querySelectorAll('input');
-        for (const inp of inputs) {
-            if (inp.type === 'text'
-                && inp.placeholder !== '请输入标题'
-                && inp.offsetParent !== null) {
-                nativeSetter.call(inp, '');
-                inp.dispatchEvent(new Event('input', { bubbles: true }));
-                inp.dispatchEvent(new Event('change', { bubbles: true }));
-                break;
-            }
         }
 
         // 选中 ProseMirror 编辑器全部内容
@@ -1163,9 +1161,10 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_act
 
     本函数统一处理两种情况。
 
-    draft_action: 草稿恢复弹窗"是否继续编辑"延迟弹出并遮挡"下一步"时，按此按钮关闭它。
-                  统一传"放弃"丢弃残留草稿（避免点"继续编辑"保留草稿、每次重载都重新
-                  弹出而关不掉）。这是状态机分支 2 的确定性处理，避免走不到"发布设置"超时。
+    draft_action: 点"下一步"后弹出"是否继续编辑"草稿弹窗时，按此按钮处理（状态机分支 2）。
+                  修改流程必须传"继续编辑"——此时草稿是我们刚填的新内容，保留它才能把
+                  新标题/正文发布出去；传"放弃"会丢弃本次编辑、最终发布的还是原章节。
+                  新建/定时发布流程一般不弹此窗，默认值仅作兜底。
     """
     # 统一状态机：轮询页面状态并按状态推进，直到到达"发布设置"。
     # 初次"下一步"与被吞后的自愈走同一条 "仍在编辑器 -> 点下一步" 分支；
@@ -1624,17 +1623,20 @@ async def edit_one_chapter(
     for attempt in range(1, max_retries + 2):
         try:
             await page.goto(edit_url)
-            # 修改已有章节: 草稿恢复弹窗点"放弃"丢弃残留草稿（随后 clear+fill 会重填
-            # 新内容）。点"继续编辑"会保留草稿，导致每次重载都重新弹出、关不掉而卡死；
-            # 丢弃后虽会重载一次编辑器，但"下一步"竞态已由状态机自愈分支兜底。
+            # 打开时若有「上次遗留」的旧草稿 -> "放弃"，从已发布内容开始干净重填。
             await wait_for_editor_ready(page, draft_action="放弃")
             await dismiss_edit_hint(page)
+            # 只清/填标题+正文，章节号不动（已发布章节的号是现成的）。
+            # _prepare_body 已去 md+空行。
             await clear_editor(page)
-            await fill_chapter(page, str(ch_num), title, content)
-            # fill 之后给编辑器留出 settle 时间，避免随后点"下一步"被瞬时遮罩/
-            # 重渲染吞掉（修改流程特有的竞态；新建流程不需要，故不放进共用函数）。
+            await fill_chapter(page, None, title, content)
             await page.wait_for_timeout(800)
-            await _navigate_to_publish_settings(page, use_ai=use_ai, draft_action="放弃")
+            # 关键修复：填入新内容后，番茄会把它自动存成草稿；点"下一步"时会弹
+            # 「有刚刚更新的章节，是否继续编辑？」。这里必须点"继续编辑"保留我们刚填的
+            # 新标题+新正文；若点"放弃"会把这次编辑整个丢掉、最终发布的还是原章节
+            # （这正是"标题/正文改不动"的根因，CDP 实测确认）。
+            await _navigate_to_publish_settings(
+                page, use_ai=use_ai, draft_action="继续编辑")
             await _check_daily_limit(page)
             confirm_btn = page.locator("button", has_text="确认发布")
             if await confirm_btn.count() == 0:
@@ -2024,15 +2026,22 @@ async def cmd_edit(directory: Path, book_id: str, args):
         # 执行修改
         success = 0
         failed = 0
+        skipped = 0
         total = len(matched)
 
         for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched):
             logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
 
+            status = plat_ch.get("status", "")
+            if "审核中" in status:
+                logger.warning(f"  状态「{status}」审核中，不可编辑，跳过")
+                skipped += 1
+                continue
+
             edit_url = plat_ch.get("editUrl")
             if not edit_url:
-                logger.error("无法获取编辑链接，跳过")
-                failed += 1
+                logger.error("无法获取编辑链接，跳过（可能审核中或平台未提供编辑入口）")
+                skipped += 1
                 continue
 
             if edit_url.startswith("/"):
@@ -2058,7 +2067,8 @@ async def cmd_edit(directory: Path, book_id: str, args):
 
         logger.info("")
         logger.info("=" * 40)
-        logger.info(f"  修改完成! 成功: {success}  失败: {failed}")
+        skip_str = f"  跳过: {skipped}" if skipped else ""
+        logger.info(f"  修改完成! 成功: {success}  失败: {failed}{skip_str}")
         logger.info("=" * 40)
 
 
