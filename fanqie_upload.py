@@ -167,6 +167,17 @@ def load_config() -> dict:
         logger.warning(f"browser_timeout 无效({val})，使用默认值 {DEFAULT_CONFIG['browser_timeout']}")
         val = DEFAULT_CONFIG["browser_timeout"]
     _browser_timeout = int(val)
+
+    # 校验其余数值型配置项，避免手改 config.json 写入字符串/负数后在
+    # range()、wait_for_timeout() 等处抛 TypeError 中断整个上传任务。
+    for key, minimum in (("delay_between_chapters", 0),
+                          ("max_retries", 0),
+                          ("default_per_day", 1)):
+        v = cfg.get(key, DEFAULT_CONFIG[key])
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v < minimum:
+            logger.warning(f"{key} 无效({v})，使用默认值 {DEFAULT_CONFIG[key]}")
+            v = DEFAULT_CONFIG[key]
+        cfg[key] = int(v)
     return cfg
 
 
@@ -1794,7 +1805,10 @@ async def _reschedule_current_volume(
             return result;
         }""")
 
-        matched_on_page = [t for t in page_titles if t in remaining]
+        # 去重：同一标题在本页若出现多行，remaining 是按标题键的字典只能存一条，
+        # 处理后会 del remaining[title]，重复迭代会在 remaining[title] 处抛 KeyError。
+        matched_on_page = list(dict.fromkeys(
+            t for t in page_titles if t in remaining))
 
         for title in matched_on_page:
             if cancel_check and cancel_check():

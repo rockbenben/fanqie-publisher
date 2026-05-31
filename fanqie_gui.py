@@ -749,6 +749,15 @@ class FanqieGUI:
             self.root.after_cancel(self._config_save_after)
         self._config_save_after = self.root.after(1000, self._save_config)
 
+    @staticmethod
+    def _atomic_write_json(path, data):
+        """原子写 JSON：先写临时文件再 replace，避免进程中途被杀留下半截文件。"""
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        tmp.replace(path)  # 同目录 rename，Windows 上原子
+
     def _save_config(self):
         """将当前 GUI 设置写入 config.json。"""
         self._cfg["default_mode"] = self.mode_var.get()
@@ -761,11 +770,9 @@ class FanqieGUI:
         except tk.TclError:
             pass
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._cfg, f, ensure_ascii=False, indent=2)
-                f.write("\n")
-        except Exception:
-            pass
+            self._atomic_write_json(CONFIG_FILE, self._cfg)
+        except Exception as e:
+            logger.debug(f"保存 config.json 失败: {e}")
 
     # --- GUI 内部状态 (.gui_state.json，不含在用户 config 中) ---
 
@@ -781,11 +788,9 @@ class FanqieGUI:
 
     def _save_gui_state(self):
         try:
-            with open(GUI_STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._gui_state, f, ensure_ascii=False, indent=2)
-                f.write("\n")
-        except Exception:
-            pass
+            self._atomic_write_json(GUI_STATE_FILE, self._gui_state)
+        except Exception as e:
+            logger.debug(f"保存 .gui_state.json 失败: {e}")
 
     def _set_uploading(self, active):
         self.uploading = active
@@ -933,8 +938,13 @@ class FanqieGUI:
         只更新 date_var，不覆盖 time_var —— 时间是用户配置项，
         平台单条发布记录不应覆盖用户设定的多时间方案。
         """
-        date_str = info["date"]
-        time_str = info["time"]
+        date_str = info.get("date")
+        time_str = info.get("time")
+        if not date_str or not time_str:
+            # 平台记录不完整（DOM 变动 / 部分抓取），不要让 KeyError
+            # 冒泡进 after() 回调把标签卡在"正在获取..."。
+            self.lbl_last_publish.configure(text="暂无发布记录", foreground="gray")
+            return
         chapter = info.get("chapter", "")
         label = f"上次发布: {date_str} {time_str}"
         if chapter:
