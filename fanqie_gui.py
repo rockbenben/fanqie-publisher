@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import unicodedata
 import sys
 import threading
@@ -53,6 +54,37 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 CHAPTER_MANAGE_URL = CHAPTER_MANAGE_URL_TPL
 DEFAULT_CHAPTERS_DIR = SCRIPT_DIR / "chapters"
+
+# --- 新手引导 ---
+GH_URL = "https://github.com/rockbenben/fanqie-publisher"
+ONBOARD_STEP_NAMES = ["登录", "选作品", "选章节文件夹", "上传/修改"]
+_CIRCLED = ["①", "②", "③", "④"]
+STEP_HINTS = {
+    1: "下一步：点「登录/新建」，在弹出的浏览器里登录番茄账号",
+    2: "下一步：点「刷新作品列表」并选择一部作品",
+    3: "下一步：选择章节文件夹（默认 chapters/），确认下方「章节预览」里出现章节",
+    4: "下一步：选好「操作模式」后点「开始上传」（修改模式为「开始修改」）",
+}
+SECTION_HELP = {
+    "账号": "给每个番茄账号起一个本地名称用于区分。点「登录/新建」会打开浏览器，"
+            "请在其中登录番茄账号——本地名称只是标签，不是番茄笔名。"
+            "登录多个账号后用下拉框切换。",
+    "作品选择": "登录后点「刷新作品列表」拉取你的作品，选中一部后会自动获取最新发布信息。"
+                "「章节管理 ↗」可在浏览器里打开该作品的章节管理页。",
+    "章节文件夹": "选择存放章节的文件夹（含子文件夹）。每个 .md 或 .txt（纯文本）"
+                  "文件就是一章，按文件名顺序排列（chapter-1 在 chapter-10 之前）。"
+                  "「自动处理重名」避免番茄的同名章节限制；可按修改日期只挑近期改过的章节。",
+    "操作模式": "五种操作，按需选一：\n"
+                "· 定时发布：排好日期时间，到点自动发布\n"
+                "· 立即发布：上传后马上发布\n"
+                "· 存草稿：只上传存草稿，稍后自己手动发\n"
+                "· 修改内容：用本地文件替换已发布章节的正文\n"
+                "· 修改排期：只改已有章节的发布时间，不动正文\n"
+                "所有模式都能「按章节号筛选」，只操作指定范围（如 1,3,5-10）的章节。",
+    "定时执行": "设定一个未来时刻，到点自动执行当前所选操作（仅一次），"
+                "适合无人值守（比如半夜自动上传）。到点若有任务在跑会等它结束再执行，"
+                "触发前会重新读取一次章节目录。",
+}
 
 # 高 DPI 支持 (Windows)
 if sys.platform == "win32":
@@ -169,7 +201,9 @@ class FanqieGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("番茄作家 MD/TXT 批量上传工具")
-        _w, _h = 1100, 920
+        # 高度含顶部新手引导栏（~96px）：1010 让两个文本面板在 1080p 上仍约 8 行；
+        # 小屏可拖动，或「✕ 收起」引导栏拿回空间（minsize 保持不变以兼容小屏）
+        _w, _h = 1100, 1010
         self.root.update_idletasks()
         _sx = (self.root.winfo_screenwidth() - _w) // 2
         _sy = (self.root.winfo_screenheight() - _h) // 2
@@ -222,8 +256,12 @@ class FanqieGUI:
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
 
+        # --- 0. 新手引导栏 ---
+        self._build_guidance_bar()
+
         # --- 1. 账号 ---
         frm = ttk.LabelFrame(self.root, text="账号")
+        self._acct_frame = frm
         frm.pack(fill="x", **pad)
         self.account_var = tk.StringVar()
         self.cmb_account = ttk.Combobox(
@@ -237,8 +275,10 @@ class FanqieGUI:
         lbl_gh = ttk.Label(frm, text="GitHub", foreground="royalblue",
                            cursor="hand2", font=("", 9, "underline"))
         lbl_gh.pack(side="right", padx=8)
-        lbl_gh.bind("<Button-1>", lambda _: webbrowser.open(
-            "https://github.com/rockbenben/fanqie-publisher"))
+        lbl_gh.bind("<Button-1>", lambda _: webbrowser.open(GH_URL))
+        ttk.Button(frm, text="❓帮助", command=self._show_welcome).pack(
+            side="right", padx=2)
+        self._add_help(frm, "账号", side="left")
         self._refresh_account_list()
         self._refresh_auth_status()
 
@@ -256,6 +296,7 @@ class FanqieGUI:
         self.btn_open_manage = ttk.Button(
             frm, text="章节管理 ↗", command=self._open_chapter_manage)
         self.btn_open_manage.pack(side="left", padx=(0, 6), pady=4)
+        self._add_help(frm, "作品选择")
 
         # --- 3. 章节文件夹 ---
         frm_dir = ttk.LabelFrame(self.root, text="章节文件夹")
@@ -288,6 +329,7 @@ class FanqieGUI:
             row1, text="按修改日期筛选",
             variable=self.filter_var,
             command=self._on_filter_toggle).pack(side="left", padx=6)
+        self._add_help(row1, "章节文件夹")
 
         # 筛选选项行（勾选后展开）
         row_filter = ttk.Frame(frm_dir)
@@ -329,6 +371,7 @@ class FanqieGUI:
                 value=val, command=self._on_mode_change)
             rb.pack(side="left", padx=10)
             self._mode_radios.append(rb)
+        self._add_help(row_radios, "操作模式")
 
         # 发布选项（所有非草稿模式可见）
         row_opts = ttk.Frame(frm_mode)
@@ -453,6 +496,7 @@ class FanqieGUI:
         self.lbl_timer_status = ttk.Label(
             row_timer, text="定时未启动", foreground="gray")
         self.lbl_timer_status.pack(side="left", padx=6)
+        self._add_help(row_timer, "定时执行")
 
         # --- 5. 章节预览 ---
         frm = ttk.LabelFrame(self.root, text="章节预览")
@@ -491,6 +535,40 @@ class FanqieGUI:
         # 启动时自动加载预览
         if self.dir_var.get():
             self.root.after(100, self._reload_chapters)
+
+    def _build_guidance_bar(self):
+        """顶部新手引导栏：步骤指示 + 下一步提示，可收起且记住。"""
+        self._guide_frame = ttk.LabelFrame(self.root, text="新手引导")
+        top = ttk.Frame(self._guide_frame)
+        top.pack(fill="x", padx=8, pady=(4, 0))
+        self._step_labels = []
+        for i, name in enumerate(ONBOARD_STEP_NAMES):
+            lbl = ttk.Label(top, text=f"{_CIRCLED[i]} {name}", font=("", 10))
+            lbl.pack(side="left")
+            self._step_labels.append(lbl)
+            if i < len(ONBOARD_STEP_NAMES) - 1:
+                ttk.Label(top, text="──▸", foreground="gray").pack(
+                    side="left", padx=6)
+        ttk.Button(top, text="✕ 收起",
+                   command=lambda: self._set_guidance_collapsed(True)).pack(
+                       side="right")
+        self.lbl_next_step = ttk.Label(
+            self._guide_frame, text="", foreground="#1565c0", font=("", 9))
+        self.lbl_next_step.pack(anchor="w", padx=10, pady=(2, 6))
+
+        # 收起后的细长再入口
+        self._guide_stub = ttk.Frame(self.root)
+        link = ttk.Label(self._guide_stub, text="▸ 新手引导",
+                         foreground="royalblue", cursor="hand2",
+                         font=("", 9, "underline"))
+        link.pack(side="left", padx=4)
+        link.bind("<Button-1>", lambda _: self._set_guidance_collapsed(False))
+
+        # 按记忆决定初始展开/收起（首次默认展开）
+        if self._gui_state.get("guidance_collapsed"):
+            self._guide_stub.pack(fill="x", padx=8, pady=(6, 0))
+        else:
+            self._guide_frame.pack(fill="x", padx=8, pady=(6, 0))
 
     # -----------------------------------------------------------------------
     # 缓存管理
@@ -534,7 +612,159 @@ class FanqieGUI:
                 self.lbl_auth.configure(
                     text="已登录", foreground="green")
         else:
-            self.lbl_auth.configure(text="未登录", foreground="red")
+            # 新用户第一步就是登录——把空标签变成明确的行动指引
+            self.lbl_auth.configure(
+                text="未登录 ← 请先点「登录/新建」", foreground="red")
+        self._update_guidance()
+
+    # -----------------------------------------------------------------------
+    # 新手引导
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _compute_onboarding_step(logged_in: bool, has_book: bool,
+                                 has_chapters: bool) -> int:
+        """纯函数：当前状态对应新手引导第几步（1..4）。
+
+        顺序门槛：登录 → 选作品 → 选章节 → 上传/修改。前一道未过，步号不前进。
+        """
+        if not logged_in:
+            return 1
+        if not has_book:
+            return 2
+        if not has_chapters:
+            return 3
+        return 4
+
+    def _onboarding_state(self):
+        """读取当前真实状态（对尚未构建的控件做容错）。"""
+        logged_in = AUTH_FILE.exists()
+        cmb = getattr(self, "cmb_book", None)
+        has_book = bool(self.books) and cmb is not None and cmb.current() >= 0
+        mode_var = getattr(self, "mode_var", None)
+        mode = mode_var.get() if mode_var is not None else ""
+        if mode == "reschedule":
+            # 修改排期不依赖本地章节文件夹（操作的是平台章节），选好作品即就绪，
+            # 否则会一直卡在第③步误导用户去选不需要的文件夹
+            has_chapters = has_book
+        else:
+            has_chapters = bool(self.files)
+        return logged_in, has_book, has_chapters
+
+    def _update_guidance(self):
+        """按当前状态刷新引导栏的步骤高亮与「下一步」提示。"""
+        if not getattr(self, "_step_labels", None):
+            return
+        step = self._compute_onboarding_step(*self._onboarding_state())
+        for i, lbl in enumerate(self._step_labels, start=1):
+            name = ONBOARD_STEP_NAMES[i - 1]
+            if i < step:                       # 已完成
+                lbl.configure(text=f"✓ {name}", foreground="#2e7d32",
+                              font=("", 10))
+            elif i == step:                    # 当前
+                lbl.configure(text=f"{_CIRCLED[i-1]} {name}",
+                              foreground="#1565c0", font=("", 10, "bold"))
+            else:                              # 未到
+                lbl.configure(text=f"{_CIRCLED[i-1]} {name}",
+                              foreground="gray", font=("", 10))
+        self.lbl_next_step.configure(text=STEP_HINTS.get(step, ""))
+
+    def _set_guidance_collapsed(self, collapsed: bool):
+        """收起/展开引导栏，并记住选择。"""
+        self._gui_state["guidance_collapsed"] = collapsed
+        self._save_gui_state()
+        if collapsed:
+            self._guide_frame.pack_forget()
+            self._guide_stub.pack(fill="x", padx=8, pady=(6, 0),
+                                  before=self._acct_frame)
+        else:
+            self._guide_stub.pack_forget()
+            self._guide_frame.pack(fill="x", padx=8, pady=(6, 0),
+                                   before=self._acct_frame)
+            self._update_guidance()
+
+    def _section_help(self, key: str, event=None):
+        """弹出区块帮助。用自定义小窗而非 messagebox：
+
+        messagebox.showinfo 在 Windows 上会触发系统提示音，对纯参考文本是多余的；
+        自定义 Toplevel 无声、出现在鼠标旁、Esc/按钮即关，观感更像贴士卡片。
+        """
+        win = tk.Toplevel(self.root)
+        win.title(f"帮助 · {key}")
+        win.resizable(False, False)
+        win.transient(self.root)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=key, font=("", 10, "bold")).pack(anchor="w")
+        ttk.Label(frm, text=SECTION_HELP.get(key, ""), wraplength=380,
+                  justify="left").pack(anchor="w", pady=(4, 8))
+        ttk.Button(frm, text="知道了", command=win.destroy).pack(anchor="e")
+        win.bind("<Escape>", lambda _: win.destroy())
+        # 出现在鼠标点击处旁边，并夹到屏幕内（右对齐的 (?) 贴近边缘，防溢出）
+        win.update_idletasks()
+        ww, wh = win.winfo_reqwidth(), win.winfo_reqheight()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        x = (event.x_root + 12) if event is not None else self.root.winfo_pointerx()
+        y = (event.y_root + 12) if event is not None else self.root.winfo_pointery()
+        x = max(8, min(x, sw - ww - 8))
+        y = max(8, min(y, sh - wh - 8))
+        win.geometry(f"+{x}+{y}")
+        win.focus_set()
+
+    def _add_help(self, parent, key: str, side="right"):
+        """在某区块行内放一个 (?) 帮助入口。"""
+        lbl = ttk.Label(parent, text="(?)", foreground="royalblue",
+                        cursor="hand2")
+        lbl.pack(side=side, padx=6)
+        lbl.bind("<Button-1>", lambda e: self._section_help(key, e))
+        return lbl
+
+    def _show_welcome(self):
+        """首次/手动触发的总览弹窗。"""
+        # 防重入：已有一个欢迎弹窗时不再叠开
+        existing = getattr(self, "_welcome_win", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+        win = tk.Toplevel(self.root)
+        self._welcome_win = win
+        win.title("新手引导")
+        win.resizable(False, False)
+        win.transient(self.root)
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="欢迎使用番茄作家批量上传工具 👋",
+                  font=("", 13, "bold")).pack(anchor="w", pady=(0, 8))
+        steps = [
+            "① 登录：点「登录/新建」，在弹出的浏览器里登录番茄账号。",
+            "② 选作品：点「刷新作品列表」并选择一部作品。",
+            "③ 选章节文件夹：默认 chapters/，每个 .md 或 .txt（纯文本）文件是一章。",
+            "④ 上传/修改：选好「操作模式」后点「开始上传」。",
+        ]
+        for s in steps:
+            ttk.Label(body, text=s, font=("", 10)).pack(anchor="w", pady=1)
+        ttk.Label(
+            body,
+            text="提示：登录框里填的是「本地账号名称」（用于区分多个账号），"
+                 "不是番茄笔名；真正的登录在浏览器里完成。",
+            font=("", 9), foreground="#856404", wraplength=420,
+            justify="left").pack(anchor="w", pady=(10, 12))
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x")
+        lbl_doc = ttk.Label(btn_row, text="查看完整说明 (GitHub)",
+                            foreground="royalblue", cursor="hand2",
+                            font=("", 9, "underline"))
+        lbl_doc.pack(side="left")
+        lbl_doc.bind("<Button-1>", lambda _: webbrowser.open(GH_URL))
+        ttk.Button(btn_row, text="开始使用", command=win.destroy).pack(
+            side="right")
+        win.update_idletasks()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        ww, wh = win.winfo_width(), win.winfo_height()
+        win.geometry(f"+{(sw - ww) // 2}+{(sh - wh) // 3}")
 
     # -----------------------------------------------------------------------
     # 多账号管理
@@ -710,6 +940,7 @@ class FanqieGUI:
         self.txt_preview.delete("1.0", tk.END)
         self.txt_preview.insert("1.0", text)
         self.txt_preview.configure(state="disabled")
+        self._update_guidance()
 
     def _export_log(self):
         """导出运行日志到文件。"""
@@ -836,6 +1067,7 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     def _on_book_changed(self):
         self._fetch_gen += 1
+        self._update_guidance()
 
         idx = self.cmb_book.current()
         if idx < 0 or not self.books:
@@ -1185,7 +1417,9 @@ class FanqieGUI:
         current_acct = self._gui_state.get("current_account", "")
         raw = simpledialog.askstring(
             "账号名称",
-            "请输入账号名称（如 作家A）：\n用于区分多个登录账号",
+            "给这个账号起一个本地名称（如 作家A）：\n"
+            "· 仅用于在本工具里区分多个账号，不是番茄笔名\n"
+            "· 点「确定」后会打开浏览器，请在浏览器里登录番茄账号",
             parent=self.root,
             initialvalue=current_acct,
         )
@@ -1216,8 +1450,10 @@ class FanqieGUI:
                 async with async_playwright() as p:
                     browser, context = await create_context(p, headless=False)
                     page = await context.new_page()
-                    await page.goto(ZONE_URL)
-                    await page.wait_for_load_state("networkidle")
+                    # domcontentloaded 而非 networkidle：番茄的埋点/轮询会拖死
+                    # networkidle，使登录浮窗迟迟不弹（取作品列表处同因已改）。
+                    # 登录页只需渲染出来供用户手动登录，不必等网络空闲。
+                    await page.goto(ZONE_URL, wait_until="domcontentloaded")
 
                     self._after(0, self._show_login_dialog)
                     loop = asyncio.get_running_loop()
@@ -1264,8 +1500,9 @@ class FanqieGUI:
             font=("", 12, "bold"), bg="#FFF3CD", fg="#856404",
         ).pack(pady=(0, 6))
         tk.Label(
-            body, text="登录完成后点击下方按钮保存会话",
-            font=("", 9), bg="#FFF3CD", fg="#856404",
+            body, text="在浏览器里登录番茄账号（没有账号请先注册并开通作家），\n"
+                       "完成后点下方按钮保存会话",
+            font=("", 9), bg="#FFF3CD", fg="#856404", justify="left",
         ).pack(pady=(0, 10))
 
         btn_frame = tk.Frame(body, bg="#FFF3CD")
@@ -1321,6 +1558,12 @@ class FanqieGUI:
         if error:
             self._refresh_auth_status()
             self._log(f"登录失败: {error}")
+            # 错误必须显眼：登录是新用户的第一步，只往日志里塞一行很容易被忽略，
+            # 表现成"点了没反应"。缺浏览器内核是最常见原因，单独给出可一键修复的引导。
+            if self._looks_like_missing_browser(error):
+                self._prompt_install_browser()
+            else:
+                messagebox.showerror("登录失败", f"登录未能完成：\n\n{error}")
         else:
             if name:
                 self._gui_state["current_account"] = name
@@ -1331,6 +1574,65 @@ class FanqieGUI:
             # 刷新共享浏览器以加载新的登录状态
             self.worker.submit(self._shared.refresh())
             self._after(300, self._on_refresh_books)
+
+    @staticmethod
+    def _looks_like_missing_browser(error) -> bool:
+        """判断错误是否为"Playwright 浏览器内核未安装/损坏"。
+
+        首次安装未跑 `playwright install chromium`、或升级后浏览器没同步时，
+        launch() 会抛此类错误，是新用户"点登录没反应"的最常见根因。
+        """
+        s = str(error).lower()
+        return ("executable doesn't exist" in s
+                or "playwright install" in s
+                or "please run the following command" in s)
+
+    def _prompt_install_browser(self):
+        """缺浏览器内核时弹窗引导：可一键自动下载，或给出手动命令。"""
+        if messagebox.askyesno(
+                "缺少浏览器内核",
+                "检测到 Playwright 浏览器内核（chromium）未安装或损坏，"
+                "这通常是首次安装未完成导致的。\n\n"
+                "是否现在自动下载安装？（需要联网，约几十 MB）"):
+            self._install_browser_async()
+        else:
+            messagebox.showinfo(
+                "手动安装",
+                "你也可以手动在命令行运行：\n"
+                "    python -m playwright install chromium\n\n"
+                "或重新运行 run.bat / run.sh（会自动补装）。")
+
+    def _install_browser_async(self):
+        self._log("正在下载安装浏览器内核（chromium）…完成前请勿操作。")
+        self.btn_login.configure(state="disabled")
+
+        def work():
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    capture_output=True, text=True)
+                ok = proc.returncode == 0
+                msg = (proc.stdout or "") + (proc.stderr or "")
+            except Exception as e:
+                ok, msg = False, str(e)
+            self._after(0, self._install_browser_done, ok, msg)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _install_browser_done(self, ok, msg):
+        self.btn_login.configure(state="normal")
+        if ok:
+            self._log("浏览器内核安装完成，请重新点击「登录/新建」。")
+            messagebox.showinfo(
+                "安装完成", "浏览器内核已安装，请重新点击「登录/新建」。")
+        else:
+            tail = msg.strip()[-400:]
+            self._log(f"浏览器内核安装失败: {tail}")
+            messagebox.showerror(
+                "安装失败",
+                "自动安装未成功，请手动在命令行运行：\n"
+                "    python -m playwright install chromium\n\n"
+                f"错误信息（末尾）：\n{tail}")
 
     # -----------------------------------------------------------------------
     # 刷新作品列表
@@ -1537,6 +1839,7 @@ class FanqieGUI:
 
     def _refresh_preview(self):
         """仅重新计算排期和刷新预览文本，不重新读取文件。"""
+        self._update_guidance()
         mode = self.mode_var.get()
 
         # 修改排期模式: 不依赖本地文件，使用平台章节
@@ -2680,6 +2983,11 @@ class FanqieGUI:
     def run(self):
         if AUTH_FILE.exists():
             self.root.after(500, self._on_refresh_books)
+        # 首次启动自动弹一次欢迎引导，之后仅「❓帮助」按钮触发
+        if not self._gui_state.get("onboarded"):
+            self._gui_state["onboarded"] = True
+            self._save_gui_state()
+            self.root.after(400, self._show_welcome)
         self.root.mainloop()
 
 
