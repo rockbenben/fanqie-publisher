@@ -31,3 +31,4 @@ fanqie_error.log.*
 Thumbs.db
 *~
 *.swp
+.claude
