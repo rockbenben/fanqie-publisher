@@ -292,14 +292,15 @@ fanqie/
 `tests/` 下是零依赖回归测试，不需要浏览器或番茄账号，直接运行即可：
 
 ```bash
-python tests/test_publish_result.py      # 发布结果判定状态机（虚拟时钟仿真）
-python tests/test_chapter_filter.py      # 章节号筛选解析
-python tests/test_adversarial_campaign.py
+python tests/test_publish_result.py        # 发布结果判定状态机（虚拟时钟仿真）
+python tests/test_chapter_filter.py        # 章节号筛选解析
+python tests/test_adversarial_campaign.py  # 排期(含同日保序)/章节号/MD 清洗等纯函数对抗
 python tests/test_adversarial_campaign2.py
-python tests/test_onboarding.py          # 新手引导步骤判定
+python tests/test_onboarding.py            # 新手引导步骤判定
+python tests/test_shared_browser_race.py   # 共享浏览器并发 ensure() 不重复启动（桩替换，无需浏览器）
 ```
 
-覆盖发布结果判定、章节号筛选、排期/章节号解析/MD 清洗、失败章节号压缩、新手引导步骤等核心纯逻辑。改动相关逻辑后建议跑一遍确认全绿。
+覆盖发布结果判定、章节号筛选、排期/章节号解析/MD 清洗、失败章节号压缩、新手引导步骤、共享浏览器并发安全等核心逻辑。改动相关逻辑后建议跑一遍确认全绿。
 
 ## 常见问题
 

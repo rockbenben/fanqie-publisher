@@ -177,22 +177,36 @@ class _SharedBrowser:
         self._pw = None
         self._browser = None
         self._context = None
+        # 串行化 ensure/refresh/close：这些都在 worker 单一事件循环上运行，但
+        # 多个后台任务（刷新作品列表 + 切到修改模式拉章节）可在 await 点交错。
+        # 无锁时两个并发 ensure() 在浏览器尚未建好（_browser 仍为 None）时会
+        # 各自 start() 一套 playwright+chromium，只有最后赋值的被记录，另一套
+        # 子进程成为孤儿、连 _on_close 都关不到——进程/内存泄漏。
+        self._lock = asyncio.Lock()
 
     async def ensure(self):
         """确保浏览器运行中，返回 context。"""
-        if self._browser and self._browser.is_connected():
+        async with self._lock:
+            if self._browser and self._browser.is_connected():
+                return self._context
+            await self._teardown()
+            self._pw = await async_playwright().start()
+            self._browser, self._context = await create_context(
+                self._pw, headless=True)
             return self._context
-        await self.close()
-        self._pw = await async_playwright().start()
-        self._browser, self._context = await create_context(
-            self._pw, headless=True)
-        return self._context
 
     async def refresh(self):
         """重新创建（登录后需要刷新 auth）。"""
-        await self.close()
+        async with self._lock:
+            await self._teardown()
 
     async def close(self):
+        async with self._lock:
+            await self._teardown()
+
+    async def _teardown(self):
+        """实际关闭逻辑（不加锁）。仅由持锁的 ensure/refresh/close 调用，
+        避免 ensure 内部再次走 close() 重入自身持有的锁而死锁。"""
         if self._browser:
             await close_browser_safely(self._browser)
         if self._pw:
