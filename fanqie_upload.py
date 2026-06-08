@@ -1355,6 +1355,9 @@ def compute_schedule(
       - 时间点数量 > per_day 时, 以时间点数量为准
       - 时间点不足时, 均匀分配到各时间点, 同一时间内每章 +1 分钟
       - 每个时间段上限为下一时间点前 1 分钟 (末尾为 23:59), 防止重叠
+      - 保序保证: 同日内各章发布时刻严格递增（即「章节顺序 = 发布顺序」，
+        且同日时刻唯一）。临近午夜挤在一起时把该串整体前移以放下而不打乱顺序
+        （如 23:58×3 → 23:57/23:58/23:59），不跨日、不改每天章数
 
     返回: [(date_str, time_str), ...] 长度等于 file_count
     """
@@ -1391,43 +1394,67 @@ def compute_schedule(
         t = times[slot]
         schedule.append((d.strftime("%Y-%m-%d"), t))
 
-    # 去重保护：时间点过近 / 临近午夜且每天章数过多时，槽位 +分钟 可能被截顶为
-    # 相同时刻；平台拒绝同一时间的重复定时。为同日内重复时刻分配唯一分钟：
-    # 先向后顺延到 23:59，若无空位则向前回填到 00:00，仍冲突才告警。
-    DAY_MIN = 24 * 60
-    used_by_day: dict[str, set] = {}
-    collided = False
+    # 同日时刻必须唯一，且要保持「章节顺序 = 发布时刻顺序」（读者按序读）。
+    # 时间点过近 / 临近午夜且每天章数过多时，槽位 +分钟 会被截顶为相同时刻。
+    # 旧实现按冲突逐个向后顺延、排满再「向前回填」——回填会把靠后的章节塞进更早
+    # 的分钟，导致同日章节乱序（如 23:58×3 → 第3章 23:57 反而早于第1、2章）。
+    # 改为按天做「保序修复」（不跨日、不改每天章数，只前调临近午夜挤住的那一串）：
+    #   正向：t_i = max(理想_i, t_{i-1}+1)  —— 严格递增（即唯一），且不早于理想
+    #   末章越过 23:59 时再反向：t_i = min(t_i, t_{i+1}-1)，把尾部整体前移到放得下；
+    #   早间/前面时间点的章节不受影响。严格递增 ⇒ 同日时刻天然唯一。
+    DAY_LAST = 24 * 60 - 1   # 23:59
+
+    def _to_min(t):
+        return int(t[:2]) * 60 + int(t[3:])
+
+    def _to_hhmm(m):
+        return f"{m // 60:02d}:{m % 60:02d}"
+
     fixed = []
-    for d, t in schedule:
-        day_used = used_by_day.setdefault(d, set())
-        if t not in day_used:
-            day_used.add(t)
-            fixed.append((d, t))
-            continue
-        collided = True
-        base_min = int(t[:2]) * 60 + int(t[3:])
-        chosen = None
-        for m in range(base_min, DAY_MIN):          # 向后顺延
-            if f"{m // 60:02d}:{m % 60:02d}" not in day_used:
-                chosen = m
-                break
-        if chosen is None:                          # 向后排满 → 向前回填
-            for m in range(base_min - 1, -1, -1):
-                if f"{m // 60:02d}:{m % 60:02d}" not in day_used:
-                    chosen = m
-                    break
-        if chosen is None:
-            logger.warning(
-                f"排期时间冲突: {d} 当天分钟槽位已排满，平台可能拒绝该章定时发布。"
-                f"建议减少每天章数或调整发布时间点。")
-            day_used.add(t)
-            fixed.append((d, t))
-        else:
-            nt = f"{chosen // 60:02d}:{chosen % 60:02d}"
-            day_used.add(nt)
-            fixed.append((d, nt))
-    if collided:
-        logger.warning("检测到排期时间重复，已自动调整以保证同日时刻唯一。")
+    adjusted = False
+    saturated = False
+    # schedule 中同日章节天然连续（day_offset = i // effective 单调不减），逐日分组
+    i = 0
+    n = len(schedule)
+    while i < n:
+        j = i
+        d = schedule[i][0]
+        while j < n and schedule[j][0] == d:
+            j += 1
+        ideals = [_to_min(t) for _, t in schedule[i:j]]
+        mins = list(ideals)
+        # 正向：严格递增、不早于理想
+        for k in range(1, len(mins)):
+            if mins[k] <= mins[k - 1]:
+                mins[k] = mins[k - 1] + 1
+        # 末章越界 → 反向把临近午夜的尾部整体前移
+        if mins and mins[-1] > DAY_LAST:
+            mins[-1] = DAY_LAST
+            for k in range(len(mins) - 2, -1, -1):
+                if mins[k] >= mins[k + 1]:
+                    mins[k] = mins[k + 1] - 1
+            if mins[0] < 0:
+                # 当天章节多到一天 1440 分钟都排不下（per_day 极端，正常 UI 不可达）：
+                # 夹回 [0,23:59] 后同日时刻不再保证唯一，告警；其余路径不受影响。
+                saturated = True
+                cur = 0
+                for k in range(len(mins)):
+                    m = min(max(ideals[k], cur), DAY_LAST)
+                    mins[k] = m
+                    cur = m + 1
+        if mins != ideals:
+            adjusted = True
+        for m in mins:
+            fixed.append((d, _to_hhmm(max(0, min(m, DAY_LAST)))))
+        i = j
+
+    if saturated:
+        logger.warning(
+            "排期：当天章节过多，一天 24 小时排不下唯一时刻，部分章节时刻可能重复，"
+            "平台可能拒绝。建议减少每天章数或拉开发布时间点。")
+    elif adjusted:
+        logger.warning(
+            "排期：个别时刻冲突/临近午夜，已自动微调以保证同日时刻唯一且顺序不乱。")
     return fixed
 
 

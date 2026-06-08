@@ -43,6 +43,7 @@ def schedule_oracle(n, start, times_str, per_day, sched):
     assert len(sched) == n, f"长度 {len(sched)} != {n}"
     prev_date = None
     used = {}
+    last_min_by_day = {}
     for d, t in sched:
         assert DATE_RE.match(d), f"日期格式 {d}"
         assert TIME_RE.match(t), f"时间格式 {t}"
@@ -53,6 +54,14 @@ def schedule_oracle(n, start, times_str, per_day, sched):
         day = used.setdefault(d, set())
         assert t not in day, f"同日重复时刻 {d} {t} (输入: {times_str!r}/{per_day})"
         day.add(t)
+        # 章节顺序必须等于发布时刻顺序：同日内严格递增（修复 23:58×3 回填乱序）。
+        # per_day 极端到一天 1440 分钟排不下时（正常 UI 不可达）允许退化，故跳过。
+        cur_min = int(t[:2]) * 60 + int(t[3:])
+        if per_day <= 24 * 60 and d in last_min_by_day:
+            assert cur_min > last_min_by_day[d], \
+                f"同日时刻未严格递增(乱序) {d}: ...{last_min_by_day[d]}->{cur_min} " \
+                f"(输入: {times_str!r}/{per_day})"
+        last_min_by_day[d] = cur_min
 
 
 def rounds_schedule():
