@@ -26,7 +26,8 @@ try:
         parse_md_file, get_md_files, strip_md_formatting,
         deduplicate_titles, compute_schedule, _validate_times,
         DailyLimitReached, _check_daily_limit, _wait_publish_result,
-        create_context, save_auth,
+        _log_fail_list,
+        create_context, save_auth, close_browser_safely,
         wait_for_editor_ready, fill_chapter,
         save_draft, publish_scheduled, _navigate_to_publish_settings,
         extract_chapters_from_page, match_chapters, edit_one_chapter,
@@ -149,13 +150,12 @@ class _SharedBrowser:
 
     async def close(self):
         if self._browser:
-            try:
-                await self._browser.close()
-            except Exception as e:
-                logger.debug(f"关闭浏览器: {e}")
+            await close_browser_safely(self._browser)
         if self._pw:
             try:
-                await self._pw.stop()
+                # 浏览器进程挂死时 stop() 会等 driver 退出而无限悬停，
+                # 加超时防止 ensure()/窗口关闭被卡住
+                await asyncio.wait_for(self._pw.stop(), timeout=10)
             except Exception as e:
                 logger.debug(f"停止 Playwright: {e}")
         self._browser = self._context = self._pw = None
@@ -1224,7 +1224,7 @@ class FanqieGUI:
                     await loop.run_in_executor(None, self._login_event.wait)
 
                     if self._login_cancelled:
-                        await browser.close()
+                        await close_browser_safely(browser)
                         self._after(0, self._login_done, "cancelled")
                         return
 
@@ -1234,9 +1234,12 @@ class FanqieGUI:
                     named = SCRIPT_DIR / f".auth_{name}.json"
                     shutil.copy2(str(AUTH_FILE), str(named))
 
-                    await browser.close()
+                    await close_browser_safely(browser)
 
-                self._after(0, self._login_done, None)
+                    # 完成通知放在 async with 内：浏览器挂死时 playwright
+                    # stop（with 退出）可能同样阻塞，不能让它挡住结果汇报
+                    self._after(0, self._login_done, None)
+                    return
             except Exception as e:
                 self._after(0, self._login_done, str(e))
 
@@ -1695,14 +1698,41 @@ class FanqieGUI:
         self.progress["value"] = 0
         self.lbl_progress.configure(text=f"0/{matched_count}")
 
+    @staticmethod
+    def _parse_chapter_spec(raw):
+        """解析章节筛选表达式 → 区间列表 [(lo, hi), ...]；非法返回 None。
+
+        支持逗号分隔的单号与范围混用: "1,3,5-10"（范围亦可用 ~，
+        分隔符兼容 , ; 、以及 NFKC 归一后的全角逗号/分号）。
+        """
+        intervals = []
+        for token in re.split(r'[,;、]', raw):
+            token = token.strip()
+            if not token:
+                continue
+            m = re.match(r'^(\d+)\s*[-~]\s*(\d+)$', token)
+            if m:
+                lo, hi = int(m.group(1)), int(m.group(2))
+                if lo > hi:
+                    lo, hi = hi, lo
+                intervals.append((lo, hi))
+                continue
+            if token.isdigit():
+                n = int(token)
+                intervals.append((n, n))
+                continue
+            return None  # 含非法 token
+        return intervals
+
     def _filter_by_chapter_num(self, items, key):
         """按章节序号筛选列表。
 
         key(item) 提取章节序号 (int 或 None, None 视为不匹配)。
-        支持单值 (≤/≥) 和范围 (如 5-10)。
+        - 纯数字单值: 按 ≤ / ≥ 运算符做阈值筛选（原有行为）
+        - 含逗号或范围: 集合命中模式，支持 "1,3,5-10" 混用，运算符不适用
         返回 (filtered_items, is_active)。同时更新筛选信息标签。
         """
-        # 默认恢复运算符下拉框（范围格式时会覆盖为 disabled）
+        # 默认恢复运算符下拉框（组合/范围格式时会覆盖为 disabled）
         self.cmb_resched_filter_op.configure(state="readonly")
 
         if not self.resched_filter_var.get():
@@ -1718,15 +1748,17 @@ class FanqieGUI:
 
         total = len(items)
 
-        # 范围格式: "5-10" / "5~10"
-        m = re.match(r'^(\d+)\s*[-~]\s*(\d+)$', raw)
-        if m:
-            lo, hi = int(m.group(1)), int(m.group(2))
-            if lo > hi:
-                lo, hi = hi, lo
+        # 组合/范围格式: "5-10"、"1,3,5-10"、"3、7~9" → 集合命中，运算符不适用
+        if not raw.isdigit():
+            intervals = self._parse_chapter_spec(raw)
+            if not intervals:  # None=含非法 token；[]=只有分隔符
+                self.lbl_resched_filter_info.configure(
+                    text="请输入数字、范围或组合(如 1,3,5-10)", foreground="red")
+                return items, False
             self.cmb_resched_filter_op.configure(state="disabled")
             kept = [x for x in items
-                    if (n := key(x)) is not None and lo <= int(n) <= hi]
+                    if (n := key(x)) is not None
+                    and any(lo <= int(n) <= hi for lo, hi in intervals)]
             self.lbl_resched_filter_info.configure(
                 text=f"筛选: {len(kept)}/{total} 章", foreground="gray")
             return kept, True
@@ -1736,7 +1768,7 @@ class FanqieGUI:
             threshold = int(raw)
         except ValueError:
             self.lbl_resched_filter_info.configure(
-                text="请输入数字或范围(如 5-10)", foreground="red")
+                text="请输入数字、范围或组合(如 1,3,5-10)", foreground="red")
             return items, False
         op = self.resched_filter_op_var.get()
         if op == "≤":
@@ -2129,12 +2161,14 @@ class FanqieGUI:
                         await wait_for_editor_ready(page)
                     except PWTimeout:
                         logger.error("无法进入编辑器，请检查 Book ID 和登录状态。")
-                        await browser.close()
+                        await close_browser_safely(browser)
                         self._after(0, self._upload_done, 0, 0)
                         return
 
                     success = 0
                     failed = 0
+                    consec_fail = 0
+                    fail_list = []  # (章节标签, 失败原因)
                     total = len(files)
                     max_retries = self._cfg.get("max_retries", 2)
 
@@ -2169,7 +2203,8 @@ class FanqieGUI:
                                     btn = page.locator("button", has_text="确认发布")
                                     if await btn.count() == 0:
                                         raise RuntimeError("未找到确认发布按钮")
-                                    await btn.first.click(no_wait_after=True)
+                                    await btn.first.click(
+                                        no_wait_after=True, timeout=get_browser_timeout())
                                     await _wait_publish_result(page, btn.first)
                                     logger.info("  -> 已发布")
                                 else:
@@ -2180,7 +2215,10 @@ class FanqieGUI:
                                 break
 
                             except DailyLimitReached as e:
-                                logger.warning(f"{e}")
+                                # 上限按字数计、非硬墙：字数较短的后续章节可能仍
+                                # 发得出去，故只记录原因、跳过本章，不中止整批。
+                                logger.warning(f"  跳过本章（{e}），继续后续章节")
+                                fail_list.append((f"{num_str}{title}", str(e)))
                                 daily_limit = True
                                 break
 
@@ -2190,6 +2228,7 @@ class FanqieGUI:
                                     await page.wait_for_timeout(2000)
                                 else:
                                     logger.error(f"失败: {e}")
+                                    fail_list.append((f"{num_str}{title}", str(e)))
                                     try:
                                         err = SCRIPT_DIR / f"error_{i}_{files[i].stem}.png"
                                         await page.screenshot(path=str(err))
@@ -2199,12 +2238,21 @@ class FanqieGUI:
 
                         if daily_limit:
                             failed += 1
-                            break
-
-                        if ok:
+                            # 上限失败重置熔断计数：toast 被正确捕获说明流程健康
+                            consec_fail = 0
+                        elif ok:
                             success += 1
+                            consec_fail = 0
                         else:
                             failed += 1
+                            consec_fail += 1
+                            if consec_fail >= 3:
+                                rest = total - (i + 1)
+                                logger.error(
+                                    f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
+                                    f"中止任务，剩余 {rest} 章未处理")
+                                self._after(0, self._update_progress, i + 1, total)
+                                break
 
                         self._after(0, self._update_progress, i + 1, total)
 
@@ -2212,13 +2260,17 @@ class FanqieGUI:
                             await page.wait_for_timeout(delay * 1000)
 
                     await save_auth(context)
-                    await browser.close()
+                    await close_browser_safely(browser)
 
-                logger.info(f"{'='*40}")
-                logger.info(f"  上传完成! 成功: {success}  失败: {failed}")
-                logger.info(f"{'='*40}")
+                    # 汇总与完成通知放在 async with 内：浏览器挂死时
+                    # playwright stop（with 退出）可能同样阻塞，不能让它
+                    # 挡住结果汇报（实测曾让 GUI"卡死"41 分钟）
+                    logger.info(f"{'='*40}")
+                    logger.info(f"  上传完成! 成功: {success}  失败: {failed}")
+                    _log_fail_list(fail_list)
+                    logger.info(f"{'='*40}")
 
-                self._after(0, self._upload_done, success, failed)
+                    self._after(0, self._upload_done, success, failed)
 
             except Exception as e:
                 logger.error(f"上传异常: {e}")
@@ -2299,6 +2351,9 @@ class FanqieGUI:
                     success = 0
                     failed = 0
                     skipped = 0
+                    consec_fail = 0
+                    fail_list = []  # (章节标签, 失败原因)
+                    dup_pending = []  # "重复标题"暂存，批末二次尝试
                     total = len(matched_copy)
 
                     for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched_copy):
@@ -2326,32 +2381,121 @@ class FanqieGUI:
                             edit_url = BASE_URL + edit_url
 
                         try:
-                            if await edit_one_chapter(
-                                    page, edit_url, ch_num, title, content,
-                                    use_ai=use_ai,
-                                    max_retries=self._cfg.get("max_retries", 2)):
+                            ok, err = await edit_one_chapter(
+                                page, edit_url, ch_num, title, content,
+                                use_ai=use_ai,
+                                max_retries=self._cfg.get("max_retries", 2))
+                            if ok:
                                 success += 1
+                                consec_fail = 0
+                            elif "重复" in err:
+                                # 标题搬移的临时冲突（本地重新编号后新章先于
+                                # 旧章提交同名标题被拒），留待批末二次尝试
+                                logger.info("  标题暂被其他章节占用，留待批末二次尝试")
+                                dup_pending.append((ch_num, title, content, edit_url))
+                                consec_fail = 0
                             else:
                                 failed += 1
+                                fail_list.append(
+                                    (f"第{ch_num}章 {title}",
+                                     err or "重试后仍失败(见日志/截图)"))
+                                consec_fail += 1
+                                if consec_fail >= 3:
+                                    rest = total - (i + 1)
+                                    logger.error(
+                                        f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
+                                        f"中止任务，剩余 {rest} 章未处理")
+                                    skipped += rest
+                                    self._after(0, self._update_progress, i + 1, total)
+                                    break
                         except DailyLimitReached as e:
-                            logger.warning(f"{e}")
+                            # 上限按字数计、非硬墙：字数较短的后续章节可能仍发得
+                            # 出去，故只记录原因、跳过本章，不中止整批。toast 被
+                            # 正确捕获说明流程健康，重置熔断计数。
+                            logger.warning(f"  跳过本章（{e}），继续后续章节")
+                            fail_list.append((f"第{ch_num}章 {title}", str(e)))
                             failed += 1
-                            break
+                            consec_fail = 0
+                        except Exception as e:
+                            # 兜底浏览器崩溃/页面被关等意外，按原因不明失败计入
+                            # 熔断，保证 save_auth/汇总仍能执行而不是整批裸抛中止。
+                            logger.error(f"  本章发生未预期异常: {e}")
+                            fail_list.append(
+                                (f"第{ch_num}章 {title}", f"未预期异常: {e}"))
+                            failed += 1
+                            consec_fail += 1
+                            if consec_fail >= 3:
+                                rest = total - (i + 1)
+                                logger.error(
+                                    f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
+                                    f"中止任务，剩余 {rest} 章未处理")
+                                skipped += rest
+                                self._after(0, self._update_progress, i + 1, total)
+                                break
 
                         self._after(0, self._update_progress, i + 1, total)
 
                         if i < total - 1 and delay > 0:
                             await page.wait_for_timeout(delay * 1000)
 
+                    # 批末二次尝试: 主循环跑完后，占用旧标题的章节多已更新
+                    if dup_pending:
+                        if not self._cancel_requested:
+                            logger.info("")
+                            logger.info(
+                                f"二次尝试 {len(dup_pending)} 个标题重复的章节"
+                                f"（标题搬移的临时冲突，此时多已解除）...")
+                        for idx2, (ch_num, title, content, edit_url) in \
+                                enumerate(dup_pending):
+                            if self._cancel_requested:
+                                # 中途/事前取消: 剩余章节如实计入失败清单
+                                for ch_num2, title2, *_ in dup_pending[idx2:]:
+                                    fail_list.append(
+                                        (f"第{ch_num2}章 {title2}",
+                                         "标题重复(用户取消，未二次尝试)"))
+                                    failed += 1
+                                break
+                            logger.info(f"[二次] 修改第{ch_num}章 {title}")
+                            try:
+                                ok, err = await edit_one_chapter(
+                                    page, edit_url, ch_num, title, content,
+                                    use_ai=use_ai, max_retries=0)
+                                if ok:
+                                    success += 1
+                                else:
+                                    failed += 1
+                                    fail_list.append(
+                                        (f"第{ch_num}章 {title}",
+                                         err or "标题重复，二次尝试仍失败"))
+                            except DailyLimitReached as e:
+                                logger.warning(f"  跳过本章（{e}）")
+                                fail_list.append((f"第{ch_num}章 {title}", str(e)))
+                                failed += 1
+                            except Exception as e:
+                                logger.error(f"  二次尝试异常: {e}")
+                                fail_list.append(
+                                    (f"第{ch_num}章 {title}", f"二次尝试异常: {e}"))
+                                failed += 1
+                            if delay > 0:
+                                try:
+                                    await page.wait_for_timeout(delay * 1000)
+                                except Exception:
+                                    pass  # 页面已死也要走完计数与汇总
+
                     await save_auth(context)
-                    await browser.close()
+                    await close_browser_safely(browser)
 
-                logger.info(f"{'='*40}")
-                skip_str = f"  跳过: {skipped}" if skipped else ""
-                logger.info(f"  修改完成! 成功: {success}  失败: {failed}{skip_str}")
-                logger.info(f"{'='*40}")
+                    # 汇总与完成通知放在 async with 内：浏览器挂死时
+                    # playwright stop（with 退出）可能同样阻塞，不能让它
+                    # 挡住结果汇报（实测曾让 GUI"卡死"41 分钟）
+                    logger.info(f"{'='*40}")
+                    skip_str = f"  跳过: {skipped}" if skipped else ""
+                    logger.info(
+                        f"  修改完成! 成功: {success}  失败: {failed}{skip_str}")
+                    _log_fail_list(fail_list)
+                    logger.info(f"{'='*40}")
 
-                self._after(0, self._upload_done, success, failed)
+                    self._after(0, self._upload_done, success, failed)
 
             except Exception as e:
                 logger.error(f"修改异常: {e}")
@@ -2476,13 +2620,16 @@ class FanqieGUI:
                     )
 
                     await save_auth(context)
-                    await browser.close()
+                    await close_browser_safely(browser)
 
-                logger.info(f"{'='*40}")
-                logger.info(f"  修改排期完成! 成功: {success}  失败: {failed}")
-                logger.info(f"{'='*40}")
+                    # 汇总与完成通知放在 async with 内：浏览器挂死时
+                    # playwright stop（with 退出）可能同样阻塞，不能让它
+                    # 挡住结果汇报（实测曾让 GUI"卡死"41 分钟）
+                    logger.info(f"{'='*40}")
+                    logger.info(f"  修改排期完成! 成功: {success}  失败: {failed}")
+                    logger.info(f"{'='*40}")
 
-                self._after(0, self._upload_done, success, failed)
+                    self._after(0, self._upload_done, success, failed)
 
             except Exception as e:
                 logger.error(f"修改排期异常: {e}")

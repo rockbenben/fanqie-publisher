@@ -23,6 +23,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -98,51 +99,281 @@ def setup_logging(log_file=None, level=logging.INFO):
 
 
 class DailyLimitReached(RuntimeError):
-    """当日发布字数已达平台上限，无法继续发布。"""
+    """本章提交触发平台"当日发布字数上限"。
+
+    注意：上限按字数计、不是硬墙——各章字数不同，本章超限后，
+    字数较短的后续章节可能仍发得出去（2026-06-06 实测：79-81 章失败、
+    82 章成功）。因此上层不中止整批，记录原因后继续后续章节。
+    """
+
+
+# 平台"每日字数上限"toast 文案不止一种（均为实测）:
+#   「已到达当日发布字数上限」 -- 新章节发布路径
+#   「提交字数超出每日上限」   -- 章节修改提交路径 (2026-06-06)
+# 用宽松正则匹配，避免平台换文案后检测失效。
+_DAILY_LIMIT_RE = re.compile(r"(每日|当日|今日|本日|单日|今天)[^，。;；]{0,12}上限")
+# toast 含这些词 → 视为发布失败，立即抛错（不再傻等按钮超时）。
+# 注意 _classify_toasts 先全量匹配每日上限正则，故此处的"超出/上限"只接住
+# 非每日类的限制错误（如"标题字数超出限制"），按单章失败处理。
+_TOAST_ERROR_RE = re.compile(
+    r"失败|错误|异常|敏感|违规|驳回|无法|频繁|稍后再试|审核不通过|超出|超过|上限"
+    r"|不能|早于|已过期|不支持"   # 定时发布"不能早于当前时间"类拒绝也要秒级失败
+    r"|重复")  # "本书中存在重复标题，请修改后再发布" (2026-06-07 实测)
+
+
+async def _visible_toast_texts(page) -> dict:
+    """单次 evaluate 原子抓取当前可见的 Arco toast 文本，按组件类型分组。
+
+    返回 {"messages": [...], "notifications": [...]}：
+    - message: 瞬态提示（~3s 自动消失），平台实测用它弹失败/上限提示
+    - notification: 可常驻（公告类）。分开返回是为了让调用方区分角色——
+      常驻公告若与瞬态提示同权，一条含"失败"字样的公告会团灭整批，
+      一条良性常驻公告会让静默自愈永不触发
+
+    实现要点:
+    - 一次 CDP 往返拿一致快照（locator count+nth 在 toast 自动消失下有
+      detach 竞态且每条空等 300ms）
+    - 优先取最内层 -content 节点：宽选择器会同时命中 wrapper 容器，其
+      innerText 是全部子 toast 的换行拼接，去重失效且污染日志；content
+      节点不存在时回退宽选择器以兼容平台改版
+    - getClientRects 过滤未渲染节点：display:none 的退场残留 innerText
+      仍返回旧文案，会把已消失的错误反复算成当前提示；不能用
+      offsetParent 判定——toast 容器是 fixed 定位，offsetParent 恒为 null
+    出错返回空组——本函数只做观测。
+    """
+    empty = {"messages": [], "notifications": []}
+    try:
+        result = await page.evaluate(
+            """() => {
+                const grab = (contentSel, broadSel) => {
+                    let els = document.querySelectorAll(contentSel);
+                    if (els.length === 0) els = document.querySelectorAll(broadSel);
+                    const out = [];
+                    for (const el of els) {
+                        if (el.getClientRects().length === 0) continue;
+                        const t = (el.innerText || '').trim();
+                        if (t && !out.includes(t)) out.push(t);
+                        if (out.length >= 6) break;
+                    }
+                    return out;
+                };
+                return {
+                    messages: grab('.arco-message-content',
+                                   "[class*='arco-message']"),
+                    notifications: grab('.arco-notification-content',
+                                        "[class*='arco-notification']"),
+                };
+            }""")
+        return {
+            "messages": [t for t in result.get("messages", [])
+                         if isinstance(t, str)],
+            "notifications": [t for t in result.get("notifications", [])
+                              if isinstance(t, str)],
+        }
+    except Exception:
+        return empty
+
+
+def _classify_toasts(messages: list[str], notifications: list[str] = ()):
+    """对 toast 文本分类抛错: 上限 → DailyLimitReached; 其他错误 → RuntimeError。
+
+    两段式：先全量扫上限、再扫一般错误——同 tick 多条 toast 同时可见时
+    （如「操作过于频繁」+「提交字数超出每日上限」），保证上限分类不被
+    排在前面的一般错误抢先，避免该章被误判为可重试普通失败。
+
+    上限正则扫 message+notification（万一平台某天用常驻通知发上限）；
+    错误正则只扫瞬态 message——常驻公告含"失败/异常"等字样不该团灭整批。
+    """
+    for t in (*messages, *notifications):
+        if _DAILY_LIMIT_RE.search(t):
+            raise DailyLimitReached(f"当日发布字数已达上限: {t}")
+    for t in messages:
+        if _TOAST_ERROR_RE.search(t):
+            raise RuntimeError(f"发布失败，页面提示: {t}")
 
 
 async def _check_daily_limit(page):
-    """检测平台"当日发布字数上限"提示，若存在则抛出 DailyLimitReached。"""
-    try:
-        tip = page.locator("text=已到达当日发布字数上限")
-        if await tip.count() > 0:
-            raise DailyLimitReached("已到达当日发布字数上限，无法继续发布")
-    except DailyLimitReached:
-        raise
-    except Exception:
-        logger.debug("_check_daily_limit 检测时出错(非致命)", exc_info=True)
+    """检测平台"当日发布字数上限"toast，若存在则抛出 DailyLimitReached。
+
+    只扫 toast 元素、不做全页文本匹配，避免误中正文内容。
+    """
+    toasts = await _visible_toast_texts(page)
+    for t in toasts["messages"] + toasts["notifications"]:
+        if _DAILY_LIMIT_RE.search(t):
+            raise DailyLimitReached(f"当日发布字数已达上限: {t}")
+
+
+def _compress_chapter_nums(nums) -> str:
+    """把章节号集合压缩成筛选表达式: [79,80,81,83] -> "79-81,83"。
+
+    输出与 GUI「按章节号筛选」的组合写法完全兼容，可直接粘贴补传。
+    """
+    uniq = sorted(set(nums))
+    parts = []
+    i = 0
+    while i < len(uniq):
+        j = i
+        while j + 1 < len(uniq) and uniq[j + 1] == uniq[j] + 1:
+            j += 1
+        parts.append(str(uniq[i]) if i == j else f"{uniq[i]}-{uniq[j]}")
+        i = j + 1
+    return ",".join(parts)
+
+
+def _log_fail_list(fail_list):
+    """批量结束时打印失败章节及原因清单（CLI/GUI 上传与修改共用）。
+
+    末尾追加按筛选语法压缩的失败章节号（如 "79-81,83-114"），
+    可直接粘贴到「按章节号筛选」输入框补传失败章节。
+    """
+    if not fail_list:
+        return
+    logger.info("  失败章节及原因:")
+    for label, reason in fail_list:
+        logger.info(f"    - {label}: {reason}")
+    nums = []
+    for label, _ in fail_list:
+        m = re.match(r"第(\d+)章", label)
+        if m:
+            nums.append(int(m.group(1)))
+    if nums:
+        logger.info(
+            f"  失败章节号: {_compress_chapter_nums(nums)}"
+            f"（可直接粘贴到「按章节号筛选」补传）")
+
+
+# _wait_publish_result 行为参数
+_PUBLISH_POLL_MS = 200        # 轮询间隔
+_RECLICK_SILENT_S = 5.0       # 按钮在、且无瞬态 toast 持续此秒数 → 判定点击被吞
+_RECLICK_MAX = 2              # 自愈重点击次数上限
+_RECLICK_TIMEOUT_MS = 2000    # 重点击的 actionability 超时——按钮处于 loading/disabled
+                              # （首次点击其实已生效）时必须快速失败，不能用 Playwright
+                              # 默认 30s 阻塞整个轮询，也避免真点下去造成重复提交
+_RECLICK_BUDGET_S = 7.0       # 发起重点击所需的最少剩余预算（2s 点击 + 5s 观察）。
+                              # 不点白点：点完就超时的重点击观察不到结果，
+                              # 还会在新建章节流程留下重复提交风险
 
 
 async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None):
-    """点击「确认发布」后，等待对话框关闭或上限提示出现。
+    """点击「确认发布」后判定发布结果，每 200ms 轮询，按真实时钟控制超时。
 
-    平台「已到达当日发布字数上限」是 Arco Message toast，~3 秒自动消失。
-    必须趁 toast 还在时检测，不能等 wait_for(state="hidden") 超时后再看。
-    每 200ms 轮询：先看上限文案 (时机敏感)，再看按钮是否消失。
+    判定规则（实测）:
+    - 按钮消失 → 提交成功，立即返回（按钮消失是可靠的成功信号，无需再看 toast）
+    - toast 含上限文案 → 抛 DailyLimitReached（上层记录原因后继续后续章节）
+    - 瞬态 toast 含失败/错误等 → 立即抛 RuntimeError（不再傻等超时）
+    - 按钮在、且连续 5s 无瞬态 toast（常驻公告不算响应）→ 疑似点击被
+      遮挡/吞掉（与"下一步"被吞同类问题），自愈：限时重点击；
+      仅在剩余预算 ≥ 点击+观察窗时才发起，避免点完即超时的无效点击
+    - 超时按钮仍在 → 抛 RuntimeError，注明期间有无页面提示
+    - 按钮可见性检测出错 → 状态未知，继续轮询（不当成功）
 
-    - 按钮消失 → 返回
-    - 出现上限文案 → 抛 DailyLimitReached
-    - 超时仍未消失也未见上限 → 抛 RuntimeError (交由重试逻辑处理)
+    平台失败提示（上限/敏感词等）是 Arco Message toast，~3 秒自动消失，
+    必须趁还在时捕获。所有捕获到的 toast 文本都写入日志。
+
+    TODO: 更深层的判定是监听章节提交接口的 response JSON 错误码（不依赖
+    toast 文案与时机）；待抓到接口 URL/格式后接入。
     """
     if timeout is None:
         timeout = _browser_timeout
-    limit_locator = page.locator("text=已到达当日发布字数上限")
-    iterations = max(1, timeout // 200)
-    for _ in range(iterations):
+    # 真实时钟截止：每 tick 除 200ms 睡眠外还有 CDP 往返耗时，
+    # 按固定迭代数算会让实际超时膨胀到名义值的 1.5 倍以上（日志实测 23s vs 15s）
+    deadline = time.monotonic() + timeout / 1000
+    seen_toasts: list[str] = []
+    last_activity = time.monotonic()  # 最近一次"页面有响应"（瞬态 toast 在场）的时刻
+    reclicks = 0
+    # 接口探针：窗口期内记录提交类接口的 (status, url)，只在失败时输出。
+    # 纯观测不判定——为将来切换到"按接口响应码判定"积累真实格式数据。
+    api_probe: list[str] = []
+
+    def _on_response(resp):
         try:
-            if await limit_locator.count() > 0:
-                raise DailyLimitReached("已到达当日发布字数上限，无法继续发布")
-        except DailyLimitReached:
-            raise
+            url = resp.url
+            if len(api_probe) < 20 and re.search(
+                    r"draft|publish|chapter|submit|create|article", url, re.I):
+                idx = len(api_probe)
+                api_probe.append(f"{resp.status} {url[:160]}")
+                # 提交接口(实测 /api/author/publish_article/v0/，业务错误藏在
+                # 200 响应的 JSON body 里)——异步补抓 body 前 300 字符，
+                # 为切换到"按响应码判定"积累格式数据。
+                if "publish_article" in url:
+                    async def _grab(i=idx, r=resp):
+                        try:
+                            body = (await r.text())[:300]
+                            api_probe[i] += f" body={body}"
+                        except Exception:
+                            pass
+                    try:
+                        asyncio.create_task(_grab())
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+    try:
+        page.on("response", _on_response)
+    except Exception:
+        pass
+    try:
+        while True:
+            toasts = await _visible_toast_texts(page)
+            for t in toasts["messages"] + toasts["notifications"]:
+                if t not in seen_toasts:
+                    seen_toasts.append(t)
+                    logger.info(f"    页面提示: {t}")
+            _classify_toasts(toasts["messages"], toasts["notifications"])
+            try:
+                visible = await confirm_btn.is_visible()
+            except Exception:
+                visible = None  # 状态未知（页面跳转/上下文销毁等），不能当成功
+            if visible is False:
+                return  # 按钮消失 = 提交成功
+            now = time.monotonic()
+            if visible:
+                if toasts["messages"]:
+                    # 瞬态 toast 在场=页面有响应（含同文本重复弹出）；
+                    # 常驻 notification 不算，否则一条公告会让自愈永不触发
+                    last_activity = now
+                elif (now - last_activity >= _RECLICK_SILENT_S
+                        and reclicks < _RECLICK_MAX
+                        and deadline - now >= _RECLICK_BUDGET_S):
+                    reclicks += 1
+                    last_activity = now
+                    logger.warning(
+                        f"    按钮未消失且无页面提示，疑似点击未生效，"
+                        f"重新点击 (第{reclicks}次)")
+                    try:
+                        await confirm_btn.click(
+                            no_wait_after=True, timeout=_RECLICK_TIMEOUT_MS)
+                    except Exception as e:
+                        logger.debug(f"    重新点击失败: {e}")
+            if time.monotonic() >= deadline:
+                break
+            await page.wait_for_timeout(_PUBLISH_POLL_MS)
+    finally:
         try:
-            if not await confirm_btn.is_visible():
-                return
+            page.remove_listener("response", _on_response)
         except Exception:
-            return
-        await page.wait_for_timeout(200)
-    raise RuntimeError("确认发布按钮未消失，发布可能失败")
+            pass
+    # ---- 超时失败：尽量多带现场信息（只在失败路径付出这些开销） ----
+    if seen_toasts:
+        extra = (f"；期间页面提示: {'; '.join(seen_toasts)}"
+                 f"（未命中已知失败文案，如确为失败原因请补充词库）")
+    else:
+        extra = "；期间无任何页面提示"
+    try:
+        extra += f"；当前URL: {page.url}"
+    except Exception:
+        pass
+    try:
+        btn_html = await confirm_btn.evaluate(
+            "el => (el.outerHTML || '').slice(0, 160)", timeout=1000)
+        if btn_html:
+            extra += f"；按钮状态: {btn_html}"
+    except Exception:
+        pass
+    if api_probe:
+        logger.info(f"    窗口期接口响应: {'; '.join(api_probe[:8])}")
+    raise RuntimeError(f"确认发布按钮未消失，发布可能失败{extra}")
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +394,12 @@ def load_config() -> dict:
         except (json.JSONDecodeError, ValueError, TypeError, OSError):
             logger.warning("config.json 格式错误，使用默认配置")
     val = cfg.get("browser_timeout", DEFAULT_CONFIG["browser_timeout"])
-    if not isinstance(val, (int, float)) or val <= 0:
-        logger.warning(f"browser_timeout 无效({val})，使用默认值 {DEFAULT_CONFIG['browser_timeout']}")
+    # 单位是毫秒；<1000 几乎必然是把"秒"误填成了毫秒（如 15），会让所有
+    # 页面操作瞬间超时、整批失败——按无效处理。
+    if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 1000:
+        logger.warning(
+            f"browser_timeout 无效({val}，单位应为毫秒且 ≥1000)，"
+            f"使用默认值 {DEFAULT_CONFIG['browser_timeout']}")
         val = DEFAULT_CONFIG["browser_timeout"]
     _browser_timeout = int(val)
 
@@ -449,11 +684,17 @@ async def create_context(p, headless=False):
     browser = await p.chromium.launch(headless=headless)
     try:
         if AUTH_FILE.exists():
-            context = await browser.new_context(storage_state=str(AUTH_FILE))
+            try:
+                context = await browser.new_context(storage_state=str(AUTH_FILE))
+            except Exception as e:
+                # 登录状态文件损坏（半截 JSON 等）→ 降级为全新会话，
+                # 而不是让整个任务裸崩；用户重新 login 即可。
+                logger.warning(f"登录状态文件无法加载({e})，已忽略——请重新运行 login")
+                context = await browser.new_context()
         else:
             context = await browser.new_context()
     except Exception:
-        await browser.close()
+        await close_browser_safely(browser)
         raise
     # 授予剪贴板权限，用于可靠的粘贴操作
     await context.grant_permissions(
@@ -463,8 +704,41 @@ async def create_context(p, headless=False):
 
 
 async def save_auth(context):
-    """保存当前登录状态。"""
-    await context.storage_state(path=str(AUTH_FILE))
+    """保存当前登录状态（原子写：tmp+rename，防进程中断留下半截 JSON）。
+
+    保存失败不应影响本次任务结果，只告警。storage_state 走 CDP，
+    浏览器挂死时会无限悬停，故加超时（超时走同一条告警路径）。
+    """
+    try:
+        state = await asyncio.wait_for(context.storage_state(), timeout=30)
+        tmp = AUTH_FILE.with_suffix(AUTH_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(AUTH_FILE)
+    except Exception as e:
+        logger.warning(f"保存登录状态失败(不影响本次结果): {e}")
+
+
+async def close_browser_safely(browser, timeout_s: float = 30):
+    """关闭浏览器，带超时保护——关不掉就放弃等待，不让收尾阻塞结果汇报。
+
+    实测(2026-06-08): 修改任务最后一章保存后浏览器窗口立即消失，但个别
+    chrome 子进程卡在退出阶段 41 分钟；Playwright 的 close() 要等浏览器
+    进程整体退出、driver 回执后才返回——期间无日志无汇总，GUI 看起来
+    像卡死。章节早已提交成功，关浏览器不应把结果汇报当人质。
+
+    注意: close() 超时说明浏览器进程已挂死，随后的 playwright stop
+    （async with 退出时的 transport 等待）也可能同样阻塞——所以 GUI 的
+    完成汇报必须放在 async with 块内、本函数之后立即发出。
+    """
+    try:
+        await asyncio.wait_for(browser.close(), timeout=timeout_s)
+    except (asyncio.TimeoutError, TimeoutError):
+        # TimeoutError 的 str() 为空，需给出明确文案
+        logger.warning(
+            f"关闭浏览器超过 {timeout_s:g} 秒未完成（浏览器进程疑似挂死），"
+            f"放弃等待，不影响本次结果")
+    except Exception as e:
+        logger.warning(f"关闭浏览器失败(不影响本次结果): {e}")
 
 
 async def dismiss_overlays(page, draft_action="放弃"):
@@ -1345,7 +1619,7 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
     confirm_btn = page.locator("button", has_text="确认发布")
     if await confirm_btn.count() == 0:
         raise RuntimeError("未找到确认发布按钮")
-    await confirm_btn.first.click(no_wait_after=True)
+    await confirm_btn.first.click(no_wait_after=True, timeout=_browser_timeout)
     await _wait_publish_result(page, confirm_btn.first)
 
 
@@ -1368,7 +1642,7 @@ async def cmd_login():
         await asyncio.get_running_loop().run_in_executor(None, input)
 
         await save_auth(context)
-        await browser.close()
+        await close_browser_safely(browser)
         logger.info("登录状态已保存。")
 
 
@@ -1408,7 +1682,7 @@ async def cmd_books():
             logger.info("上传时使用:  python fanqie_upload.py upload <目录> --book-id <ID>")
 
         await save_auth(context)
-        await browser.close()
+        await close_browser_safely(browser)
 
 
 # ---------------------------------------------------------------------------
@@ -1522,11 +1796,13 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
             logger.info("  1. Book ID 是否正确")
             logger.info("  2. 登录状态是否有效 (重新运行 login)")
             await page.screenshot(path=str(SCRIPT_DIR / "error_navigate.png"))
-            await browser.close()
+            await close_browser_safely(browser)
             return
 
         success = 0
         failed = 0
+        consec_fail = 0
+        fail_list: list[tuple[str, str]] = []  # (章节标签, 失败原因)
         max_retries = cfg.get("max_retries", 2)
 
         for i, file in enumerate(files):
@@ -1555,12 +1831,9 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                         confirm_btn = page.locator("button", has_text="确认发布")
                         if await confirm_btn.count() == 0:
                             raise RuntimeError("未找到确认发布按钮")
-                        await confirm_btn.first.click(no_wait_after=True)
-                        try:
-                            await confirm_btn.first.wait_for(state="hidden", timeout=_browser_timeout)
-                        except Exception:
-                            await page.wait_for_timeout(2000)
-                        await _check_daily_limit(page)
+                        await confirm_btn.first.click(no_wait_after=True, timeout=_browser_timeout)
+                        # 判定结果: 按钮消失=成功；toast 分类失败原因
+                        await _wait_publish_result(page, confirm_btn.first)
                         logger.info(f"  -> 已发布")
                     else:
                         await save_draft(page)
@@ -1570,7 +1843,10 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                     break
 
                 except DailyLimitReached as e:
-                    logger.warning(f"{e}")
+                    # 上限按字数计、非硬墙：字数较短的后续章节可能仍发得出去，
+                    # 故只记录原因、跳过本章，不中止整批。
+                    logger.warning(f"  跳过本章（{e}），继续后续章节")
+                    fail_list.append((f"{num_str}{title}", str(e)))
                     daily_limit = True
                     break
 
@@ -1580,6 +1856,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                         await page.wait_for_timeout(2000)
                     else:
                         logger.error(f"失败: {e}")
+                        fail_list.append((f"{num_str}{title}", str(e)))
                         try:
                             err_path = SCRIPT_DIR / f"error_{i}_{file.stem}.png"
                             await page.screenshot(path=str(err_path))
@@ -1589,23 +1866,33 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
             if daily_limit:
                 failed += 1
-                break
-
-            if ok:
+                # 上限失败重置熔断计数：toast 被正确捕获说明整条流程健康，
+                # 它不该和"原因不明失败"拼成"连续 3 章"误触发熔断
+                consec_fail = 0
+            elif ok:
                 success += 1
+                consec_fail = 0
             else:
                 failed += 1
+                consec_fail += 1
+                if consec_fail >= 3:
+                    rest = len(files) - (i + 1)
+                    logger.error(
+                        f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
+                        f"中止任务，剩余 {rest} 章未处理")
+                    break
 
             if i < len(files) - 1 and delay > 0:
                 await page.wait_for_timeout(delay * 1000)
 
         await save_auth(context)
-        await browser.close()
+        await close_browser_safely(browser)
 
         logger.info("")
         logger.info("=" * 40)
         logger.info(f"  上传完成!")
         logger.info(f"  成功: {success}  失败: {failed}")
+        _log_fail_list(fail_list)
         logger.info("=" * 40)
 
 
@@ -1615,11 +1902,15 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 async def edit_one_chapter(
     page, edit_url: str, ch_num: int, title: str, content: str,
     *, use_ai: bool = False, max_retries: int = 2,
-) -> bool:
-    """编辑单个已有章节（含重试）。成功返回 True，失败返回 False。
+) -> tuple[bool, str]:
+    """编辑单个已有章节（含重试）。返回 (是否成功, 最后一次错误信息)。
 
-    DailyLimitReached 不在此处捕获，直接向上抛出以停止整个循环。
+    错误信息供上层写入失败清单（真实原因优于"见日志"），并用于识别
+    "重复标题"类可二次尝试的失败。
+    DailyLimitReached 不在此处捕获（本章重试无意义，字数不会变），
+    直接向上抛出，由上层记录原因并继续后续章节。
     """
+    last_err = ""
     for attempt in range(1, max_retries + 2):
         try:
             await page.goto(edit_url)
@@ -1641,13 +1932,14 @@ async def edit_one_chapter(
             confirm_btn = page.locator("button", has_text="确认发布")
             if await confirm_btn.count() == 0:
                 raise RuntimeError("未找到确认发布按钮")
-            await confirm_btn.first.click(no_wait_after=True)
+            await confirm_btn.first.click(no_wait_after=True, timeout=_browser_timeout)
             await _wait_publish_result(page, confirm_btn.first)
             logger.info("  -> 已保存修改")
-            return True
+            return True, ""
         except DailyLimitReached:
             raise
         except Exception as e:
+            last_err = str(e)
             if attempt <= max_retries:
                 logger.warning(f"第{attempt}次失败: {e}，重试中...")
                 await page.wait_for_timeout(2000)
@@ -1659,7 +1951,7 @@ async def edit_one_chapter(
                     logger.error(f"截图: {err_path}")
                 except Exception:
                     pass
-    return False
+    return False, last_err
 
 
 async def reschedule_on_manage_page(
@@ -1875,15 +2167,18 @@ async def _reschedule_current_volume(
                     await page.keyboard.press("Enter")
                     await page.wait_for_timeout(500)
 
-                    # 点击"确认修改"
-                    await confirm_btn.click(no_wait_after=True)
-                    try:
-                        await confirm_btn.wait_for(state="hidden", timeout=_browser_timeout)
-                    except Exception:
-                        await page.wait_for_timeout(1000)
+                    # 点击"确认修改"，判定结果: 按钮消失=成功；toast 分类失败原因
+                    await confirm_btn.first.click(no_wait_after=True, timeout=_browser_timeout)
+                    await _wait_publish_result(page, confirm_btn.first)
 
                     logger.info(f"  -> 已修改定时 {date_str} {time_str}")
                     ok = True
+                    break
+
+                except DailyLimitReached as e:
+                    # 改期不提交字数，上限 toast 多为相邻操作残留；
+                    # 重试无意义，按失败记录并继续后续章节（不截图）。
+                    logger.warning(f"  跳过本章（{e}）")
                     break
 
                 except Exception as e:
@@ -1986,7 +2281,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
 
         if not platform_chapters:
             logger.warning("未在平台找到章节。请检查 Book ID 和登录状态。")
-            await browser.close()
+            await close_browser_safely(browser)
             return
 
         logger.info(f"平台共有 {len(platform_chapters)} 个章节。")
@@ -1996,7 +2291,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
 
         if not matched:
             logger.warning("没有匹配到任何章节！请检查本地文件是否包含章节号。")
-            await browser.close()
+            await close_browser_safely(browser)
             return
 
         # 预览
@@ -2020,13 +2315,16 @@ async def cmd_edit(directory: Path, book_id: str, args):
         confirm = input("确认修改? (y/N): ").strip().lower()
         if confirm != "y":
             logger.info("已取消。")
-            await browser.close()
+            await close_browser_safely(browser)
             return
 
         # 执行修改
         success = 0
         failed = 0
         skipped = 0
+        consec_fail = 0
+        fail_list: list[tuple[str, str]] = []  # (章节标签, 失败原因)
+        dup_pending: list[tuple] = []  # "重复标题"暂存，批末二次尝试
         total = len(matched)
 
         for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched):
@@ -2048,27 +2346,97 @@ async def cmd_edit(directory: Path, book_id: str, args):
                 edit_url = BASE_URL + edit_url
 
             try:
-                if await edit_one_chapter(page, edit_url, ch_num, title, content,
-                                          use_ai=use_ai,
-                                          max_retries=cfg.get("max_retries", 2)):
+                ok, err = await edit_one_chapter(
+                    page, edit_url, ch_num, title, content,
+                    use_ai=use_ai, max_retries=cfg.get("max_retries", 2))
+                if ok:
                     success += 1
+                    consec_fail = 0
+                elif "重复" in err:
+                    # 标题在章节间搬移的临时冲突（实测: 本地重新编号后，
+                    # 新章先于旧章提交同名标题被拒；旧章稍后更新即释放）。
+                    # 留待批末二次尝试；属已识别原因，不计熔断。
+                    logger.info("  标题暂被其他章节占用，留待批末二次尝试")
+                    dup_pending.append((ch_num, title, content, edit_url))
+                    consec_fail = 0
                 else:
                     failed += 1
+                    fail_list.append((f"第{ch_num}章 {title}",
+                                      err or "重试后仍失败(见日志/截图)"))
+                    consec_fail += 1
+                    if consec_fail >= 3:
+                        rest = total - (i + 1)
+                        logger.error(
+                            f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
+                            f"中止任务，剩余 {rest} 章未处理")
+                        skipped += rest
+                        break
             except DailyLimitReached as e:
-                logger.warning(f"{e}")
+                # 上限按字数计、非硬墙：字数较短的后续章节可能仍发得出去，
+                # 故只记录原因、跳过本章，不中止整批。toast 被正确捕获说明
+                # 流程健康，重置熔断计数，避免与原因不明失败拼成误熔断。
+                logger.warning(f"  跳过本章（{e}），继续后续章节")
+                fail_list.append((f"第{ch_num}章 {title}", str(e)))
                 failed += 1
-                break
+                consec_fail = 0
+            except Exception as e:
+                # edit_one_chapter 正常不会泄漏非上限异常（内部已含重试+吞错），
+                # 这里兜底浏览器崩溃/页面被关等意外，按原因不明失败计入熔断，
+                # 保证 save_auth/汇总仍能执行而不是整批裸抛中止。
+                logger.error(f"  本章发生未预期异常: {e}")
+                fail_list.append((f"第{ch_num}章 {title}", f"未预期异常: {e}"))
+                failed += 1
+                consec_fail += 1
+                if consec_fail >= 3:
+                    rest = total - (i + 1)
+                    logger.error(
+                        f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
+                        f"中止任务，剩余 {rest} 章未处理")
+                    skipped += rest
+                    break
 
             if i < total - 1 and delay > 0:
                 await page.wait_for_timeout(delay * 1000)
 
+        # 批末二次尝试: 主循环跑完后，占用旧标题的章节多已更新、标题已释放
+        if dup_pending:
+            logger.info("")
+            logger.info(f"二次尝试 {len(dup_pending)} 个标题重复的章节"
+                        f"（标题搬移的临时冲突，此时多已解除）...")
+            for ch_num, title, content, edit_url in dup_pending:
+                logger.info(f"[二次] 修改第{ch_num}章 {title}")
+                try:
+                    ok, err = await edit_one_chapter(
+                        page, edit_url, ch_num, title, content,
+                        use_ai=use_ai, max_retries=0)
+                    if ok:
+                        success += 1
+                    else:
+                        failed += 1
+                        fail_list.append((f"第{ch_num}章 {title}",
+                                          err or "标题重复，二次尝试仍失败"))
+                except DailyLimitReached as e:
+                    logger.warning(f"  跳过本章（{e}）")
+                    fail_list.append((f"第{ch_num}章 {title}", str(e)))
+                    failed += 1
+                except Exception as e:
+                    logger.error(f"  二次尝试异常: {e}")
+                    fail_list.append((f"第{ch_num}章 {title}", f"二次尝试异常: {e}"))
+                    failed += 1
+                if delay > 0:
+                    try:
+                        await page.wait_for_timeout(delay * 1000)
+                    except Exception:
+                        pass  # 页面已死也要走完计数与汇总
+
         await save_auth(context)
-        await browser.close()
+        await close_browser_safely(browser)
 
         logger.info("")
         logger.info("=" * 40)
         skip_str = f"  跳过: {skipped}" if skipped else ""
         logger.info(f"  修改完成! 成功: {success}  失败: {failed}{skip_str}")
+        _log_fail_list(fail_list)
         logger.info("=" * 40)
 
 
