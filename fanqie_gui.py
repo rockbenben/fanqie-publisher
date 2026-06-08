@@ -86,6 +86,18 @@ SECTION_HELP = {
                 "触发前会重新读取一次章节目录。",
 }
 
+def _as_int(n):
+    """把章节号安全转 int；None/非数字返回 None（视为不匹配，不抛异常）。
+
+    筛选的 key 可能来自平台章节(理论上 int)或本地解析(数字字符串)；万一
+    DOM 漂移给出 "番外" 等非数字，旧代码 int(n) 会让整个预览/筛选崩掉。
+    """
+    try:
+        return int(n)
+    except (TypeError, ValueError):
+        return None
+
+
 # 高 DPI 支持 (Windows)
 if sys.platform == "win32":
     try:
@@ -361,7 +373,10 @@ class FanqieGUI:
 
         row_radios = ttk.Frame(frm_mode)
         row_radios.pack(fill="x", padx=6, pady=4)
-        self.mode_var = tk.StringVar(value=self._cfg.get("default_mode", "schedule"))
+        _mode = self._cfg.get("default_mode", "schedule")
+        if _mode not in ("schedule", "publish", "draft", "edit", "reschedule"):
+            _mode = "schedule"  # 损坏/手改的 config 不应让单选组空选、模式分发错乱
+        self.mode_var = tk.StringVar(value=_mode)
         self._mode_radios: list[ttk.Radiobutton] = []
         for text, val in [("定时发布", "schedule"), ("立即发布", "publish"),
                           ("存草稿", "draft"), ("修改内容", "edit"),
@@ -417,7 +432,10 @@ class FanqieGUI:
         self.ent_date = ttk.Entry(r1, textvariable=self.date_var, width=14)
         self.ent_date.pack(side="left", padx=4)
         ttk.Label(r1, text="每天章数:").pack(side="left", padx=(20, 0))
-        self.perday_var = tk.IntVar(value=self._cfg.get("default_per_day", 2))
+        _pd = self._cfg.get("default_per_day", 2)
+        if not isinstance(_pd, int) or isinstance(_pd, bool) or not (1 <= _pd <= 20):
+            _pd = 2  # 非整数/越界会让 tk.IntVar 在构造时抛 TclError、整个 GUI 起不来
+        self.perday_var = tk.IntVar(value=_pd)
         ttk.Spinbox(
             r1, from_=1, to=20, textvariable=self.perday_var,
             width=4).pack(side="left", padx=4)
@@ -594,7 +612,9 @@ class FanqieGUI:
             return
         try:
             self.root.after(ms, func, *args)
-        except tk.TclError:
+        except (tk.TclError, RuntimeError):
+            # destroy() 后跨线程调度可能抛 RuntimeError("main thread is not in
+            # main loop") 而非 TclError——_closing 只是快速路径，真正兜底靠这里
             pass
 
     def _refresh_auth_status(self):
@@ -984,10 +1004,19 @@ class FanqieGUI:
     def _atomic_write_json(path, data):
         """原子写 JSON：先写临时文件再 replace，避免进程中途被杀留下半截文件。"""
         tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        tmp.replace(path)  # 同目录 rename，Windows 上原子
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            tmp.replace(path)  # 同目录 rename，Windows 上原子
+        except Exception:
+            # 写一半失败（磁盘满/只读）时清掉残留 tmp，别留垃圾；原文件因
+            # 尚未 replace 仍完好。异常继续上抛由调用方告警。
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
     def _save_config(self):
         """将当前 GUI 设置写入 config.json。"""
@@ -1012,7 +1041,10 @@ class FanqieGUI:
         if GUI_STATE_FILE.exists():
             try:
                 with open(GUI_STATE_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                # 合法 JSON 但非对象（如 []）会让后续 .get() 抛 AttributeError
+                if isinstance(data, dict):
+                    return data
             except (json.JSONDecodeError, ValueError):
                 pass
         return {}
@@ -1212,12 +1244,15 @@ class FanqieGUI:
 
     def _show_volumes(self, volumes):
         """填充卷选项，在 edit/reschedule 模式下显示（紧跟 lbl_last_publish 之后）。"""
-        texts = [v["text"] for v in volumes]
+        # DOM 漂移时卷条目可能缺 text，用 .get 容错而非 KeyError
+        texts = [v.get("text", "") if isinstance(v, dict) else str(v)
+                 for v in volumes]
         self.cmb_volume["values"] = texts
         # 恢复优先级: 当前选择 > 平台活跃卷 > 首卷
         current = self.volume_var.get()
         if not (current and current in texts):
-            active = [v["text"] for v in volumes if v.get("isActive")]
+            active = [v.get("text", "") for v in volumes
+                      if isinstance(v, dict) and v.get("isActive")]
             if active:
                 self.cmb_volume.set(active[0])
             elif texts:
@@ -1365,11 +1400,11 @@ class FanqieGUI:
                 if self._fetch_gen != gen:
                     return
                 self._after(0, self._on_platform_chapters_fetched,
-                            book_id, chapters, None, last_pub)
+                            book_id, chapters, None, last_pub, gen)
             except Exception as e:
                 if self._fetch_gen == gen:
                     self._after(0, self._on_platform_chapters_fetched,
-                                book_id, [], str(e), None)
+                                book_id, [], str(e), None, gen)
             finally:
                 if page:
                     try:
@@ -1380,7 +1415,12 @@ class FanqieGUI:
         self.worker.submit(task())
 
     def _on_platform_chapters_fetched(self, book_id, chapters, error,
-                                      last_pub=None):
+                                      last_pub=None, gen=None):
+        # gen 过期 = 期间切了作品或卷（_fetch_gen 已自增）。必须在这里(应用时)
+        # 再判一次：仅判 book_id 不够——切卷时 book_id 不变，但缓存键
+        # _chapter_cache_key 读实时 volume_var，会把旧卷章节写到新卷键下
+        if gen is not None and gen != self._fetch_gen:
+            return
         # 检查当前选中的作品是否仍匹配
         idx = self.cmb_book.current()
         current_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
@@ -1803,8 +1843,8 @@ class FanqieGUI:
             for i, f in enumerate(self._all_files):
                 try:
                     mt = datetime.fromtimestamp(f.stat().st_mtime)
-                except OSError:
-                    continue
+                except (OSError, OverflowError, ValueError):
+                    continue  # 损坏/越界 mtime 会抛 Overflow/ValueError，非仅 OSError
                 mtimes.append(mt)
                 if (op == "早于" and mt < cutoff) or (op != "早于" and mt >= cutoff):
                     kept.append(i)
@@ -2060,8 +2100,8 @@ class FanqieGUI:
                 return items, False
             self.cmb_resched_filter_op.configure(state="disabled")
             kept = [x for x in items
-                    if (n := key(x)) is not None
-                    and any(lo <= int(n) <= hi for lo, hi in intervals)]
+                    if (v := _as_int(key(x))) is not None
+                    and any(lo <= v <= hi for lo, hi in intervals)]
             self.lbl_resched_filter_info.configure(
                 text=f"筛选: {len(kept)}/{total} 章", foreground="gray")
             return kept, True
@@ -2075,9 +2115,11 @@ class FanqieGUI:
             return items, False
         op = self.resched_filter_op_var.get()
         if op == "≤":
-            kept = [x for x in items if (n := key(x)) is not None and int(n) <= threshold]
+            kept = [x for x in items
+                    if (v := _as_int(key(x))) is not None and v <= threshold]
         else:
-            kept = [x for x in items if (n := key(x)) is not None and int(n) >= threshold]
+            kept = [x for x in items
+                    if (v := _as_int(key(x))) is not None and v >= threshold]
         self.lbl_resched_filter_info.configure(
             text=f"筛选: {len(kept)}/{total} 章", foreground="gray")
         return kept, True
@@ -2637,7 +2679,7 @@ class FanqieGUI:
 
         self._set_uploading(True)
         self.progress["value"] = 0
-        self.progress["maximum"] = count
+        self.progress["maximum"] = max(count, 1)
 
         self._install_log_handler()
 
@@ -2890,7 +2932,7 @@ class FanqieGUI:
         # 开始
         self._set_uploading(True)
         self.progress["value"] = 0
-        self.progress["maximum"] = count
+        self.progress["maximum"] = max(count, 1)
 
         self._install_log_handler()
 
@@ -2968,12 +3010,19 @@ class FanqieGUI:
             self.root.after_cancel(self._config_save_after)
             self._save_config()
         self._remove_log_handler()
-        # 关闭共享浏览器
+        # 关闭共享浏览器。超时给到 8s 覆盖正常的 pw.stop；若仍超时，主动
+        # cancel 协程再 stop 事件循环，避免把 close 丢在半途（孤儿子进程/线程）
+        future = None
         try:
             future = self.worker.submit(self._shared.close())
-            future.result(timeout=5)
+            future.result(timeout=8)
         except Exception as e:
             logger.debug(f"关闭共享浏览器: {e}")
+            if future is not None:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
         self.worker.stop()
         self.root.destroy()
 

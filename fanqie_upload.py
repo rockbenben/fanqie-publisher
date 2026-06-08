@@ -284,6 +284,7 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
     # 接口探针：窗口期内记录提交类接口的 (status, url)，只在失败时输出。
     # 纯观测不判定——为将来切换到"按接口响应码判定"积累真实格式数据。
     api_probe: list[str] = []
+    grab_tasks: list = []  # 跟踪 body 异步补抓任务，收尾统一取消，避免孤儿任务告警
 
     def _on_response(resp):
         try:
@@ -303,7 +304,7 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
                         except Exception:
                             pass
                     try:
-                        asyncio.create_task(_grab())
+                        grab_tasks.append(asyncio.create_task(_grab()))
                     except Exception:
                         pass
         except Exception:
@@ -354,6 +355,10 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
             page.remove_listener("response", _on_response)
         except Exception:
             pass
+        # 取消未完成的 body 补抓任务，避免函数返回后任务被 GC "destroyed but pending"
+        for _t in grab_tasks:
+            if not _t.done():
+                _t.cancel()
     # ---- 超时失败：尽量多带现场信息（只在失败路径付出这些开销） ----
     if seen_toasts:
         extra = (f"；期间页面提示: {'; '.join(seen_toasts)}"
@@ -808,10 +813,13 @@ async def _get_word_count(page) -> int:
         el = page.locator("text=正文字数")
         if await el.count() > 0:
             txt = await el.text_content()
-            # 去掉千分位逗号，避免 "1,234" 被截成 1。
-            m = re.search(r"(\d[\d,]*)", txt)
-            if m:
-                return int(m.group(1).replace(",", ""))
+            # text_content() 可能返回 None（节点暂无文本/正在重渲染）——直接喂给
+            # re.search 会抛 TypeError 被下面 except 吞掉、错当成"字数=0 粘贴失败"。
+            if txt:
+                # 去掉千分位逗号，避免 "1,234" 被截成 1。
+                m = re.search(r"(\d[\d,]*)", txt)
+                if m:
+                    return int(m.group(1).replace(",", ""))
     except Exception:
         pass
     return 0
@@ -1576,6 +1584,10 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
         return 'not_found';
     }""")
     logger.info(f"    定时发布开关: {switched}")
+    if switched == "not_found":
+        # 开关没找到，日期框必然不出现——直接快速失败，不空等整个 timeout，
+        # 也给出真因而非误导性的"等待日期输入框超时"
+        raise RuntimeError("未找到定时发布开关，页面结构可能已变更")
     # 等待日期输入框出现
     try:
         await page.wait_for_selector("input[placeholder='请选择日期']", timeout=_browser_timeout)
@@ -1791,11 +1803,16 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         await page.goto(new_chapter_url)
         try:
             await wait_for_editor_ready(page)
-        except PWTimeout:
-            logger.error("无法进入编辑器，请检查:")
+        except Exception as e:
+            # 不止 PWTimeout：dismiss_overlays/evaluate 等可能抛非超时错误，
+            # 漏接会让异常逃出 async with、浏览器未 close 即 pw.stop → 收尾挂死
+            logger.error(f"无法进入编辑器（{e}），请检查:")
             logger.info("  1. Book ID 是否正确")
             logger.info("  2. 登录状态是否有效 (重新运行 login)")
-            await page.screenshot(path=str(SCRIPT_DIR / "error_navigate.png"))
+            try:
+                await page.screenshot(path=str(SCRIPT_DIR / "error_navigate.png"))
+            except Exception:
+                pass
             await close_browser_safely(browser)
             return
 
@@ -1883,7 +1900,12 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                     break
 
             if i < len(files) - 1 and delay > 0:
-                await page.wait_for_timeout(delay * 1000)
+                try:
+                    await page.wait_for_timeout(delay * 1000)
+                except Exception:
+                    # 章节间等待时页面已死：停止循环，但仍走到下面的
+                    # save_auth/close，避免收尾被跳过导致 pw.stop 挂死
+                    break
 
         await save_auth(context)
         await close_browser_safely(browser)
@@ -1999,7 +2021,11 @@ async def reschedule_on_manage_page(
             if cancel_check and cancel_check():
                 break
             logger.info(f"切换到分卷 ({vi+1}/{len(volume_texts)}): {vt}")
-            await select_volume(page, vt)
+            if not await select_volume(page, vt):
+                # 切换失败若不拦截，下一步会扫到当前(错误的)卷，把这一卷
+                # 的章节当"未处理"统计且诊断误导——跳过本卷，留待"未处理"汇报
+                logger.error(f"  切换到分卷失败，跳过本卷: {vt}")
+                continue
             s, f = await _reschedule_current_volume(
                 page, remaining, total,
                 max_retries=max_retries, delay=delay,
@@ -2224,16 +2250,26 @@ async def _reschedule_current_volume(
             "li.arco-pagination-item-next:not(.arco-pagination-item-disabled)")
         if await next_btn.count() == 0:
             break
+        if page_num >= 500:
+            # 硬上限：防止异常情况下（按钮永不 disabled 等）无限翻页
+            logger.warning("翻页超过 500 页，停止扫描本卷")
+            break
         first_title = await page.evaluate(
             "() => document.querySelector('tr td')?.textContent?.trim() || ''")
         await next_btn.click()
         # 等待表格内容变化
+        changed = False
         for _ in range(30):
             await page.wait_for_timeout(300)
             cur = await page.evaluate(
                 "() => document.querySelector('tr td')?.textContent?.trim() || ''")
             if cur and cur != first_title:
+                changed = True
                 break
+        if not changed:
+            # 9 秒内首格未变：翻页卡住（或跨页首格同名），再扫只会原地打转
+            logger.warning("翻页未检测到内容变化，停止扫描本卷")
+            break
 
     return success, failed
 
@@ -2396,14 +2432,24 @@ async def cmd_edit(directory: Path, book_id: str, args):
                     break
 
             if i < total - 1 and delay > 0:
-                await page.wait_for_timeout(delay * 1000)
+                try:
+                    await page.wait_for_timeout(delay * 1000)
+                except Exception:
+                    break  # 页面已死：停止循环，仍走到 save_auth/close 收尾
 
         # 批末二次尝试: 主循环跑完后，占用旧标题的章节多已更新、标题已释放
         if dup_pending:
             logger.info("")
             logger.info(f"二次尝试 {len(dup_pending)} 个标题重复的章节"
                         f"（标题搬移的临时冲突，此时多已解除）...")
+            dead = False
             for ch_num, title, content, edit_url in dup_pending:
+                if dead:
+                    # 页面已死，剩余条目逐个 goto 只会重复快速失败+刷屏，
+                    # 直接如实记失败，不再尝试
+                    failed += 1
+                    fail_list.append((f"第{ch_num}章 {title}", "页面已失效，未二次尝试"))
+                    continue
                 logger.info(f"[二次] 修改第{ch_num}章 {title}")
                 try:
                     ok, err = await edit_one_chapter(
@@ -2423,6 +2469,8 @@ async def cmd_edit(directory: Path, book_id: str, args):
                     logger.error(f"  二次尝试异常: {e}")
                     fail_list.append((f"第{ch_num}章 {title}", f"二次尝试异常: {e}"))
                     failed += 1
+                    if page.is_closed():
+                        dead = True
                 if delay > 0:
                     try:
                         await page.wait_for_timeout(delay * 1000)
