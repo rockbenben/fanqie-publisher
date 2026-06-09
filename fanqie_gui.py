@@ -24,7 +24,7 @@ from pathlib import Path
 try:
     from fanqie_upload import (
         load_config,
-        parse_md_file, get_md_files, strip_md_formatting,
+        parse_md_file, parse_md_files, get_md_files, strip_md_formatting,
         deduplicate_titles, compute_schedule, _validate_times,
         DailyLimitReached, _check_daily_limit, _wait_publish_result,
         _log_fail_list,
@@ -1827,7 +1827,14 @@ class FanqieGUI:
             self._set_preview("目录及子文件夹中没有 .md/.txt 文件")
             return
 
-        self._all_parsed = [parse_md_file(f) for f in self._all_files]
+        # 跳过扫描后变得无法读取的文件（云端离线占位/被删/无权限），并保持
+        # _all_files 与 _all_parsed 一一对齐——否则解析在列表推导处抛 OSError，
+        # 刷新整段中断且二者失配，后续按日期筛选会 IndexError。
+        self._all_files, self._all_parsed = parse_md_files(self._all_files)
+        if not self._all_files:
+            self.files, self.parsed_chapters, self._word_counts = [], [], []
+            self._set_preview("目录中的文件均无法读取（可能是云端离线文件或权限不足）")
+            return
         self._apply_date_filter()
 
     def _apply_date_filter(self):

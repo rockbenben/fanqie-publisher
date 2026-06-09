@@ -579,6 +579,26 @@ def parse_md_file(fp: Path) -> tuple:
     return chapter_num, title, content
 
 
+def parse_md_files(files: list) -> tuple:
+    """解析多个 MD 文件，跳过无法读取的，返回对齐的 (files, parsed)。
+
+    parse_md_file 只兜底编码错误；磁盘读取 OSError（文件在扫描后被删、
+    云端按需文件离线、权限不足）若不处理，会让整次刷新/上传在列表推导处
+    整段崩掉——GUI 在 pythonw 下无可见报错（刷新像没反应），且崩溃点之后
+    _all_parsed 与 _all_files 失配，后续按日期筛选会在索引处 IndexError。
+    逐个解析、跳过坏文件，并保持两个返回列表一一对齐。
+    """
+    kept_files: list[Path] = []
+    parsed: list[tuple] = []
+    for f in files:
+        try:
+            parsed.append(parse_md_file(f))
+            kept_files.append(f)
+        except OSError as e:
+            logger.warning(f"跳过无法读取的文件 {f.name}: {e}")
+    return kept_files, parsed
+
+
 def get_md_files(directory: Path) -> list:
     exts = (".md", ".txt")
     files: list[Path] = []
@@ -1752,8 +1772,11 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         logger.warning(f"在 {directory} 及其子文件夹中没有找到 .md/.txt 文件")
         return
 
-    # 解析所有文件
-    parsed = [parse_md_file(f) for f in files]
+    # 解析所有文件（跳过扫描后变得无法读取的文件，保持 files/parsed 对齐）
+    files, parsed = parse_md_files(files)
+    if not files:
+        logger.warning("目录中的文件均无法读取（可能是云端离线文件或权限不足）")
+        return
 
     # 检测重复标题
     title_counts = Counter(title for _, title, _ in parsed)
@@ -2325,7 +2348,10 @@ async def cmd_edit(directory: Path, book_id: str, args):
         logger.warning(f"在 {directory} 及其子文件夹中没有找到 .md/.txt 文件")
         return
 
-    parsed = [parse_md_file(f) for f in files]
+    files, parsed = parse_md_files(files)
+    if not files:
+        logger.warning("目录中的文件均无法读取（可能是云端离线文件或权限不足）")
+        return
     if unique_titles:
         parsed = deduplicate_titles(parsed)
 
