@@ -64,6 +64,11 @@ DEFAULT_CONFIG = {
     "default_per_day": 2,          # GUI 默认每天章数
     "default_time": "08:00",       # GUI 默认发布时间（支持逗号分隔多时间）
     "browser_timeout": 15000,      # 浏览器操作超时 (ms)
+    "auto_unique": True,           # GUI 自动处理重名 开关
+    "use_ai": False,               # GUI 稿件使用了AI创作 开关
+    "resched_filter_on": False,    # GUI 按章节号筛选 开关
+    "resched_filter_op": "≥",      # GUI 章节号筛选运算符 (≤/≥)
+    "resched_filter_num": "1",     # GUI 章节号筛选阈值/区间表达式
 }
 
 # 平台修饰键 (macOS = Meta/Cmd, 其他 = Control)

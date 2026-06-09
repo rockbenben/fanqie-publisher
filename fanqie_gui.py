@@ -346,10 +346,11 @@ class FanqieGUI:
             side="left", pady=4)
         ttk.Button(row1, text="刷新", command=self._reload_chapters).pack(
             side="left", padx=(4, 6), pady=4)
-        self.unique_var = tk.BooleanVar(value=True)
+        self.unique_var = tk.BooleanVar(value=bool(self._cfg.get("auto_unique", True)))
         ttk.Checkbutton(
             row1, text="自动处理重名", variable=self.unique_var,
             command=self._apply_date_filter).pack(side="left", padx=6)
+        self.unique_var.trace_add("write", lambda *_: self._schedule_config_save())
         self.filter_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             row1, text="按修改日期筛选",
@@ -405,10 +406,11 @@ class FanqieGUI:
         # 发布选项（所有非草稿模式可见）
         row_opts = ttk.Frame(frm_mode)
         row_opts.pack(fill="x", padx=6, pady=(0, 4))
-        self.use_ai_var = tk.BooleanVar(value=False)
+        self.use_ai_var = tk.BooleanVar(value=bool(self._cfg.get("use_ai", False)))
         self.chk_use_ai = ttk.Checkbutton(
             row_opts, text="稿件使用了AI创作", variable=self.use_ai_var)
         self.chk_use_ai.pack(side="left", padx=6)
+        self.use_ai_var.trace_add("write", lambda *_: self._schedule_config_save())
 
         # 上次发布信息（所有模式可见）
         self.lbl_last_publish = ttk.Label(
@@ -478,13 +480,18 @@ class FanqieGUI:
         self._sync_perday_from_times()
 
         # 章节序号筛选
-        self.resched_filter_var = tk.BooleanVar(value=False)
+        self.resched_filter_var = tk.BooleanVar(
+            value=bool(self._cfg.get("resched_filter_on", False)))
         self._resched_filter_row = ttk.Frame(frm_mode)
         ttk.Checkbutton(
             self._resched_filter_row, text="按章节号筛选",
             variable=self.resched_filter_var,
             command=self._refresh_preview).pack(side="left", padx=(12, 4))
-        self.resched_filter_op_var = tk.StringVar(value="≥")
+        # 损坏/手改的 config 可能给出非法运算符，readonly 下拉会显示空白，回退默认
+        _saved_op = self._cfg.get("resched_filter_op", "≥")
+        if _saved_op not in ("≤", "≥"):
+            _saved_op = "≥"
+        self.resched_filter_op_var = tk.StringVar(value=_saved_op)
         self.cmb_resched_filter_op = ttk.Combobox(
             self._resched_filter_row, textvariable=self.resched_filter_op_var,
             values=["≤", "≥"], width=3, state="readonly")
@@ -492,12 +499,17 @@ class FanqieGUI:
         self.cmb_resched_filter_op.bind("<<ComboboxSelected>>",
                                         lambda _: self._refresh_preview())
         ttk.Label(self._resched_filter_row, text="第").pack(side="left", padx=(4, 0))
-        self.resched_filter_num_var = tk.StringVar(value="1")
+        self.resched_filter_num_var = tk.StringVar(
+            value=str(self._cfg.get("resched_filter_num", "1")))
         self.ent_resched_filter_num = ttk.Entry(
             self._resched_filter_row, textvariable=self.resched_filter_num_var, width=8)
         self.ent_resched_filter_num.pack(side="left", padx=2)
         ttk.Label(self._resched_filter_row, text="章").pack(side="left")
         self.resched_filter_num_var.trace_add("write", lambda *_: self._refresh_preview())
+        # 持久化筛选设置（防抖写盘）
+        for _v in (self.resched_filter_var, self.resched_filter_op_var,
+                   self.resched_filter_num_var):
+            _v.trace_add("write", lambda *_: self._schedule_config_save())
         self.ent_resched_filter_num.bind("<Return>", lambda _: self.txt_preview.focus_set())
         self.lbl_resched_filter_info = ttk.Label(
             self._resched_filter_row, text="", foreground="gray")
@@ -1043,6 +1055,14 @@ class FanqieGUI:
             self._cfg["default_per_day"] = self.perday_var.get()
         except tk.TclError:
             pass
+        if hasattr(self, "unique_var"):
+            self._cfg["auto_unique"] = self.unique_var.get()
+        if hasattr(self, "use_ai_var"):
+            self._cfg["use_ai"] = self.use_ai_var.get()
+        if hasattr(self, "resched_filter_var"):
+            self._cfg["resched_filter_on"] = self.resched_filter_var.get()
+            self._cfg["resched_filter_op"] = self.resched_filter_op_var.get()
+            self._cfg["resched_filter_num"] = self.resched_filter_num_var.get().strip()
         try:
             self._atomic_write_json(CONFIG_FILE, self._cfg)
         except Exception as e:
