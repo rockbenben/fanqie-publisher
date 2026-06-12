@@ -2,6 +2,8 @@
 .auth_*.json
 .gui_state.json
 .env
+# 原子写中断残留（.auth_state.json.tmp 含完整登录 cookie，不匹配上面的 .json 规则）
+*.tmp
 
 # Python
 __pycache__/

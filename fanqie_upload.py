@@ -14,7 +14,7 @@
 
 MD 文件格式:
     文件名: 001_章节标题.md  或  第1章_标题.md  或  任意名称.md
-    内容: 纯文本或 Markdown，第一个 # 标题可作为章节标题
+    内容: 纯文本或 Markdown，首行的 # 标题可作为章节标题
     排序: 按文件名自然排序决定上传顺序
 """
 
@@ -535,7 +535,7 @@ def parse_md_file(fp: Path) -> tuple:
     解析 MD 文件，返回 (chapter_num, title, content)。
 
     章节号提取优先级: 文件名 > 标题中 "第X章"
-    标题提取优先级:  第一个 # 标题(去前缀) > 文件名(去前缀)
+    标题提取优先级:  首行 # 标题(去前缀) > 文件名(去前缀)
 
     支持的文件名:
         001_标题.md / 第27章.md / chapter-027.md / 第 3 章 出发.md
@@ -554,13 +554,14 @@ def parse_md_file(fp: Path) -> tuple:
     heading = None      # 原始 # 标题
     content_start = 0
 
-    # 从第一个 # heading 提取标题
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("# "):
-            heading = stripped[2:].strip()
-            content_start = i + 1
-            break
+    # 标题只认首行的 "# "（text 读入时已 strip，首行即首个非空行）。
+    # 不能扫全文找第一个 "# "：正文中部的 "# 场景X" 会被当成标题，
+    # 且它之前的全部正文被静默丢弃——发布出去的章节缺前半截。
+    if lines:
+        first = lines[0].strip()
+        if first.startswith("# "):
+            heading = first[2:].strip()
+            content_start = 1
 
     content = "\n".join(lines[content_start:]).strip()
 
@@ -650,8 +651,10 @@ def strip_md_formatting(text: str) -> str:
     text = re.sub(r"`([^`]*)`", r"\1", text)
     # 移除 HTML 注释
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-    # 移除 HTML 标签
-    text = re.sub(r"<[^>]+>", "", text)
+    # 移除 HTML 标签——只认真实标签形状（字母/斜杠开头、不跨行）。
+    # 宽松的 <[^>]+> 会把正文里成对颜文字 (>_<)…(>_<) 或散落的 < … >
+    # 之间的内容当成"标签"整段删除（[^>] 还能匹配换行，可跨段误删几千字）
+    text = re.sub(r"</?[a-zA-Z][^>\n]*>", "", text)
     # 移除任务列表标记 (- [ ] / - [x]，须在普通列表标记之前处理)
     text = re.sub(r"^\s*[-*+]\s+\[[ xX]\]\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*\d+[.)]\s+\[[ xX]\]\s*", "", text, flags=re.MULTILINE)
@@ -733,19 +736,63 @@ async def create_context(p, headless=False):
     return browser, context
 
 
-async def save_auth(context):
+async def goto_with_login_retry(page, url, *, wait_until="load"):
+    """打开作家后台页面，并区分"会话真失效"与"误跳登录页"。
+
+    实测(2026-06-10): 机器高负载时（如另一个自动化程序占满 CPU/网络），
+    作家后台 SPA 的鉴权请求（/api/user/info 等）超时，前端会把仍然有效的
+    会话误判为未登录并跳转 /login。重试一次即可区分：瞬态失败第二次就能
+    进入目标页，真失效则两次都被重定向。
+
+    返回 True=已进入目标页；False=两次均被重定向到登录页（会话失效）。
+    goto 超时不视为失败——页面可能已部分加载，以最终 URL 为准。
+
+    注意: SPA 的鉴权跳转是异步的——domcontentloaded 时 URL 往往还停在
+    目标页，立刻检查会漏掉随后才发生的 /login 跳转（实测如此）。所以
+    每次导航后留一个观察窗，等跳转发生或确认没有跳转再下结论。
+    """
+    for attempt in (1, 2):
+        try:
+            await page.goto(url, wait_until=wait_until)
+        except PWTimeout:
+            pass
+        if "/login" not in page.url:
+            try:
+                await page.wait_for_url("**/login**", timeout=4000)
+            except PWTimeout:
+                pass  # 观察窗内没跳登录页 = 真的进来了
+        if "/login" not in page.url:
+            return True
+        if attempt == 1:
+            await page.wait_for_timeout(3000)
+    return False
+
+
+async def save_auth(context) -> bool:
     """保存当前登录状态（原子写：tmp+rename，防进程中断留下半截 JSON）。
 
     保存失败不应影响本次任务结果，只告警。storage_state 走 CDP，
     浏览器挂死时会无限悬停，故加超时（超时走同一条告警路径）。
+
+    返回是否保存成功——登录流程必须检查：失败时 AUTH_FILE 还是旧账号的
+    会话，若照常复制成命名账号文件，会把旧账号 cookie 静默挂到新账号名下。
+    其余调用方（任务收尾的顺手保存）可忽略返回值。
     """
+    tmp = AUTH_FILE.with_suffix(AUTH_FILE.suffix + ".tmp")
     try:
         state = await asyncio.wait_for(context.storage_state(), timeout=30)
-        tmp = AUTH_FILE.with_suffix(AUTH_FILE.suffix + ".tmp")
         tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         tmp.replace(AUTH_FILE)
+        return True
     except Exception as e:
         logger.warning(f"保存登录状态失败(不影响本次结果): {e}")
+        # 清掉残留 tmp（与 GUI _atomic_write_json 对称）：它含完整登录
+        # cookie，留在目录里有被 git add . 连带提交的泄露风险
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
 
 
 async def close_browser_safely(browser, timeout_s: float = 30):
@@ -1108,11 +1155,16 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
                 }
             }
 
-            // 章节号
+            // 章节号。裸数字兜底带前视守卫，与本地侧 _extract_chapter_num
+            // 对称——否则 "2024新春番外" 这类数字开头的特殊章节会被误编号，
+            // 在按章节号筛选/匹配时被错误纳入（排期错位、内容写错章）
             let chapterNum = null;
             let m = title.match(/^第\s*(\d+)\s*[章回节话]/);
             if (m) chapterNum = parseInt(m[1], 10);
-            else { m = title.match(/^(\d+)/); if (m) chapterNum = parseInt(m[1], 10); }
+            else {
+                m = title.match(/^(\d+)(?=$|[\s:：_\-.、章回节话])/);
+                if (m) chapterNum = parseInt(m[1], 10);
+            }
 
             const key = chapterNum + '|' + title;
             if (seenKeys.has(key)) continue;
@@ -1316,27 +1368,45 @@ def match_chapters(
 
     matched = []
     unmatched = []
+    used_nums: set[int] = set()
+    dup_local: list[int] = []
     for i, (num, title, content) in enumerate(local_parsed):
         int_num = int(num) if num else None
         if int_num is not None and int_num in platform_map:
+            if int_num in used_nums:
+                # 本地重复章节号（多卷子文件夹各自从 1 编号 / 残留旧副本）：
+                # 若都执行，会对同一平台章节先后写入两份内容、后写的静默
+                # 覆盖前者——与平台侧重复处理对称，仅取首个，其余跳过
+                dup_local.append(int_num)
+                unmatched.append((i, num, title))
+                continue
+            used_nums.add(int_num)
             matched.append((i, platform_map[int_num], int_num, title, content))
         else:
             unmatched.append((i, num, title))
+    if dup_local:
+        logger.warning(
+            f"本地存在重复章节号 {sorted(set(dup_local))}（多为分卷子文件夹"
+            f"各自编号或残留旧副本）；按章节号匹配时仅取首个文件，其余跳过，"
+            f"以免同一平台章节被后写的文件覆盖。")
     return matched, unmatched
 
 
 async def click_next_step(page):
     """点击下一步按钮（进入发布流程）。"""
     # 精确定位发布按钮（class 含 publish-button），避开 React Tour 引导中的同名按钮
+    # 点击限时 5s：唯一调用方是 _navigate_to_publish_settings 的轮询状态机，按钮被
+    # 未知弹窗遮罩挡住时应快速失败回到轮询识别弹窗，而不是烧满 Playwright 默认 30s
+    # （正常点击 <1s，5s 余量充足；超时后状态机下一轮会重试点击）。
     next_btn = page.locator("button.auto-editor-next")
     if await next_btn.count() > 0:
-        await next_btn.click()
+        await next_btn.click(timeout=5000)
     else:
         # 兜底：排除 React Tour 中的按钮
         next_btn = page.locator("button", has_text="下一步").locator(
             "visible=true"
         ).first
-        await next_btn.click()
+        await next_btn.click(timeout=5000)
     await page.wait_for_timeout(2000)
 
 
@@ -1521,6 +1591,20 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_act
                 await page.wait_for_timeout(500)
                 continue
 
+        # 2.5) 信息提示弹窗（如"请在发布时间前30分钟提交修改内容，否则无法完成修改"）
+        #      -> 点"我知道了"关闭。此类弹窗可能晚于编辑器就绪才出现，入口处的
+        #      dismiss_edit_hint 会漏掉；不点掉则遮罩挡住"下一步"，每轮点击烧满
+        #      可操作性超时（曾导致每章空转 448s 后才进入整章重试）。
+        try:
+            ack_btn = page.locator("button", has_text="我知道了")
+            if await ack_btn.count() > 0 and await ack_btn.first.is_visible():
+                await ack_btn.first.click()
+                logger.info("    已关闭提示弹窗(我知道了)")
+                await page.wait_for_timeout(500)
+                continue
+        except Exception:
+            pass
+
         # 3) 智能纠错面板 -> "忽略全部"
         try:
             ignore_btn = page.locator("button", has_text="忽略全部")
@@ -1696,7 +1780,12 @@ async def cmd_login():
         browser, context = await create_context(p, headless=False)
         page = await context.new_page()
         await page.goto(ZONE_URL)
-        await page.wait_for_load_state("networkidle")
+        try:
+            await page.wait_for_load_state("networkidle")
+        except PWTimeout:
+            # 平台埋点/轮询会拖死 networkidle（GUI 登录路径同因已改用
+            # domcontentloaded）；登录页只需渲染出来供用户手动登录
+            pass
 
         logger.info("")
         logger.info("=" * 50)
@@ -1705,9 +1794,13 @@ async def cmd_login():
         logger.info("=" * 50)
         await asyncio.get_running_loop().run_in_executor(None, input)
 
-        await save_auth(context)
+        saved = await save_auth(context)
         await close_browser_safely(browser)
-        logger.info("登录状态已保存。")
+        if saved:
+            logger.info("登录状态已保存。")
+        else:
+            logger.error(
+                "登录状态未能保存（浏览器可能已被提前关闭），请重新运行 login")
 
 
 # ---------------------------------------------------------------------------
@@ -1722,17 +1815,26 @@ async def cmd_books():
         browser, context = await create_context(p, headless=True)
         page = await context.new_page()
 
-        await page.goto(BOOK_MANAGE_URL)
-        await page.wait_for_load_state("networkidle")
+        if not await goto_with_login_retry(page, BOOK_MANAGE_URL):
+            logger.error("登录状态已失效，请重新运行 login")
+            await close_browser_safely(browser)
+            return
+        try:
+            await page.wait_for_load_state("networkidle")
+        except PWTimeout:
+            pass
+        list_timed_out = False
         try:
             await page.wait_for_selector('a[href*="chapter-manage/"]', timeout=5000)
         except PWTimeout:
-            pass
+            list_timed_out = True
 
         books = await page.evaluate(BOOKS_JS)
 
         logger.info("")
-        if not books:
+        if not books and list_timed_out:
+            logger.error("作品列表加载超时（多为系统繁忙或网络缓慢），登录状态未必有问题，请稍后重试")
+        elif not books:
             logger.error("未找到作品，请检查登录状态 (重新运行 login)")
         else:
             logger.info(f"找到 {len(books)} 部作品:")
@@ -2059,7 +2161,10 @@ async def reschedule_on_manage_page(
 
     chapter_manage_url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
     await page.goto(chapter_manage_url)
-    await page.wait_for_load_state("networkidle")
+    try:
+        await page.wait_for_load_state("networkidle")
+    except PWTimeout:
+        pass  # 平台埋点/轮询会拖死 networkidle；真正的就绪由下面的表格等待保证
 
     # 等待表格出现
     try:
@@ -2291,7 +2396,13 @@ async def _reschedule_current_volume(
                 progress_cb(success_so_far + failed_so_far + success + failed, total)
 
             if delay > 0 and remaining:
-                await page.wait_for_timeout(int(delay * 1000))
+                try:
+                    await page.wait_for_timeout(int(delay * 1000))
+                except Exception:
+                    # 等待时页面已死（如用户关掉浏览器窗口）：立即结束本卷扫描，
+                    # 保住已有计数；remaining 由调用方如实计入"未处理"
+                    logger.warning("页面已失效，停止扫描，剩余章节计入未处理")
+                    return success, failed
 
         # cancel_check 在内部 break 后也需要退出外层
         if cancel_check and cancel_check():
@@ -2369,7 +2480,12 @@ async def cmd_edit(directory: Path, book_id: str, args):
         page = await context.new_page()
 
         await page.goto(chapter_manage_url)
-        await page.wait_for_load_state("networkidle")
+        try:
+            await page.wait_for_load_state("networkidle")
+        except PWTimeout:
+            # 平台埋点/轮询会拖死 networkidle（cmd_books 同因已包）；
+            # 提取 JS 自带表格等待，不必因此整批崩掉
+            pass
 
         platform_chapters, _ = await extract_chapters_from_page(page, book_id)
 

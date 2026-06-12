@@ -28,7 +28,7 @@ try:
         deduplicate_titles, compute_schedule, _validate_times,
         DailyLimitReached, _check_daily_limit, _wait_publish_result,
         _log_fail_list,
-        create_context, save_auth, close_browser_safely,
+        create_context, save_auth, close_browser_safely, goto_with_login_retry,
         wait_for_editor_ready, fill_chapter,
         save_draft, publish_scheduled, _navigate_to_publish_settings,
         extract_chapters_from_page, match_chapters, edit_one_chapter,
@@ -1079,7 +1079,9 @@ class FanqieGUI:
                 # 合法 JSON 但非对象（如 []）会让后续 .get() 抛 AttributeError
                 if isinstance(data, dict):
                     return data
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, OSError):
+                # OSError: 文件被占用/云端按需文件离线时 open 会抛错，不该让
+                # GUI 整个起不来（load_config 对 config.json 同因已处理）
                 pass
         return {}
 
@@ -1185,7 +1187,12 @@ class FanqieGUI:
                         return
                     url = CHAPTER_MANAGE_URL.format(book_id=book_id)
                     await page.goto(url)
-                    await page.wait_for_load_state("networkidle")
+                    try:
+                        await page.wait_for_load_state("networkidle")
+                    except PWTimeout:
+                        # 平台埋点/轮询会拖死 networkidle；超时若任其抛出，
+                        # 会被外层 except 误报成"暂无发布记录"且漏检分卷
+                        pass
                     try:
                         await page.wait_for_selector(
                             "tr td", timeout=get_browser_timeout())
@@ -1319,7 +1326,10 @@ class FanqieGUI:
 
         mode = self.mode_var.get()
         if mode in ("edit", "reschedule"):
-            self.btn_upload.configure(state="disabled")
+            # 任务运行中此按钮是「停止」——不能禁用，否则批次无法取消
+            # （分卷下拉未被 _set_uploading 禁用，运行中仍可切换）
+            if not self.uploading:
+                self.btn_upload.configure(state="disabled")
             self._fetch_platform_chapters_for_edit()
             self._refresh_preview()
 
@@ -1392,8 +1402,20 @@ class FanqieGUI:
                 if self._fetch_gen != gen:
                     return
                 url = CHAPTER_MANAGE_URL.format(book_id=book_id)
-                await page.goto(url)
-                await page.wait_for_load_state("networkidle")
+                if not await goto_with_login_retry(page, url):
+                    raise RuntimeError(
+                        "被重定向到登录页，登录状态可能已失效（请重新登录）")
+                try:
+                    await page.wait_for_load_state("networkidle")
+                except PWTimeout:
+                    # 平台埋点/轮询会拖死 networkidle，不该让修改模式
+                    # 在负载尖峰期整个不可用；表格就绪由下面的等待保证
+                    pass
+                try:
+                    await page.wait_for_selector(
+                        "tr td", timeout=get_browser_timeout())
+                except PWTimeout:
+                    pass
 
                 # 仅首次检测卷
                 if not volumes_known:
@@ -1538,7 +1560,19 @@ class FanqieGUI:
                         self._after(0, self._login_done, "cancelled")
                         return
 
-                    await save_auth(context)
+                    if not await save_auth(context):
+                        # 保存失败（多为用户提前关掉了浏览器窗口）：此时
+                        # AUTH_FILE 还是上一个账号的旧会话，绝不能复制成
+                        # 新账号的命名文件——那会把旧账号 cookie 静默挂到
+                        # 新账号名下，之后的批量操作会发到错误的账号。
+                        # 与取消分支同构：先安全关浏览器、在 with 内汇报，
+                        # 不让异常带着未关闭的浏览器去赌 pw.stop 不挂
+                        await close_browser_safely(browser)
+                        self._after(0, self._login_done,
+                                    "保存登录状态失败（浏览器可能已被提前关闭）。"
+                                    "请重新点「登录/新建」，登录后先点"
+                                    "「✔ 登录完成」再关浏览器。")
+                        return
 
                     # 将活跃 auth 复制为命名文件
                     named = SCRIPT_DIR / f".auth_{name}.json"
@@ -1730,19 +1764,22 @@ class FanqieGUI:
                 page = await ctx.new_page()
                 # domcontentloaded 比 networkidle 可靠: 平台埋点/轮询会拖死 networkidle
                 # 致使 goto 超时被误判为会话失效。
-                try:
-                    await page.goto(BOOK_MANAGE_URL, wait_until="domcontentloaded")
-                except PWTimeout:
-                    pass  # 即便 goto 超时, 后续仍可能拿到作品
-                # 仅在被重定向到登录页时直接判失效
-                if "/login" in page.url:
+                # goto_with_login_retry 会在跳登录页时重试一次：系统繁忙导致
+                # 鉴权 API 超时会被 SPA 误判成未登录，重试即可与真失效区分。
+                if not await goto_with_login_retry(
+                        page, BOOK_MANAGE_URL, wait_until="domcontentloaded"):
                     self._after(0, self._books_fetched, [], "__SESSION_EXPIRED__")
                     return
+                list_timed_out = False
                 try:
                     await page.wait_for_selector('a[href*="chapter-manage/"]', timeout=10000)
                 except PWTimeout:
-                    pass
+                    list_timed_out = True
                 books = await page.evaluate(BOOKS_JS)
+                if not books and list_timed_out:
+                    # 列表迟迟没渲染出来：是加载问题不是登录问题，别误导用户去重新登录
+                    self._after(0, self._books_fetched, [], "__PAGE_TIMEOUT__")
+                    return
                 await save_auth(ctx)
                 self._after(0, self._books_fetched, books, None)
             except Exception as e:
@@ -1763,6 +1800,10 @@ class FanqieGUI:
     def _books_fetched(self, books, error):
         self._books_loading = False
         self.btn_books.configure(state="normal")
+        if error == "__PAGE_TIMEOUT__":
+            self._log("获取失败: 作品列表长时间未加载出来（多为系统繁忙或网络缓慢，"
+                      "例如有其他自动化程序占用资源）。登录状态未必有问题，请稍后重试。")
+            return
         if error == "__SESSION_EXPIRED__":
             self._log("获取失败: 登录状态可能已失效")
             acct = self._gui_state.get("current_account", "")
@@ -2545,8 +2586,11 @@ class FanqieGUI:
                     await page.goto(url)
                     try:
                         await wait_for_editor_ready(page)
-                    except PWTimeout:
-                        logger.error("无法进入编辑器，请检查 Book ID 和登录状态。")
+                    except Exception as e:
+                        # 不止 PWTimeout：页面被关/evaluate 失败等非超时错误若逃出，
+                        # 会在浏览器未 close 时直达 pw.stop（无超时保护），浏览器
+                        # 挂死场景下任务永不结束、GUI 永久停在上传态（CLI 同位点同因已改）
+                        logger.error(f"无法进入编辑器（{e}），请检查 Book ID 和登录状态。")
                         await close_browser_safely(browser)
                         self._after(0, self._upload_done, 0, 0)
                         return
@@ -2643,7 +2687,12 @@ class FanqieGUI:
                         self._after(0, self._update_progress, i + 1, total)
 
                         if i < total - 1 and delay > 0:
-                            await page.wait_for_timeout(delay * 1000)
+                            try:
+                                await page.wait_for_timeout(delay * 1000)
+                            except Exception:
+                                # 章节间等待时页面已死（如用户关掉浏览器窗口）：
+                                # 停止循环，但仍走收尾与汇总，保住失败清单
+                                break
 
                     await save_auth(context)
                     await close_browser_safely(browser)
@@ -2822,7 +2871,12 @@ class FanqieGUI:
                         self._after(0, self._update_progress, i + 1, total)
 
                         if i < total - 1 and delay > 0:
-                            await page.wait_for_timeout(delay * 1000)
+                            try:
+                                await page.wait_for_timeout(delay * 1000)
+                            except Exception:
+                                # 章节间等待时页面已死（如用户关掉浏览器窗口）：
+                                # 停止循环，但仍走收尾与汇总，保住失败清单
+                                break
 
                     # 批末二次尝试: 主循环跑完后，占用旧标题的章节多已更新
                     if dup_pending:
