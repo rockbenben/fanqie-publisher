@@ -124,6 +124,15 @@ _TOAST_ERROR_RE = re.compile(
     r"失败|错误|异常|敏感|违规|驳回|无法|频繁|稍后再试|审核不通过|超出|超过|上限"
     r"|不能|早于|已过期|不支持"   # 定时发布"不能早于当前时间"类拒绝也要秒级失败
     r"|重复")  # "本书中存在重复标题，请修改后再发布" (2026-06-07 实测)
+# 编辑器字段校验失败 toast（点"下一步"/存草稿后平台拦截未填好的字段，均实测）：
+#   「章节序号只支持阿拉伯数字」 -- 章节号没写进去（fill 第一次未生效）
+#   「正文至少输入1000字」       -- 正文没写进去/字数不足
+# 这些文案不含 _TOAST_ERROR_RE 的任何关键词，状态机不专门识别就会空转 14 轮 +
+# 15s 误报"发布设置超时"，真实原因（哪个字段没填好）丢失。
+_EDITOR_VALIDATION_RE = re.compile(
+    r"只支持阿拉伯数字|序号[^，。]{0,6}数字"
+    r"|至少[^，。]{0,4}\d|字数不足|不能为空"
+    r"|请输入(标题|正文|章节|内容)")
 
 
 async def _visible_toast_texts(page) -> dict:
@@ -206,6 +215,18 @@ async def _check_daily_limit(page):
     for t in toasts["messages"] + toasts["notifications"]:
         if _DAILY_LIMIT_RE.search(t):
             raise DailyLimitReached(f"当日发布字数已达上限: {t}")
+
+
+async def _check_editor_validation(page):
+    """检测编辑器字段校验失败 toast（章节号非数字/正文字数不足等），命中即抛错。
+
+    只扫瞬态 message（不扫常驻 notification，避免公告误杀）。带上平台原文，
+    让真实原因可见、并让上层快速重试，而不是空转到"发布设置超时"。
+    """
+    toasts = await _visible_toast_texts(page)
+    for t in toasts["messages"]:
+        if _EDITOR_VALIDATION_RE.search(t):
+            raise RuntimeError(f"章节字段校验未通过，页面提示: {t}")
 
 
 def _compress_chapter_nums(nums) -> str:
@@ -971,23 +992,91 @@ async def fill_chapter(page, chapter_num: str | None, title: str, content: str):
         if wc > 0:
             break
     if wc > 0:
+        # 字数远超粘贴内容 = 编辑器里有未清空的旧内容（清空被弹窗抢焦点等），
+        # 拼接稿（约 2 倍字数）绝不能发布出去；1.5 倍+100 的余量足以容纳
+        # 平台字数口径差异，又必拦截旧+新拼接
+        limit = int(len(plain_content) * 1.5) + 100
+        if wc > limit:
+            raise RuntimeError(
+                f"正文字数异常({wc}，预期约 {len(plain_content)})，"
+                f"疑似旧内容未清空被拼接，请重试")
         logger.info(f"    正文字数 {wc}")
     else:
         raise RuntimeError("正文粘贴失败 (字数=0)，请重试")
 
+    # 章节号回读校验：第一次进编辑器时章节号输入框可能尚未就绪/被 React 回灌，
+    # 写入静默失效 → 章节号留空 → 发布时平台弹"章节序号只支持阿拉伯数字"，
+    # 整章超时重试才偶然成功。这里像正文一样回读验证，没写进去就单独重写该字段
+    # （nativeSetter 是覆盖赋值、不会与正文一样拼接），自愈而非把失败拖到发布阶段。
+    if chapter_num:
+        for _ in range(4):
+            got = await page.evaluate(_READ_CHAPTER_NUM_JS)
+            if got == str(chapter_num):
+                break
+            await page.evaluate(_WRITE_CHAPTER_NUM_JS, str(chapter_num))
+            await page.wait_for_timeout(400)
+        else:
+            got = await page.evaluate(_READ_CHAPTER_NUM_JS)
+            if got != str(chapter_num):
+                raise RuntimeError(
+                    f"章节号未能写入(读到 {got!r}，应为 {chapter_num})，请重试")
+
+
+# 章节号输入框：编辑器里第一个可见的、非"标题"的文本输入框（与 fill 写入同口径）。
+_READ_CHAPTER_NUM_JS = r"""() => {
+    for (const inp of document.querySelectorAll('input')) {
+        if (inp.type === 'text'
+            && inp.placeholder !== '请输入标题'
+            && inp.offsetParent !== null) {
+            return inp.value || '';
+        }
+    }
+    return null;  // 没有可见的章节号输入框（尚未就绪）
+}"""
+
+_WRITE_CHAPTER_NUM_JS = r"""(num) => {
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype, 'value').set;
+    for (const inp of document.querySelectorAll('input')) {
+        if (inp.type === 'text'
+            && inp.placeholder !== '请输入标题'
+            && inp.offsetParent !== null) {
+            nativeSetter.call(inp, num);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        }
+    }
+    return false;
+}"""
+
 
 async def save_draft(page):
-    """点击存草稿按钮并等待保存完成。"""
+    """点击存草稿按钮并轮询保存结果。
+
+    不能只等"已保存"——番茄编辑器有常驻的自动保存指示器也含"已保存"字样，
+    `wait_for_selector("text=已保存")` 会立即命中它，把"字段校验被拒、本次其实
+    没存成"误判为成功（实测：存草稿计数虚高，报存了 2 章实际只存 1 章）。
+    故每轮先扫错误/校验 toast（命中即抛真实原因），再看是否出现保存确认。
+    """
     save_btn = page.locator("button", has_text="存草稿")
     if await save_btn.count() == 0:
         raise RuntimeError("未找到存草稿按钮")
     await save_btn.first.click()
-    # 等待 "已保存" 出现
-    try:
-        await page.wait_for_selector("text=已保存", timeout=_browser_timeout)
-    except PWTimeout:
+    deadline = time.monotonic() + _browser_timeout / 1000
+    saved = False
+    while time.monotonic() < deadline:
+        toasts = await _visible_toast_texts(page)
+        for t in toasts["messages"]:
+            if _EDITOR_VALIDATION_RE.search(t) or _TOAST_ERROR_RE.search(t):
+                raise RuntimeError(f"存草稿失败，页面提示: {t}")
+        if await page.locator("text=已保存").count() > 0:
+            saved = True
+            break
+        await page.wait_for_timeout(300)
+    if not saved:
         logger.warning("未检测到保存确认，草稿可能未保存成功")
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(500)
 
 
 async def dismiss_edit_hint(page):
@@ -1004,31 +1093,58 @@ async def dismiss_edit_hint(page):
 
 
 async def clear_editor(page):
-    """清空编辑器中的标题和正文内容（修改模式用）。"""
-    await page.evaluate("""() => {
-        const nativeSetter = Object.getOwnPropertyDescriptor(
-            HTMLInputElement.prototype, 'value'
-        ).set;
+    """清空编辑器中的标题和正文内容（修改模式用）。
 
-        // 清空标题（章节号不动：已发布章节的号是现成的，修改模式不该改它）
-        const titleInput = document.querySelector('input[placeholder="请输入标题"]');
-        if (titleInput) {
-            nativeSetter.call(titleInput, '');
-            titleInput.dispatchEvent(new Event('input', { bubbles: true }));
-            titleInput.dispatchEvent(new Event('change', { bubbles: true }));
-        }
+    清空靠键盘全选+删除，会被晚到的提示弹窗（如「请在发布时间前30分钟…」
+    的"我知道了"）抢走焦点而静默失效——旧正文残留，fill_chapter 的 DOM
+    粘贴不受弹窗影响，结果把"旧+新拼接稿"发布出去（2026-06-12 线上实证；
+    此前该错误被弹窗挡"下一步"的超时重试掩盖，弹窗自动点掉后掩护消失）。
+    故清空后必须校验字数归零：未归零则点掉弹窗重试，仍失败抛错交上层
+    整章重试，绝不静默放行。
+    """
+    for _attempt in range(3):
+        await page.evaluate("""() => {
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype, 'value'
+            ).set;
 
-        // 选中 ProseMirror 编辑器全部内容
-        const editor = document.querySelector('.ProseMirror');
-        if (editor) {
-            editor.focus();
-        }
-    }""")
-    # 全选并删除正文
-    await page.keyboard.press(f"{_MOD_KEY}+a")
-    await page.wait_for_timeout(200)
-    await page.keyboard.press("Delete")
-    await page.wait_for_timeout(500)
+            // 清空标题（章节号不动：已发布章节的号是现成的，修改模式不该改它）
+            const titleInput = document.querySelector('input[placeholder="请输入标题"]');
+            if (titleInput) {
+                nativeSetter.call(titleInput, '');
+                titleInput.dispatchEvent(new Event('input', { bubbles: true }));
+                titleInput.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            // 选中 ProseMirror 编辑器全部内容
+            const editor = document.querySelector('.ProseMirror');
+            if (editor) {
+                editor.focus();
+            }
+        }""")
+        # 全选并删除正文
+        await page.keyboard.press(f"{_MOD_KEY}+a")
+        await page.wait_for_timeout(200)
+        await page.keyboard.press("Delete")
+        await page.wait_for_timeout(500)
+        # 校验清空生效（字数指示器有刷新延迟，短轮询；正常路径首查即 0）
+        wc = await _get_word_count(page)
+        for _ in range(4):
+            if wc == 0:
+                break
+            await page.wait_for_timeout(500)
+            wc = await _get_word_count(page)
+        if wc == 0:
+            return
+        # 未清掉：大概率是弹窗抢了键盘焦点——点掉已知的"我知道了"再试
+        try:
+            ack = page.locator("button", has_text="我知道了")
+            if await ack.count() > 0 and await ack.first.is_visible():
+                await ack.first.click()
+                await page.wait_for_timeout(500)
+        except Exception:
+            pass
+    raise RuntimeError("清空编辑器失败(疑似弹窗抢占焦点)，请重试")
 
 
 # ---------------------------------------------------------------------------
@@ -1553,7 +1669,28 @@ def compute_schedule(
     return fixed
 
 
-async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_action="放弃"):
+# 按【精确文本】点击可见元素：用于选项不是标准 <button> 的弹窗（如内容检测方式
+# 的"仅基础检测"卡片/单选项）。优先交互元素，再退到 span/div；只点最内层叶子，
+# 避免点到把整段文本聚合进来的父容器误触其它选项。
+_CLICK_BY_TEXT_JS = r"""(label) => {
+    const sels = ['button', '[role="button"]', '.arco-radio', 'label',
+                  '.arco-card', 'li', 'span', 'div'];
+    for (const sel of sels) {
+        for (const el of document.querySelectorAll(sel)) {
+            if (el.getClientRects().length === 0) continue;
+            if ((el.textContent || '').trim() !== label) continue;
+            // 叶子优先：若有同样只含该文本的子节点，留给更内层的迭代
+            const inner = el.querySelector(sel);
+            if (inner && (inner.textContent || '').trim() === label) continue;
+            el.click();
+            return true;
+        }
+    }
+    return false;
+}"""
+
+
+async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_action="继续编辑"):
     """
     从编辑器完整走到"发布设置"对话框。
 
@@ -1566,9 +1703,14 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_act
     本函数统一处理两种情况。
 
     draft_action: 点"下一步"后弹出"是否继续编辑"草稿弹窗时，按此按钮处理（状态机分支 2）。
-                  修改流程必须传"继续编辑"——此时草稿是我们刚填的新内容，保留它才能把
-                  新标题/正文发布出去；传"放弃"会丢弃本次编辑、最终发布的还是原章节。
-                  新建/定时发布流程一般不弹此窗，默认值仅作兜底。
+                  本函数的所有调用方（新建/定时/立即发布/修改）都是在 fill_chapter 填好
+                  内容【之后】才调用——此时弹窗里的草稿正是我们刚填的内容，必须"继续编辑"
+                  保留它。"放弃"会把刚填的标题/正文/章节号整个丢弃，表单变空，之后点
+                  "下一步"被平台校验拦住（"标题至少输入5个字/正文至少输入1000字"），空转
+                  14 轮 + 15s 误报"发布设置超时"（2026-07-02 截图实证：定时发布每章如此）。
+                  故默认即"继续编辑"；新建/定时一般不弹此窗，但失败重试会留下草稿、再跑就弹。
+                  （进编辑器【之前】丢弃上次遗留的旧草稿是另一回事，由 wait_for_editor_ready
+                  里的 dismiss_overlays 用"放弃"处理，与本参数无关。）
     """
     # 统一状态机：轮询页面状态并按状态推进，直到到达"发布设置"。
     # 初次"下一步"与被吞后的自愈走同一条 "仍在编辑器 -> 点下一步" 分支；
@@ -1582,6 +1724,12 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_act
         if await page.locator("text=发布设置").count() > 0:
             await _apply_publish_options(page, use_ai=use_ai)
             return
+
+        # 1.5) 字段校验失败 toast（章节号非数字/正文字数不足等）-> 立即抛错。
+        #      未到发布设置才查（上面已 return），故可见的校验 toast 是真实拦截。
+        #      不识别它就会反复点"下一步"被拦、空转 14 轮 + 15s 误报"发布设置超时"，
+        #      真实原因（哪个字段没填好）丢失（实测每章空转 ~43s）。
+        await _check_editor_validation(page)
 
         # 2) 草稿恢复弹窗"是否继续编辑" -> 按 draft_action 关闭
         if await page.locator("text=是否继续编辑").count() > 0:
@@ -1615,19 +1763,57 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_act
         except Exception:
             pass
 
-        # 4) 错别字确认"是否确定提交" -> 提交
-        if await page.locator("text=是否确定提交").count() > 0:
+        # 4) 错别字确认对话框（实测文案："检测到你还有错别字未修改，是否确定提交？"
+        #    按钮：取消 / 提交）-> 点"提交"，带着错别字照常提交（不采纳平台纠错改动）。
+        #    触发认"错别字未修改"或"是否确定提交"两种锚点：只认死文案易因平台微调
+        #    （确认/确定提交）漏匹配 -> 对话框没人确认 -> 一直点不动 -> 误报"发布设置超时"。
+        if (await page.locator("text=错别字未修改").count() > 0
+                or await page.locator("text=是否确定提交").count() > 0):
             submit_btn = page.locator("button", has_text="提交")
-            if await submit_btn.count() > 0:
-                await submit_btn.first.click()
+            n = await submit_btn.count()
+            clicked = False
+            # 只点【可见】的"提交"，绝不点"取消"。逐个挑可见的（背景里可能另有
+            # 含"提交"二字、不可见或非当前对话框的按钮，.first 会点错）。
+            for idx in range(n):
+                try:
+                    btn = submit_btn.nth(idx)
+                    if await btn.is_visible():
+                        await btn.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if clicked:
+                logger.info("    错别字确认 -> 提交")
                 await page.wait_for_timeout(800)
                 continue
 
-        # 5) 内容风险检测"是否进行内容风险检测" -> 取消跳过
+        # 5) 内容风险检测"是否进行内容风险检测" -> 取消跳过（旧版弹窗）
         if await page.locator("text=是否进行内容风险检测").count() > 0:
             cancel_btn = page.locator("button", has_text="取消")
             if await cancel_btn.count() > 0:
                 await cancel_btn.first.click()
+                await page.wait_for_timeout(800)
+                continue
+
+        # 5.5) 内容检测方式选择"请选择内容检测方式"（仅基础检测 / 全面检测）
+        #      -> 选"仅基础检测"。平台新版用它取代了旧的"是否进行内容风险检测?取消"，
+        #      不再有"跳过"选项、必须二选一；基础检测最快、干预最少。
+        #      选项可能是按钮/卡片/单选项，故用按文本精确点击（不限 button 标签）。
+        if await page.locator("text=内容检测方式").count() > 0:
+            picked = await page.evaluate(_CLICK_BY_TEXT_JS, "仅基础检测")
+            if picked:
+                logger.info("    内容检测方式 -> 仅基础检测")
+                await page.wait_for_timeout(500)
+                # 选完可能还需点"确定/确认"才推进（标准 Arco 弹窗页脚）
+                for label in ("确定", "确认"):
+                    btn = page.locator("button", has_text=label)
+                    try:
+                        if await btn.count() > 0 and await btn.first.is_visible():
+                            await btn.first.click()
+                            break
+                    except Exception:
+                        continue
                 await page.wait_for_timeout(800)
                 continue
 
