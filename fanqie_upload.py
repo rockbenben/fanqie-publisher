@@ -206,6 +206,38 @@ def _classify_toasts(messages: list[str], notifications: list[str] = ()):
             raise RuntimeError(f"发布失败，页面提示: {t}")
 
 
+def _interpret_publish_response(body: str):
+    """解析 /api/author/publish_article/v0/ 响应 body，返回 (verdict, message)。
+
+    业务结果藏在 HTTP 200 的 JSON `code` 字段（2026-06-26 真机抓包实测）：
+      成功 {"code":0,"data":{"item_id":"...","tips":""},"message":"success"}
+      失败 {"code":-3026,"data":null,"message":"文章内容有大段落重复，请修改后提交"}
+    这是比"确认发布按钮消失"更权威的信号——按钮消失区分不了 code!=0 的被拒
+    （编辑被拒时对话框可能也关、按钮也消失），会把失败误报成"成功"。
+
+    verdict ∈ {'success','daily_limit','fail'}；body 无法解析或不含 code 时返回
+    (None, '')，调用方回退到原有按钮/ toast 判定，保持向后兼容。code 兼容 int 0
+    与字符串 "0"（防平台序列化差异）。失败文案命中每日上限正则时归为
+    'daily_limit'，让上层按"跳过本章、继续后续"处理而非整章重试。
+    """
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return (None, "")
+    if not isinstance(data, dict) or "code" not in data:
+        return (None, "")
+    code = data.get("code")
+    msg = data.get("message") or data.get("msg") or ""
+    if not isinstance(msg, str):
+        msg = str(msg)
+    msg = msg.strip()
+    if code in (0, "0"):
+        return ("success", msg)
+    if _DAILY_LIMIT_RE.search(msg):
+        return ("daily_limit", msg)
+    return ("fail", msg or f"接口 code={code}")
+
+
 async def _check_daily_limit(page):
     """检测平台"当日发布字数上限"toast，若存在则抛出 DailyLimitReached。
 
@@ -284,7 +316,9 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
     """点击「确认发布」后判定发布结果，每 200ms 轮询，按真实时钟控制超时。
 
     判定规则（实测）:
-    - 按钮消失 → 提交成功，立即返回（按钮消失是可靠的成功信号，无需再看 toast）
+    - publish_article 接口回 code==0 → 成功；code!=0 → 失败/上限（权威信号，
+      优先于按钮，见 _interpret_publish_response）
+    - 按钮消失 → 提交成功（接口无明确判定时的回退信号）
     - toast 含上限文案 → 抛 DailyLimitReached（上层记录原因后继续后续章节）
     - 瞬态 toast 含失败/错误等 → 立即抛 RuntimeError（不再傻等超时）
     - 按钮在、且连续 5s 无瞬态 toast（常驻公告不算响应）→ 疑似点击被
@@ -296,8 +330,8 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
     平台失败提示（上限/敏感词等）是 Arco Message toast，~3 秒自动消失，
     必须趁还在时捕获。所有捕获到的 toast 文本都写入日志。
 
-    TODO: 更深层的判定是监听章节提交接口的 response JSON 错误码（不依赖
-    toast 文案与时机）；待抓到接口 URL/格式后接入。
+    接口判定 2026-06-26 真机抓包接入：提交最终调 /api/author/publish_article/v0/，
+    业务结果在 200 响应的 JSON `code` 里（按钮消失区分不了 code!=0 的被拒）。
     """
     if timeout is None:
         timeout = _browser_timeout
@@ -311,6 +345,9 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
     # 纯观测不判定——为将来切换到"按接口响应码判定"积累真实格式数据。
     api_probe: list[str] = []
     grab_tasks: list = []  # 跟踪 body 异步补抓任务，收尾统一取消，避免孤儿任务告警
+    # 提交接口的权威判定结果（由 publish_article 响应 body 的 code 解析得到）。
+    # 一旦填入即优先于"按钮消失"启发式——见下方主循环。
+    verdict_holder: dict = {}
 
     def _on_response(resp):
         try:
@@ -319,14 +356,18 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
                     r"draft|publish|chapter|submit|create|article", url, re.I):
                 idx = len(api_probe)
                 api_probe.append(f"{resp.status} {url[:160]}")
-                # 提交接口(实测 /api/author/publish_article/v0/，业务错误藏在
-                # 200 响应的 JSON body 里)——异步补抓 body 前 300 字符，
-                # 为切换到"按响应码判定"积累格式数据。
+                # 提交接口(实测 /api/author/publish_article/v0/，业务结果藏在
+                # 200 响应的 JSON `code` 里)——异步补抓 body，解析 code 写入
+                # verdict_holder 作为权威判定信号。
                 if "publish_article" in url:
                     async def _grab(i=idx, r=resp):
                         try:
-                            body = (await r.text())[:300]
-                            api_probe[i] += f" body={body}"
+                            full = await r.text()
+                            api_probe[i] += f" body={full[:300]}"
+                            verdict, vmsg = _interpret_publish_response(full)
+                            if verdict and "verdict" not in verdict_holder:
+                                verdict_holder["verdict"] = verdict
+                                verdict_holder["message"] = vmsg
                         except Exception:
                             pass
                     try:
@@ -348,12 +389,23 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
                     seen_toasts.append(t)
                     logger.info(f"    页面提示: {t}")
             _classify_toasts(toasts["messages"], toasts["notifications"])
+            # 接口响应是权威信号，优先于"按钮消失"启发式：编辑被拒(code!=0)时
+            # 对话框可能也关、按钮也消失，仅看按钮会把失败误报成"成功"。
+            iv = verdict_holder.get("verdict")
+            if iv == "success":
+                return
+            if iv == "daily_limit":
+                raise DailyLimitReached(
+                    f"当日发布字数已达上限: {verdict_holder.get('message', '')}")
+            if iv == "fail":
+                raise RuntimeError(
+                    f"发布失败，接口返回: {verdict_holder.get('message', '')}")
             try:
                 visible = await confirm_btn.is_visible()
             except Exception:
                 visible = None  # 状态未知（页面跳转/上下文销毁等），不能当成功
             if visible is False:
-                return  # 按钮消失 = 提交成功
+                return  # 按钮消失 = 提交成功（接口无明确判定时的回退信号）
             now = time.monotonic()
             if visible:
                 if toasts["messages"]:
