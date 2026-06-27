@@ -27,7 +27,7 @@ try:
         parse_md_file, parse_md_files, get_md_files, strip_md_formatting,
         deduplicate_titles, compute_schedule, _validate_times,
         DailyLimitReached, _check_daily_limit, _wait_publish_result,
-        _log_fail_list,
+        _log_fail_list, _record_unprocessed,
         create_context, save_auth, close_browser_safely, goto_with_login_retry,
         wait_for_editor_ready, fill_chapter,
         save_draft, publish_scheduled, _navigate_to_publish_settings,
@@ -877,6 +877,12 @@ class FanqieGUI:
 
     def _switch_account(self, name: str):
         """切换到指定的命名账号: 复制 auth 文件 → 刷新浏览器 + 作品列表。"""
+        if self._login_in_progress:
+            # 登录期间切换账号会 copy2 覆盖 AUTH_FILE，与登录保存的会话争用，
+            # 可能把错账号 cookie 写进命名文件。回退下拉到当前账号、待登录结束。
+            messagebox.showinfo("提示", "正在登录，请先完成或取消当前登录再切换账号。")
+            self.cmb_account.set(self._gui_state.get("current_account", ""))
+            return
         src = SCRIPT_DIR / f".auth_{name}.json"
         if not src.exists():
             messagebox.showerror("错误", f"账号文件不存在: {src.name}")
@@ -1504,12 +1510,8 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     # 登录
     # -----------------------------------------------------------------------
-    def _on_login(self):
-        # 防止并发登录
-        if self._login_in_progress:
-            messagebox.showinfo("提示", "登录正在进行中，请先完成或取消当前登录。")
-            return
-        # 弹出对话框要求输入账号名称，默认填充当前账号
+    def _prompt_account_name(self):
+        """弹"账号名称"对话框并校验，返回合法名称；取消/名称非法/放弃覆盖时返回 None。"""
         current_acct = self._gui_state.get("current_account", "")
         raw = simpledialog.askstring(
             "账号名称",
@@ -1520,26 +1522,50 @@ class FanqieGUI:
             initialvalue=current_acct,
         )
         if not raw or not raw.strip():
-            return
+            return None
         name = self._sanitize_account_name(raw)
         if not name:
             messagebox.showerror("名称无效",
                                  "账号名称包含非法字符或为保留名，请重新输入。")
-            return
-
+            return None
         # L2: 已存在同名账号时提示确认
         named_path = SCRIPT_DIR / f".auth_{name}.json"
         if named_path.exists():
             if not messagebox.askyesno(
                     "账号已存在",
                     f"账号「{name}」已存在。\n继续将覆盖其登录状态，是否继续？"):
-                return
+                return None
+        return name
+
+    def _on_login(self):
+        # 防止并发登录
+        if self._login_in_progress:
+            messagebox.showinfo("提示", "登录正在进行中，请先完成或取消当前登录。")
+            return
+        # 必须在弹"账号名称"对话框【之前】就占住登录态：simpledialog 的 wait_window
+        # 会继续泵 Tk after 事件，定时器 _timer_tick 会在对话框开着时触发——若此刻
+        # _login_in_progress 仍为 False，忙碌闸门放行，会并发起一个定时上传任务
+        # （两个浏览器同开 + 争用 AUTH_FILE，登录保存的会话可能盖掉上传在用的账号）。
+        self._login_in_progress = True
+        self.btn_login.configure(state="disabled")
+        try:
+            name = self._prompt_account_name()
+        except Exception:
+            # 对话框异常（如 root 被销毁）不能让登录态泄漏：否则按钮永久
+            # 禁用、定时器永远被"正在登录"挡住。复位后把异常照常抛出。
+            self._login_in_progress = False
+            self.btn_login.configure(state="normal")
+            raise
+        if name is None:
+            # 取消/名称非法/放弃覆盖：未起任务，必须释放登录态，
+            # 否则登录按钮永久禁用、定时器永远被"正在登录"挡住。
+            self._login_in_progress = False
+            self.btn_login.configure(state="normal")
+            return
 
         self._pending_account_name = name
         self._login_event = threading.Event()
         self._login_cancelled = False
-        self._login_in_progress = True
-        self.btn_login.configure(state="disabled")
 
         async def task():
             try:
@@ -1748,6 +1774,11 @@ class FanqieGUI:
     def _on_refresh_books(self):
         if not AUTH_FILE.exists():
             messagebox.showwarning("提示", "请先登录")
+            return
+        if self._login_in_progress:
+            # 登录期间刷新会 save_auth 写 AUTH_FILE，与登录保存的会话争用，
+            # 可能让命名 auth 文件存入错账号。等登录结束再刷新。
+            messagebox.showinfo("提示", "正在登录，请先完成或取消当前登录再刷新。")
             return
         # 防重入：多个入口可能近乎同时调度刷新（切账号 + 登录完成），
         # 避免并发任务竞争 self.books / 共享浏览器上下文
@@ -2480,6 +2511,11 @@ class FanqieGUI:
             self._cancel_requested = True
             self.btn_upload.configure(state="disabled", text="正在停止...")
             return
+        if self._login_in_progress:
+            # 登录期间另起上传会同开第二个浏览器、并发写 AUTH_FILE，
+            # 可能把登录正在保存的会话与上传账号互相覆盖（错配账号）。
+            self._notify("warning", "提示", "正在登录，请先完成或取消当前登录再上传。")
+            return
 
         # 验证
         if not AUTH_FILE.exists():
@@ -2645,9 +2681,10 @@ class FanqieGUI:
                                 break
 
                             except DailyLimitReached as e:
-                                # 上限按字数计、非硬墙：字数较短的后续章节可能仍
-                                # 发得出去，故只记录原因、跳过本章，不中止整批。
-                                logger.warning(f"  跳过本章（{e}），继续后续章节")
+                                # 每日字数上限 = 平台当日额度已耗尽。继续提交后续
+                                # 章节只会重复撞限或触发别的拦截（实测续发产生额外
+                                # 错误），故中止整批；本章与剩余章节如实记入清单。
+                                logger.warning(f"  达每日字数上限（{e}），中止整批")
                                 fail_list.append((f"{num_str}{title}", str(e)))
                                 daily_limit = True
                                 break
@@ -2668,8 +2705,14 @@ class FanqieGUI:
 
                         if daily_limit:
                             failed += 1
-                            # 上限失败重置熔断计数：toast 被正确捕获说明流程健康
-                            consec_fail = 0
+                            # 中止整批：把剩余未处理章节如实记入清单（不静默丢弃）。
+                            rest = _record_unprocessed(
+                                fail_list, ((parsed[j][0], parsed[j][1]) for j in range(i + 1, total)))
+                            failed += rest
+                            if rest:
+                                logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
+                            self._after(0, self._update_progress, total, total)
+                            break
                         elif ok:
                             success += 1
                             consec_fail = 0
@@ -2681,7 +2724,13 @@ class FanqieGUI:
                                 logger.error(
                                     f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
                                     f"中止任务，剩余 {rest} 章未处理")
-                                self._after(0, self._update_progress, i + 1, total)
+                                # 与每日上限路径一致：剩余章节记入清单并计数，
+                                # 否则汇总"成功+失败<总数"、且补传清单缺这些章节。
+                                failed += _record_unprocessed(
+                                    fail_list,
+                                    ((parsed[j][0], parsed[j][1]) for j in range(i + 1, total)),
+                                    reason="流程异常中止，未处理")
+                                self._after(0, self._update_progress, total, total)
                                 break
 
                         self._after(0, self._update_progress, i + 1, total)
@@ -2691,7 +2740,12 @@ class FanqieGUI:
                                 await page.wait_for_timeout(delay * 1000)
                             except Exception:
                                 # 章节间等待时页面已死（如用户关掉浏览器窗口）：
-                                # 停止循环，但仍走收尾与汇总，保住失败清单
+                                # 停止循环，但仍走收尾与汇总，保住失败清单。
+                                # 剩余未发章节记入清单，否则汇总漏账、补传清单缺这些章。
+                                failed += _record_unprocessed(
+                                    fail_list,
+                                    ((parsed[j][0], parsed[j][1]) for j in range(i + 1, total)),
+                                    reason="页面已失效，未处理")
                                 break
 
                     await save_auth(context)
@@ -2844,13 +2898,24 @@ class FanqieGUI:
                                     self._after(0, self._update_progress, i + 1, total)
                                     break
                         except DailyLimitReached as e:
-                            # 上限按字数计、非硬墙：字数较短的后续章节可能仍发得
-                            # 出去，故只记录原因、跳过本章，不中止整批。toast 被
-                            # 正确捕获说明流程健康，重置熔断计数。
-                            logger.warning(f"  跳过本章（{e}），继续后续章节")
+                            # 每日字数上限 = 平台当日额度已耗尽。继续提交后续章节
+                            # 只会重复撞限或触发别的拦截（实测续发产生额外错误），
+                            # 故中止整批；本章与剩余章节（含批末待二次尝试的）如实
+                            # 记入清单。
+                            logger.warning(f"  达每日字数上限（{e}），中止整批")
                             fail_list.append((f"第{ch_num}章 {title}", str(e)))
                             failed += 1
-                            consec_fail = 0
+                            # 剩余主循环章节 + 批末待二次尝试的章节都记为未处理。
+                            failed += _record_unprocessed(
+                                fail_list, ((m[2], m[3]) for m in matched_copy[i + 1:]))
+                            failed += _record_unprocessed(
+                                fail_list, ((d[0], d[1]) for d in dup_pending))
+                            dup_pending = []
+                            rest = total - (i + 1)
+                            if rest:
+                                logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
+                            self._after(0, self._update_progress, total, total)
+                            break
                         except Exception as e:
                             # 兜底浏览器崩溃/页面被关等意外，按原因不明失败计入
                             # 熔断，保证 save_auth/汇总仍能执行而不是整批裸抛中止。
@@ -2875,7 +2940,12 @@ class FanqieGUI:
                                 await page.wait_for_timeout(delay * 1000)
                             except Exception:
                                 # 章节间等待时页面已死（如用户关掉浏览器窗口）：
-                                # 停止循环，但仍走收尾与汇总，保住失败清单
+                                # 停止循环，但仍走收尾与汇总，保住失败清单。
+                                # 剩余未改章节记入清单（dup_pending 由其专属循环另行计数）。
+                                failed += _record_unprocessed(
+                                    fail_list,
+                                    ((m[2], m[3]) for m in matched_copy[i + 1:]),
+                                    reason="页面已失效，未处理")
                                 break
 
                     # 批末二次尝试: 主循环跑完后，占用旧标题的章节多已更新
@@ -2908,9 +2978,14 @@ class FanqieGUI:
                                         (f"第{ch_num}章 {title}",
                                          err or "标题重复，二次尝试仍失败"))
                             except DailyLimitReached as e:
-                                logger.warning(f"  跳过本章（{e}）")
+                                # 二次尝试阶段撞每日上限：与主循环一致中止整批，
+                                # 本条与剩余二次条目如实记入清单。
+                                logger.warning(f"  达每日字数上限（{e}），中止二次尝试")
                                 fail_list.append((f"第{ch_num}章 {title}", str(e)))
                                 failed += 1
+                                failed += _record_unprocessed(
+                                    fail_list, ((d[0], d[1]) for d in dup_pending[idx2 + 1:]))
+                                break
                             except Exception as e:
                                 logger.error(f"  二次尝试异常: {e}")
                                 fail_list.append(

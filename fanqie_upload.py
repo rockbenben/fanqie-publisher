@@ -106,9 +106,10 @@ def setup_logging(log_file=None, level=logging.INFO):
 class DailyLimitReached(RuntimeError):
     """本章提交触发平台"当日发布字数上限"。
 
-    注意：上限按字数计、不是硬墙——各章字数不同，本章超限后，
-    字数较短的后续章节可能仍发得出去（2026-06-06 实测：79-81 章失败、
-    82 章成功）。因此上层不中止整批，记录原因后继续后续章节。
+    虽然上限按字数计、非硬墙（2026-06-06 曾见 79-81 失败、82 字数较短仍
+    成功），但实践中继续提交后续章节多半重复撞限、还会触发别的拦截，徒增
+    额外错误。故上层捕获后中止整批，把本章与所有剩余未处理章节如实记入失败
+    清单（_log_fail_list 会压缩成章节号，可直接粘贴补传），留待明天接着发。
     """
 
 
@@ -218,7 +219,7 @@ def _interpret_publish_response(body: str):
     verdict ∈ {'success','daily_limit','fail'}；body 无法解析或不含 code 时返回
     (None, '')，调用方回退到原有按钮/ toast 判定，保持向后兼容。code 兼容 int 0
     与字符串 "0"（防平台序列化差异）。失败文案命中每日上限正则时归为
-    'daily_limit'，让上层按"跳过本章、继续后续"处理而非整章重试。
+    'daily_limit'，让上层中止整批、记录剩余章节，而非整章重试。
     """
     try:
         data = json.loads(body)
@@ -300,6 +301,24 @@ def _log_fail_list(fail_list):
             f"（可直接粘贴到「按章节号筛选」补传）")
 
 
+def _record_unprocessed(fail_list, remaining, reason="每日字数上限，未处理"):
+    """中止整批后，把剩余未处理章节如实记入失败清单（不静默丢弃）。
+
+    remaining: 可迭代的 (章节号, 标题) 二元组，章节号可为 None/空字符串。
+    reason: 记入清单的原因文案（每日上限 / 流程异常中止等）。
+    返回追加的条数，供上层据此累加 failed 计数，使「成功+失败=总数」对得上。
+
+    这些条目带"第N章"标签，会被 _log_fail_list 末尾的章节号压缩收进去，
+    用户明天可直接粘贴到「按章节号筛选」接着发——这正是"记录剩余"的落点。
+    """
+    n = 0
+    for ch_num, title in remaining:
+        label = f"第{ch_num}章 " if ch_num else ""
+        fail_list.append((f"{label}{title}", reason))
+        n += 1
+    return n
+
+
 # _wait_publish_result 行为参数
 _PUBLISH_POLL_MS = 200        # 轮询间隔
 _RECLICK_SILENT_S = 5.0       # 按钮在、且无瞬态 toast 持续此秒数 → 判定点击被吞
@@ -319,7 +338,7 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
     - publish_article 接口回 code==0 → 成功；code!=0 → 失败/上限（权威信号，
       优先于按钮，见 _interpret_publish_response）
     - 按钮消失 → 提交成功（接口无明确判定时的回退信号）
-    - toast 含上限文案 → 抛 DailyLimitReached（上层记录原因后继续后续章节）
+    - toast 含上限文案 → 抛 DailyLimitReached（上层中止整批、记录剩余章节）
     - 瞬态 toast 含失败/错误等 → 立即抛 RuntimeError（不再傻等超时）
     - 按钮在、且连续 5s 无瞬态 toast（常驻公告不算响应）→ 疑似点击被
       遮挡/吞掉（与"下一步"被吞同类问题），自愈：限时重点击；
@@ -2255,9 +2274,10 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                     break
 
                 except DailyLimitReached as e:
-                    # 上限按字数计、非硬墙：字数较短的后续章节可能仍发得出去，
-                    # 故只记录原因、跳过本章，不中止整批。
-                    logger.warning(f"  跳过本章（{e}），继续后续章节")
+                    # 每日字数上限 = 平台当日发布额度已耗尽。继续提交后续章节
+                    # 只会重复撞限或触发别的拦截（实测续发会产生额外错误），
+                    # 故中止整批；本章与所有剩余章节如实记入清单，留待明天接着发。
+                    logger.warning(f"  达每日字数上限（{e}），中止整批")
                     fail_list.append((f"{num_str}{title}", str(e)))
                     daily_limit = True
                     break
@@ -2278,9 +2298,13 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
             if daily_limit:
                 failed += 1
-                # 上限失败重置熔断计数：toast 被正确捕获说明整条流程健康，
-                # 它不该和"原因不明失败"拼成"连续 3 章"误触发熔断
-                consec_fail = 0
+                # 中止整批：把所有剩余未处理章节如实记入清单（不是静默丢弃）。
+                rest = _record_unprocessed(
+                    fail_list, ((parsed[j][0], parsed[j][1]) for j in range(i + 1, len(files))))
+                failed += rest
+                if rest:
+                    logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
+                break
             elif ok:
                 success += 1
                 consec_fail = 0
@@ -2292,6 +2316,12 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                     logger.error(
                         f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
                         f"中止任务，剩余 {rest} 章未处理")
+                    # 与每日上限路径一致：剩余章节记入清单并计数，
+                    # 否则汇总"成功+失败<总数"、且补传清单缺这些章节。
+                    failed += _record_unprocessed(
+                        fail_list,
+                        ((parsed[j][0], parsed[j][1]) for j in range(i + 1, len(files))),
+                        reason="流程异常中止，未处理")
                     break
 
             if i < len(files) - 1 and delay > 0:
@@ -2299,7 +2329,12 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                     await page.wait_for_timeout(delay * 1000)
                 except Exception:
                     # 章节间等待时页面已死：停止循环，但仍走到下面的
-                    # save_auth/close，避免收尾被跳过导致 pw.stop 挂死
+                    # save_auth/close，避免收尾被跳过导致 pw.stop 挂死。
+                    # 剩余未发章节记入清单，否则汇总漏账、补传清单缺这些章。
+                    failed += _record_unprocessed(
+                        fail_list,
+                        ((parsed[j][0], parsed[j][1]) for j in range(i + 1, len(files))),
+                        reason="页面已失效，未处理")
                     break
 
         await save_auth(context)
@@ -2325,7 +2360,7 @@ async def edit_one_chapter(
     错误信息供上层写入失败清单（真实原因优于"见日志"），并用于识别
     "重复标题"类可二次尝试的失败。
     DailyLimitReached 不在此处捕获（本章重试无意义，字数不会变），
-    直接向上抛出，由上层记录原因并继续后续章节。
+    直接向上抛出，由上层中止整批并记录剩余章节。
     """
     last_err = ""
     for attempt in range(1, max_retries + 2):
@@ -2820,13 +2855,22 @@ async def cmd_edit(directory: Path, book_id: str, args):
                         skipped += rest
                         break
             except DailyLimitReached as e:
-                # 上限按字数计、非硬墙：字数较短的后续章节可能仍发得出去，
-                # 故只记录原因、跳过本章，不中止整批。toast 被正确捕获说明
-                # 流程健康，重置熔断计数，避免与原因不明失败拼成误熔断。
-                logger.warning(f"  跳过本章（{e}），继续后续章节")
+                # 每日字数上限 = 平台当日额度已耗尽。继续提交后续章节只会重复
+                # 撞限或触发别的拦截（实测续发产生额外错误），故中止整批；
+                # 本章与所有剩余章节（含批末待二次尝试的）如实记入清单。
+                logger.warning(f"  达每日字数上限（{e}），中止整批")
                 fail_list.append((f"第{ch_num}章 {title}", str(e)))
                 failed += 1
-                consec_fail = 0
+                # 剩余主循环章节 + 批末待二次尝试的章节都记为未处理。
+                failed += _record_unprocessed(
+                    fail_list, ((m[2], m[3]) for m in matched[i + 1:]))
+                failed += _record_unprocessed(
+                    fail_list, ((d[0], d[1]) for d in dup_pending))
+                dup_pending = []
+                rest = total - (i + 1)
+                if rest:
+                    logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
+                break
             except Exception as e:
                 # edit_one_chapter 正常不会泄漏非上限异常（内部已含重试+吞错），
                 # 这里兜底浏览器崩溃/页面被关等意外，按原因不明失败计入熔断，
@@ -2847,7 +2891,12 @@ async def cmd_edit(directory: Path, book_id: str, args):
                 try:
                     await page.wait_for_timeout(delay * 1000)
                 except Exception:
-                    break  # 页面已死：停止循环，仍走到 save_auth/close 收尾
+                    # 页面已死：停止循环，仍走到 save_auth/close 收尾。
+                    # 剩余未改章节记入清单（dup_pending 由其专属循环另行计数）。
+                    failed += _record_unprocessed(
+                        fail_list, ((m[2], m[3]) for m in matched[i + 1:]),
+                        reason="页面已失效，未处理")
+                    break
 
         # 批末二次尝试: 主循环跑完后，占用旧标题的章节多已更新、标题已释放
         if dup_pending:
@@ -2855,7 +2904,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
             logger.info(f"二次尝试 {len(dup_pending)} 个标题重复的章节"
                         f"（标题搬移的临时冲突，此时多已解除）...")
             dead = False
-            for ch_num, title, content, edit_url in dup_pending:
+            for k, (ch_num, title, content, edit_url) in enumerate(dup_pending):
                 if dead:
                     # 页面已死，剩余条目逐个 goto 只会重复快速失败+刷屏，
                     # 直接如实记失败，不再尝试
@@ -2874,9 +2923,14 @@ async def cmd_edit(directory: Path, book_id: str, args):
                         fail_list.append((f"第{ch_num}章 {title}",
                                           err or "标题重复，二次尝试仍失败"))
                 except DailyLimitReached as e:
-                    logger.warning(f"  跳过本章（{e}）")
+                    # 二次尝试阶段撞每日上限：与主循环一致，中止整批，
+                    # 本条与剩余二次条目如实记入清单。
+                    logger.warning(f"  达每日字数上限（{e}），中止二次尝试")
                     fail_list.append((f"第{ch_num}章 {title}", str(e)))
                     failed += 1
+                    failed += _record_unprocessed(
+                        fail_list, ((d[0], d[1]) for d in dup_pending[k + 1:]))
+                    break
                 except Exception as e:
                     logger.error(f"  二次尝试异常: {e}")
                     fail_list.append((f"第{ch_num}章 {title}", f"二次尝试异常: {e}"))
