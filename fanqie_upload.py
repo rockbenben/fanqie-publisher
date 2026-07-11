@@ -682,7 +682,7 @@ def parse_md_files(files: list) -> tuple:
 
     parse_md_file 只兜底编码错误；磁盘读取 OSError（文件在扫描后被删、
     云端按需文件离线、权限不足）若不处理，会让整次刷新/上传在列表推导处
-    整段崩掉——GUI 在 pythonw 下无可见报错（刷新像没反应），且崩溃点之后
+    整段崩掉——GUI 在隐藏控制台（run.bat 后台静默启动）/pythonw 下无可见报错（刷新像没反应），且崩溃点之后
     _all_parsed 与 _all_files 失配，后续按日期筛选会在索引处 IndexError。
     逐个解析、跳过坏文件，并保持两个返回列表一一对齐。
     """

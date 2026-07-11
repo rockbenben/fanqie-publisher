@@ -3217,7 +3217,7 @@ if __name__ == "__main__":
         app.run()
     except Exception as e:
         logger.exception("启动异常")
-        # pythonw 下 raise 无可见输出，改用 messagebox 告知用户
+        # 隐藏控制台（run.bat 后台静默启动）或 pythonw 下 raise 无可见输出，改用 messagebox 告知用户
         try:
             _r = tk.Tk()
             _r.withdraw()
