@@ -1122,6 +1122,18 @@ _WRITE_CHAPTER_NUM_JS = r"""(num) => {
 }"""
 
 
+def _extract_draft_id(url: str) -> str | None:
+    """从编辑器 URL 提取草稿 ID（.../publish/<id>?...）；全新空白章无 ID 时返回 None。
+
+    存草稿时番茄有时把"新建章"复用到同一个进行中的草稿上（URL 落到同一个
+    /publish/<id>），导致连续章节互相覆盖、每隔一章丢章（实测确认）。上层据此
+    检测复用：两章落到同一 draftId ⇒ 先存的那章已被后一章覆盖、未独立保存，
+    必须如实记入补传清单，绝不"报存成功却实际丢章"。
+    """
+    m = re.search(r"/publish/(\d+)", url or "")
+    return m.group(1) if m else None
+
+
 async def save_draft(page):
     """点击存草稿按钮并轮询保存结果。
 
@@ -2234,7 +2246,9 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         failed = 0
         consec_fail = 0
         fail_list: list[tuple[str, str]] = []  # (章节标签, 失败原因)
+        draft_owner: dict[str, str] = {}  # 存草稿防覆盖漏账: draftId -> 章节标签
         max_retries = cfg.get("max_retries", 2)
+        is_draft = not publish and not schedule
 
         for i, file in enumerate(files):
             chapter_num, title, content = parsed[i]
@@ -2244,6 +2258,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
             ok = False
             daily_limit = False
+            this_draft_id = None
             for attempt in range(1, max_retries + 2):
                 try:
                     # 首章首次复用当前页面，其余情况导航到新建 URL
@@ -2268,6 +2283,15 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                         logger.info(f"  -> 已发布")
                     else:
                         await save_draft(page)
+                        # 番茄把连续两次"新建章存草稿"并到同一草稿槽（第2次覆盖第1次
+                        # 后该槽才提交），只存1次会被下一章覆盖丢失。对同一章再存一次
+                        # 同内容：让"被覆盖的那次"就是本章自己，本章占满并提交自己的
+                        # 草稿槽，下一章自然拿到新槽——逐章独立、不再隔章丢章（实测有效）。
+                        await page.goto(new_chapter_url)
+                        await wait_for_editor_ready(page)
+                        await fill_chapter(page, chapter_num, title, content)
+                        await save_draft(page)
+                        this_draft_id = _extract_draft_id(page.url)
                         logger.info(f"  -> 已存草稿")
 
                     ok = True
@@ -2308,6 +2332,22 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
             elif ok:
                 success += 1
                 consec_fail = 0
+                # 存草稿防覆盖漏账：番茄有时把"新建章"复用到同一个进行中的草稿上，
+                # 本章会覆盖上一章。若检测到 draftId 被复用，说明上一占用者其实已被
+                # 覆盖、未独立保存——把它移出成功、记入补传清单（第N章号会被
+                # _log_fail_list 压进补传号），避免"报存成功却实际丢章"。
+                if is_draft and this_draft_id:
+                    prev = draft_owner.get(this_draft_id)
+                    if prev is not None:
+                        logger.warning(
+                            f"  ⚠ 本章复用草稿ID {this_draft_id}，覆盖了上一章「{prev.strip()}」")
+                        fail_list.append(
+                            (prev, "草稿被后续章节覆盖（平台复用草稿ID），未独立保存"))
+                        success -= 1
+                        failed += 1
+                    draft_owner[this_draft_id] = f"{num_str}{title}"
+                elif is_draft and not this_draft_id:
+                    logger.warning("  ⚠ 未能读取草稿ID，无法确认是否独立保存，请到草稿箱核对")
             else:
                 failed += 1
                 consec_fail += 1

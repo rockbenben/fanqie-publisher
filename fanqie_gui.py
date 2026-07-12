@@ -31,7 +31,7 @@ try:
         _log_fail_list, _record_unprocessed,
         create_context, save_auth, close_browser_safely, goto_with_login_retry,
         wait_for_editor_ready, fill_chapter,
-        save_draft, publish_scheduled, _navigate_to_publish_settings,
+        save_draft, _extract_draft_id, publish_scheduled, _navigate_to_publish_settings,
         extract_chapters_from_page, match_chapters, edit_one_chapter,
         reschedule_on_manage_page, detect_volumes, select_volume,
         AUTH_FILE, BASE_URL, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
@@ -2897,6 +2897,8 @@ class FanqieGUI:
                     failed = 0
                     consec_fail = 0
                     fail_list = []  # (章节标签, 失败原因)
+                    draft_owner = {}  # 存草稿防覆盖漏账: draftId -> 章节标签
+                    is_draft = mode == "draft"
                     total = len(files)
                     max_retries = self._cfg.get("max_retries", 2)
 
@@ -2914,6 +2916,7 @@ class FanqieGUI:
 
                         ok = False
                         daily_limit = False
+                        this_draft_id = None
                         for attempt in range(1, max_retries + 2):
                             try:
                                 if i > 0 or attempt > 1:
@@ -2937,6 +2940,16 @@ class FanqieGUI:
                                     logger.info("  -> 已发布")
                                 else:
                                     await save_draft(page)
+                                    # 番茄把连续两次"新建章存草稿"并到同一草稿槽（第2次
+                                    # 覆盖第1次后该槽才提交），只存1次会被下一章覆盖丢失。
+                                    # 对同一章再存一次同内容：让"被覆盖的那次"就是本章自己，
+                                    # 本章占满并提交自己的草稿槽，下一章自然拿到新槽——逐章
+                                    # 独立、不再隔章丢章（实测有效）。
+                                    await page.goto(url)
+                                    await wait_for_editor_ready(page)
+                                    await fill_chapter(page, chapter_num, title, content)
+                                    await save_draft(page)
+                                    this_draft_id = _extract_draft_id(page.url)
                                     logger.info("  -> 已存草稿")
 
                                 ok = True
@@ -2978,6 +2991,24 @@ class FanqieGUI:
                         elif ok:
                             success += 1
                             consec_fail = 0
+                            # 存草稿防覆盖漏账：番茄有时把"新建章"复用到同一进行中
+                            # 草稿上，本章会覆盖上一章。检测到 draftId 复用即说明上一
+                            # 占用者已被覆盖、未独立保存——移出成功、记入补传清单，
+                            # 避免"报存成功却实际丢章"（第N章号会被压进补传号）。
+                            if is_draft and this_draft_id:
+                                prev = draft_owner.get(this_draft_id)
+                                if prev is not None:
+                                    logger.warning(
+                                        f"  ⚠ 本章复用草稿ID {this_draft_id}，"
+                                        f"覆盖了上一章「{prev.strip()}」")
+                                    fail_list.append(
+                                        (prev, "草稿被后续章节覆盖（平台复用草稿ID），未独立保存"))
+                                    success -= 1
+                                    failed += 1
+                                draft_owner[this_draft_id] = f"{num_str}{title}"
+                            elif is_draft and not this_draft_id:
+                                logger.warning(
+                                    "  ⚠ 未能读取草稿ID，无法确认是否独立保存，请到草稿箱核对")
                         else:
                             failed += 1
                             consec_fail += 1
