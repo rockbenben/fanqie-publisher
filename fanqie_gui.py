@@ -369,6 +369,11 @@ class FanqieGUI:
         style.configure("Icon.TButton", font=(ff, 14), padding=(10, 4))
         style.map("Icon.TButton",
                   background=[("active", "#E7E1D7"), ("pressed", "#DCD5C9")])
+        # emoji 图标（📖📂💾）在 YaHei 里回退到 Segoe UI Emoji，字形基线偏低、
+        # 看着"下沉"；单给一档：底部多留白把字形顶上来，与 ↻ 等符号视觉居中对齐。
+        style.configure("EmojiIcon.TButton", font=(ff, 14), padding=(10, 0, 10, 12))
+        style.map("EmojiIcon.TButton",
+                  background=[("active", "#E7E1D7"), ("pressed", "#DCD5C9")])
 
         # 卡片 / 标题
         style.configure("Card.TFrame", background=CLR_BASE,
@@ -515,7 +520,7 @@ class FanqieGUI:
         self._attach_tooltip(self.btn_books, "刷新作品列表")
         # 先在右侧预留图标按钮，再让下拉填充中间，避免下拉展开挤掉按钮
         self.btn_open_manage = ttk.Button(
-            frm, text="📖", width=2, style="Icon.TButton",
+            frm, text="📖", width=2, style="EmojiIcon.TButton",
             command=self._open_chapter_manage)
         self.btn_open_manage.pack(side="right")
         self._attach_tooltip(self.btn_open_manage, "章节管理（在浏览器打开）")
@@ -556,7 +561,7 @@ class FanqieGUI:
         btn_reload.pack(side="left")
         self._attach_tooltip(btn_reload, "刷新（重新扫描章节文件夹）")
         btn_opendir = ttk.Button(
-            row_act, text="📂", width=2, style="Icon.TButton",
+            row_act, text="📂", width=2, style="EmojiIcon.TButton",
             command=self._open_chapters_dir)
         btn_opendir.pack(side="left", padx=(10, 0))
         self._attach_tooltip(btn_opendir, "在文件管理器中打开目录")
@@ -767,9 +772,23 @@ class FanqieGUI:
                   text="格式 YYYY-MM-DD HH:MM · 到点自动执行所选操作（单次）").pack(
                       anchor="w", pady=(4, 0))
 
-        # --- 5. 章节预览 / 运行日志（选项卡） ---
+        # --- 5. 主行动条（先占底部，永不被挤出可视区）---
+        # 关键：side="bottom" 且先于选项卡 pack。pack 按顺序分配空间，底栏先占住
+        # 底部一条，剩余空间才给可伸缩的选项卡；这样无论窗口多矮、新手引导是否展开，
+        # 被裁掉的都只会是选项卡，主按钮「开始上传」始终可见。
+        frm = ttk.Frame(self.root)
+        frm.pack(side="bottom", fill="x", padx=12, pady=(10, 12))
+        self.btn_upload = ttk.Button(
+            frm, text="开始上传", style="Primary.TButton", command=self._on_upload)
+        self.btn_upload.pack(side="left")
+        self.progress = ttk.Progressbar(frm, mode="determinate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=12)
+        self.lbl_progress = ttk.Label(frm, text="")
+        self.lbl_progress.pack(side="left")
+
+        # --- 6. 章节预览 / 运行日志（选项卡） ---
         self._nb = ttk.Notebook(self.root)
-        self._nb.pack(fill="both", expand=True, padx=12, pady=(10, 0))
+        self._nb.pack(side="top", fill="both", expand=True, padx=12, pady=(10, 0))
         tab_prev = ttk.Frame(self._nb)
         self._nb.add(tab_prev, text="章节预览")
         self.txt_preview = scrolledtext.ScrolledText(
@@ -780,29 +799,19 @@ class FanqieGUI:
 
         tab_log = ttk.Frame(self._nb)
         self._nb.add(tab_log, text="运行日志")
-        log_bar = ttk.Frame(tab_log)
-        log_bar.pack(fill="x", pady=(6, 0))
-        btn_export = ttk.Button(
-            log_bar, text="💾", width=2, style="Icon.TButton",
-            command=self._export_log)
-        btn_export.pack(side="right")
-        self._attach_tooltip(btn_export, "导出运行日志到文件")
         self.txt_log = scrolledtext.ScrolledText(
             tab_log, height=10, state="disabled",
             font=("Consolas", 10), background=CLR_FIELD, foreground=CLR_INK,
             insertbackground=CLR_INK, relief="flat", borderwidth=0)
         self.txt_log.pack(fill="both", expand=True, pady=(6, 0))
-
-        # --- 6. 主行动条 ---
-        frm = ttk.Frame(self.root)
-        frm.pack(fill="x", padx=12, pady=(10, 12))
-        self.btn_upload = ttk.Button(
-            frm, text="开始上传", style="Primary.TButton", command=self._on_upload)
-        self.btn_upload.pack(side="left")
-        self.progress = ttk.Progressbar(frm, mode="determinate")
-        self.progress.pack(side="left", fill="x", expand=True, padx=12)
-        self.lbl_progress = ttk.Label(frm, text="")
-        self.lbl_progress.pack(side="left")
+        # 导出按钮浮在右上角，不再单占一行（此前那条只放一个按钮的空行）；
+        # 与「章节预览」页保持一致的整洁。x 负偏移让开右侧滚动条。
+        btn_export = ttk.Button(
+            tab_log, text="💾", width=2, style="EmojiIcon.TButton",
+            command=self._export_log)
+        btn_export.place(relx=1.0, rely=0.0, x=-26, y=8, anchor="ne")
+        btn_export.lift()
+        self._attach_tooltip(btn_export, "导出运行日志到文件")
 
         # 所有组件创建完毕，统一设置初始模式的面板可见性
         self._on_mode_change()
