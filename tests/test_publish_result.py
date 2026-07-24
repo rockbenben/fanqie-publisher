@@ -2,8 +2,9 @@
 """_wait_publish_result 状态机仿真测试（零依赖：不需要 pytest / playwright / 浏览器）。
 
 用虚拟时钟 + 假 page/locator 驱动 fanqie_upload 里的真实判定代码：
-- 10 个定向场景锁住已修复过的回归（按钮消失=成功、上限/错误分类优先级、
-  notification 角色分离、静默自愈、重点击预算守卫、超时语义）
+- 定向场景锁住已修复过的回归（按钮消失+导航确认=成功、消失但未确认=失败、
+  上限/错误分类优先级、notification 角色分离、静默自愈、重点击预算守卫、
+  超时语义）
 - 100 轮随机模糊验证不变量（必然终止、点击次数受限、预算守卫、结果与脚本一致）
 
 运行:  python tests/test_publish_result.py
@@ -69,10 +70,19 @@ class FakeBtn:
 
 
 class FakePage:
-    def __init__(self, clock, toasts_fn):
+    def __init__(self, clock, toasts_fn, nav_fn=None):
         self.clock = clock
         self.toasts_fn = toasts_fn  # (t) -> {"messages": [...], "notifications": [...]}
-        self.url = "https://fanqienovel.com/main/writer/test/publish"
+        # nav_fn: (t) -> bool，页面是否已导航离开编辑器（真机实测：提交成功
+        # 后 SPA 跳回 chapter-manage）。None = 一直停在编辑器。
+        # 2026-07-24 契约收紧后，按钮消失还须导航/接口确认才算成功。
+        self.nav_fn = nav_fn
+
+    @property
+    def url(self):
+        if self.nav_fn is not None and self.nav_fn(self.clock.t):
+            return "https://fanqienovel.com/main/writer/chapter-manage/123"
+        return "https://fanqienovel.com/main/writer/test/publish"
 
     async def evaluate(self, js):
         self.clock.advance(CDP)
@@ -103,7 +113,7 @@ def make_toasts_fn(messages=(), notifications=()):
 
 
 def run_case(visible_fn, messages=(), notifications=(), on_click=None,
-             timeout_ms=TIMEOUT_MS):
+             timeout_ms=TIMEOUT_MS, nav_fn=None):
     """跑一轮 _wait_publish_result，返回 (outcome, clock, btn)。
     outcome: "success" | ("limit", msg) | ("error", msg) | ("timeout", msg)
     """
@@ -111,7 +121,7 @@ def run_case(visible_fn, messages=(), notifications=(), on_click=None,
     real_time = fu.time
     fu.time = _TimeShim(clock)
     try:
-        page = FakePage(clock, make_toasts_fn(messages, notifications))
+        page = FakePage(clock, make_toasts_fn(messages, notifications), nav_fn)
         btn = FakeBtn(clock, visible_fn, on_click)
 
         async def go():
@@ -143,9 +153,9 @@ def check(name, cond, detail=""):
 def scenario_tests():
     print("[定向场景]")
 
-    # S1 按钮 1s 后消失 → 成功，零重点击
-    out, clk, btn = run_case(lambda t: t < 1.0)
-    check("S1 按钮消失=成功", out == "success" and not btn.clicks,
+    # S1 按钮 1s 后消失 + 页面导航离开编辑器（真实成功形态）→ 成功，零重点击
+    out, clk, btn = run_case(lambda t: t < 1.0, nav_fn=lambda t: t >= 1.0)
+    check("S1 按钮消失+导航=成功", out == "success" and not btn.clicks,
           f"out={out} clicks={btn.clicks}")
 
     # S2 上限 toast(message) → DailyLimitReached，1.5s 内，零重点击
@@ -175,7 +185,7 @@ def scenario_tests():
     check("S5c 超时消息含词库提示与URL",
           "词库" in out[1] and "当前URL" in out[1], out[1][:120])
 
-    # S6 点击被吞：重点击后 1s 按钮消失 → 成功且恰好 1 次重点击
+    # S6 点击被吞：重点击后 1s 按钮消失并导航 → 成功且恰好 1 次重点击
     state = {"hide_at": None}
 
     def on_click(t):
@@ -184,7 +194,9 @@ def scenario_tests():
     def visible(t):
         return state["hide_at"] is None or t < state["hide_at"]
 
-    out, clk, btn = run_case(visible, on_click=on_click)
+    out, clk, btn = run_case(
+        visible, on_click=on_click,
+        nav_fn=lambda t: state["hide_at"] is not None and t >= state["hide_at"])
     check("S6 静默自愈重点击成功", out == "success" and len(btn.clicks) == 1,
           f"out={out} clicks={btn.clicks}")
 
@@ -209,18 +221,26 @@ def scenario_tests():
                          (0.4, 3.4, "提交字数超出每日上限")))
     check("S9 双toast优先上限", out[0] == "limit", f"out={out}")
 
-    # S10 按钮一开始就不在 → 立即成功
-    out, clk, btn = run_case(lambda t: False)
+    # S10 按钮一开始就不在（页面已在 chapter-manage，如改期流程）→ 立即成功
+    out, clk, btn = run_case(lambda t: False, nav_fn=lambda t: True)
     check("S10 立即成功", out == "success" and clk.t < 0.5, f"t={clk.t:.2f}")
 
-    # S11 导航瞬态异常后按钮消失 → 成功（异常≠消失，但恢复后 False 即成功）
+    # S11 导航瞬态异常后按钮消失+URL已离开编辑器 → 成功
     def navigating(t):
         if 0.5 <= t < 1.2:
             raise RuntimeError("Execution context was destroyed")
         return t < 0.5  # 新页面上按钮不存在
 
-    out, clk, btn = run_case(navigating)
+    out, clk, btn = run_case(navigating, nav_fn=lambda t: t >= 0.5)
     check("S11 导航瞬态异常后成功", out == "success", f"out={out}")
+
+    # S12 假成功场景（2026-07-24 定时发布漏 151 章根因）：按钮消失但
+    # 无接口确认、页面仍停留在编辑器（对话框被异常关闭）→ 判失败触发重试
+    out, clk, btn = run_case(lambda t: t < 1.0)
+    check("S12 消失但未确认→失败",
+          out[0] == "error" and "未获确认" in out[1], f"out={out}")
+    check("S12b 宽限窗后及时失败(不拖到超时)",
+          5.0 <= clk.t <= 9.0, f"t={clk.t:.2f}")
 
 
 def fuzz_tests(rounds=100):
@@ -229,6 +249,8 @@ def fuzz_tests(rounds=100):
     for i in range(rounds):
         rng = random.Random(20260606 + i)
         btn_hide_at = rng.uniform(0.2, 20.0) if rng.random() < 0.5 else None
+        # 按钮消失后页面是否导航离开编辑器（真实成功 vs 对话框被异常关闭）
+        navigates = btn_hide_at is not None and rng.random() < 0.7
         messages, notifications = [], []
         has_limit = has_error = False
         if rng.random() < 0.3:
@@ -248,20 +270,27 @@ def fuzz_tests(rounds=100):
         def visible(t, h=btn_hide_at):
             return h is None or t < h
 
-        out, clk, btn = run_case(visible, messages, notifications)
+        def nav_fn(t, h=btn_hide_at, nv=navigates):
+            return nv and h is not None and t >= h
+
+        out, clk, btn = run_case(visible, messages, notifications, nav_fn=nav_fn)
         tag = out if isinstance(out, str) else out[0]
-        # 不变量
-        assert clk.t <= 18.0, f"fuzz#{i}: 未在预算内终止 t={clk.t:.2f}"
+        # 不变量（终止预算含未确认宽限窗：15s 超时 + 5s 宽限 + 轮询开销）
+        assert clk.t <= 22.0, f"fuzz#{i}: 未在预算内终止 t={clk.t:.2f}"
         assert len(btn.clicks) <= fu._RECLICK_MAX, f"fuzz#{i}: 重点击超限 {btn.clicks}"
         for ct in btn.clicks:
             assert ct <= 15.0 - fu._RECLICK_BUDGET_S + 0.6, \
                 f"fuzz#{i}: 预算守卫失效 click@{ct:.2f}"
         if tag == "success":
-            assert btn_hide_at is not None, f"fuzz#{i}: 按钮未消失却返回成功"
+            # 2026-07-24 契约收紧的核心不变量：仅"按钮消失"绝不再判成功，
+            # 必须伴随导航确认（本仿真无接口响应，接口确认由 verdict 套件覆盖）
+            assert btn_hide_at is not None and navigates, \
+                f"fuzz#{i}: 无导航确认却返回成功 hide={btn_hide_at} nav={navigates}"
         elif tag == "limit":
             assert has_limit, f"fuzz#{i}: 无上限脚本却判上限"
         elif tag == "error":
-            assert has_error, f"fuzz#{i}: 无错误脚本却判错误"
+            assert has_error or (btn_hide_at is not None and not navigates), \
+                f"fuzz#{i}: 无错误脚本且非未确认场景却判错误 out={out}"
         elif tag == "timeout":
             assert btn_hide_at is None or btn_hide_at > 14.0, \
                 f"fuzz#{i}: 按钮应消失({btn_hide_at})却超时"

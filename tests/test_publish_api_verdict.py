@@ -63,6 +63,13 @@ def interpret_unit_tests():
     v, m = f('{"code":-5001,"message":"提交字数超出每日上限"}')
     check("上限文案2归类daily_limit", v == "daily_limit", f"got={(v, m)}")
 
+    # 每月上限（2026-07-25 真机实测接口原文）→ 同样归 daily_limit（中止整批、
+    # 不重试）。此前漏在词库外被当普通 fail 重试，白占宝贵额度。
+    v, m = f('{"code":-5001,"message":"提交字数超出每月上限"}')
+    check("每月上限归类daily_limit", v == "daily_limit", f"got={(v, m)}")
+    v, m = f('{"code":-5001,"message":"已达本月发布字数上限"}')
+    check("本月上限归类daily_limit", v == "daily_limit", f"got={(v, m)}")
+
     # 非上限失败带文案
     v, m = f('{"code":-9,"message":"内容包含敏感词"}')
     check("普通失败带文案", v == "fail" and "敏感" in m, f"got={(v, m)}")
@@ -129,14 +136,24 @@ class FakeBtn:
 
 
 class FakePage:
-    """假 page：每次 evaluate(toast 轮询) 时，触发到点的 publish_article 响应。"""
+    """假 page：每次 evaluate(toast 轮询) 时，触发到点的 publish_article 响应。
 
-    def __init__(self, clock, responses):
+    nav_at: 虚拟时刻——页面导航离开编辑器、URL 变为 chapter-manage
+    （真机实测：提交成功后 SPA 跳回章节管理页）。None = 一直停在编辑器。
+    """
+
+    def __init__(self, clock, responses, nav_at=None):
         self.clock = clock
-        self.url = "https://fanqienovel.com/main/writer/test/publish"
+        self._nav_at = nav_at
         self._handler = None
         self._responses = list(responses)  # [(t, FakeResp), ...]
         self._fired = set()
+
+    @property
+    def url(self):
+        if self._nav_at is not None and self.clock.t >= self._nav_at:
+            return "https://fanqienovel.com/main/writer/chapter-manage/123"
+        return "https://fanqienovel.com/main/writer/test/publish"
 
     def _fire_due(self):
         for i, (t, resp) in enumerate(self._responses):
@@ -152,6 +169,9 @@ class FakePage:
 
     async def wait_for_timeout(self, ms):
         self.clock.t += ms / 1000
+        # 响应任意时刻都可能到达（含按钮消失后的确认宽限窗，
+        # 其间只调 wait_for_timeout 不调 evaluate）
+        self._fire_due()
         # 让 _on_response 里 create_task 的 body 补抓任务有机会运行
         await asyncio.sleep(0)
         await asyncio.sleep(0)
@@ -164,12 +184,12 @@ class FakePage:
         pass
 
 
-def run_sim(visible_fn, responses, timeout_ms=TIMEOUT_MS):
+def run_sim(visible_fn, responses, timeout_ms=TIMEOUT_MS, nav_at=None):
     clock = VirtualClock()
     real_time = fu.time
     fu.time = _TimeShim(clock)
     try:
-        page = FakePage(clock, responses)
+        page = FakePage(clock, responses, nav_at=nav_at)
         btn = FakeBtn(clock, visible_fn)
 
         async def go():
@@ -219,12 +239,61 @@ def integration_tests():
         [(0.5, FakeResp(URL, 200, REAL_FAIL_DUP))])
     check("I4 接口失败压过按钮消失", out[0] == "error", f"out={out}")
 
-    # I5 无接口响应（旧路径）→ 仍按按钮消失判成功，保持向后兼容
+    # ---- 2026-07-24 契约收紧：按钮消失 ≠ 成功 ----
+    # 定时发布 748 章漏 151 章的根因：对话框被异常关闭时按钮同样消失，
+    # 章节没提交却被记"成功"（正文只留在自动草稿）。新契约：按钮消失后
+    # 还须「接口 code=0」或「页面导航离开编辑器」二者其一确认。
+
+    # I5 按钮消失、无接口、未导航（假成功场景）→ 必须判失败触发重试
     out, clk, btn = run_sim(lambda t: t < 1.0, [])
-    check("I5 无接口回退按钮逻辑", out == "success", f"out={out}")
+    check("I5 消失但未确认→失败",
+          out[0] == "error" and "未获确认" in out[1], f"out={out}")
+
+    # I6 按钮消失、无接口、随后导航离开编辑器 → 成功（真实成功的形态）
+    out, clk, btn = run_sim(lambda t: t < 1.0, [], nav_at=1.5)
+    check("I6 消失+导航→成功", out == "success", f"out={out}")
+
+    # I7 按钮先消失，接口 code=0 在宽限窗内迟到 → 成功（在途响应不丢）
+    out, clk, btn = run_sim(
+        lambda t: t < 1.0,
+        [(2.0, FakeResp(URL, 200, REAL_SUCCESS))])
+    check("I7 迟到成功响应被采信", out == "success", f"out={out}")
+
+    # I8 按钮先消失，接口迟到 code!=0 → 失败（假成功被接口揭穿）
+    out, clk, btn = run_sim(
+        lambda t: t < 1.0,
+        [(2.0, FakeResp(URL, 200, REAL_FAIL_DUP))])
+    check("I8 迟到失败响应压过消失",
+          out[0] == "error" and "大段落重复" in out[1], f"out={out}")
+
+    # I9 按钮先消失，接口迟到上限 → DailyLimitReached（上层中止整批）
+    out, clk, btn = run_sim(
+        lambda t: t < 1.0,
+        [(2.0, FakeResp(URL, 200, '{"code":-5001,"message":"提交字数超出每日上限"}'))])
+    check("I9 迟到上限响应→limit", out[0] == "limit", f"out={out}")
+
+    # I10 改期流程形态：对话框开在 chapter-manage 页（非编辑器）→
+    # 按钮消失即导航条件天然满足，行为与旧契约一致
+    out, clk, btn = run_sim(lambda t: t < 1.0, [], nav_at=0.0)
+    check("I10 chapter-manage页消失即成功", out == "success", f"out={out}")
+
+
+def editor_url_unit_tests():
+    print("[_is_editor_url 纯函数]")
+    f = fu._is_editor_url
+    check("新建章URL是编辑器",
+          f("https://fanqienovel.com/main/writer/123/publish/?enter_from=newchapter_1"))
+    check("草稿URL是编辑器",
+          f("https://fanqienovel.com/main/writer/123/publish/7655447097667240472"))
+    check("chapter_id参数是编辑器", f("https://fanqienovel.com/x?chapter_id=1"))
+    check("chapter-manage不是编辑器",
+          not f("https://fanqienovel.com/main/writer/chapter-manage/123&%E4%B9%A6%E5%90%8D"))
+    check("空串不是编辑器", not f(""))
+    check("None不是编辑器", not f(None))
 
 
 if __name__ == "__main__":
     interpret_unit_tests()
+    editor_url_unit_tests()
     integration_tests()
     print(f"\nALL PASSED ({PASS} 断言)")

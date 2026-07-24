@@ -113,11 +113,14 @@ class DailyLimitReached(RuntimeError):
     """
 
 
-# 平台"每日字数上限"toast 文案不止一种（均为实测）:
+# 平台"发布字数上限"toast/接口文案不止一种（均为实测）:
 #   「已到达当日发布字数上限」 -- 新章节发布路径
 #   「提交字数超出每日上限」   -- 章节修改提交路径 (2026-06-06)
+#   「提交字数超出每月上限」   -- 接口 code!=0 返回 (2026-07-25 真机)
+# 每月/每日上限语义一致：额度耗尽，中止整批、记录剩余、重试无意义。
 # 用宽松正则匹配，避免平台换文案后检测失效。
-_DAILY_LIMIT_RE = re.compile(r"(每日|当日|今日|本日|单日|今天)[^，。;；]{0,12}上限")
+_DAILY_LIMIT_RE = re.compile(
+    r"(每日|当日|今日|本日|单日|今天|每月|本月|单月|月度)[^，。;；]{0,12}上限")
 # toast 含这些词 → 视为发布失败，立即抛错（不再傻等按钮超时）。
 # 注意 _classify_toasts 先全量匹配每日上限正则，故此处的"超出/上限"只接住
 # 非每日类的限制错误（如"标题字数超出限制"），按单章失败处理。
@@ -329,6 +332,54 @@ _RECLICK_TIMEOUT_MS = 2000    # 重点击的 actionability 超时——按钮处
 _RECLICK_BUDGET_S = 7.0       # 发起重点击所需的最少剩余预算（2s 点击 + 5s 观察）。
                               # 不点白点：点完就超时的重点击观察不到结果，
                               # 还会在新建章节流程留下重复提交风险
+_SUBMIT_CONFIRM_GRACE_S = 5.0  # 按钮消失后等待「提交确认」信号（接口 code /
+                               # 页面导航离开编辑器）的宽限窗
+
+
+def _is_editor_url(url) -> bool:
+    """判断 URL 是否仍是章节编辑器页。
+
+    编辑器页 URL 实测均含 /publish（新建章:
+    /main/writer/{book_id}/publish/?enter_from=newchapter_1；
+    草稿/编辑: .../publish/<id>），编辑已有章还可能带 chapter_id 参数。
+    chapter-manage 列表页两个特征都没有。
+    """
+    u = url or ""
+    return "/publish" in u or "chapter_id" in u
+
+
+async def _await_submit_confirmation(page, verdict_holder, *,
+                                     grace_s: float = _SUBMIT_CONFIRM_GRACE_S):
+    """「确认发布」按钮消失后，等待提交真正落地的确认信号。
+
+    按钮消失 ≠ 提交成功：对话框被异常关闭（Escape 残留、点击被吞后 DOM
+    重建、弹窗抢焦点）时按钮同样消失，而章节根本没提交。2026-07-24 实测
+    该假成功让 748 章的定时发布批量漏掉 151 章——日志全记"成功"，平台上
+    却无此章，正文只留在自动草稿里（草稿箱大量堆积是同一根因的另一面）。
+
+    确认信号二选一（宽限窗内轮询）：
+      a) publish_article 接口 code 判定已写入 verdict_holder（响应可能在途，
+         这也顺带修掉了"按钮消失抢在 body 补抓完成之前返回"的竞态）；
+      b) 页面已导航离开编辑器（实测提交成功后 SPA 跳回 chapter-manage；
+         修改排期流程本就在 chapter-manage 页上弹窗，天然立即满足）。
+    返回 verdict（'success'/'fail'/'daily_limit'）或 'navigated'；
+    宽限窗耗尽仍无任何信号返回 None，调用方按未提交处理（宁可失败重试，
+    重复章可见可删，静默漏章不可见——151 章即为代价）。
+    """
+    deadline = time.monotonic() + grace_s
+    while True:
+        v = verdict_holder.get("verdict")
+        if v:
+            return v
+        try:
+            url = page.url
+        except Exception:
+            url = ""
+        if url and not _is_editor_url(url):
+            return "navigated"
+        if time.monotonic() >= deadline:
+            return None
+        await page.wait_for_timeout(_PUBLISH_POLL_MS)
 
 
 async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None):
@@ -337,7 +388,10 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
     判定规则（实测）:
     - publish_article 接口回 code==0 → 成功；code!=0 → 失败/上限（权威信号，
       优先于按钮，见 _interpret_publish_response）
-    - 按钮消失 → 提交成功（接口无明确判定时的回退信号）
+    - 按钮消失 → 进入确认宽限窗（_await_submit_confirmation）：等接口 code
+      或页面导航离开编辑器；两者皆无 → 判未提交失败。按钮消失本身不再
+      直接算成功——对话框被异常关闭时按钮同样消失而章节没提交
+      （2026-07-24 定时发布批量漏 151 章的根因）
     - toast 含上限文案 → 抛 DailyLimitReached（上层中止整批、记录剩余章节）
     - 瞬态 toast 含失败/错误等 → 立即抛 RuntimeError（不再傻等超时）
     - 按钮在、且连续 5s 无瞬态 toast（常驻公告不算响应）→ 疑似点击被
@@ -424,7 +478,25 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
             except Exception:
                 visible = None  # 状态未知（页面跳转/上下文销毁等），不能当成功
             if visible is False:
-                return  # 按钮消失 = 提交成功（接口无明确判定时的回退信号）
+                # 按钮消失只是必要条件——还需接口 code=0 或页面导航离开
+                # 编辑器确认提交真正落地，否则按未提交失败（触发上层重试）。
+                # 详见 _await_submit_confirmation（2026-07-24 定时发布漏 151 章根因）。
+                outcome = await _await_submit_confirmation(page, verdict_holder)
+                if outcome in ("success", "navigated"):
+                    return
+                if outcome == "daily_limit":
+                    raise DailyLimitReached(
+                        f"当日发布字数已达上限: {verdict_holder.get('message', '')}")
+                if outcome == "fail":
+                    raise RuntimeError(
+                        f"发布失败，接口返回: {verdict_holder.get('message', '')}")
+                if api_probe:
+                    # 输出窗口期接口响应，供排查定时发布实际命中的提交端点
+                    logger.info(f"    窗口期接口响应: {'; '.join(api_probe[:8])}")
+                raise RuntimeError(
+                    "确认发布按钮已消失但提交未获确认"
+                    "（无接口 code=0 响应且页面仍停留在编辑器）——"
+                    "对话框疑似被异常关闭，按未提交处理")
             now = time.monotonic()
             if visible:
                 if toasts["messages"]:
