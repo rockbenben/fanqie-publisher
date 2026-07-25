@@ -348,6 +348,17 @@ def _is_editor_url(url) -> bool:
     return "/publish" in u or "chapter_id" in u
 
 
+def _is_publish_success_url(url) -> bool:
+    """判断 URL 是否是「提交成功后应落到」的页面：章节管理页。
+
+    只认 chapter-manage，不认"任意非编辑器页"——会话中途掉线会跳 /login，
+    /login 也离开了编辑器，若把它当成功就又制造静默漏章（正是本次要消灭的
+    bug 类）。故成功导航必须是显式的 chapter-manage，掉登录页/错误页一律
+    不算成功、按未提交处理触发重试。
+    """
+    return "chapter-manage" in (url or "")
+
+
 async def _await_submit_confirmation(page, verdict_holder, *,
                                      grace_s: float = _SUBMIT_CONFIRM_GRACE_S):
     """「确认发布」按钮消失后，等待提交真正落地的确认信号。
@@ -360,8 +371,10 @@ async def _await_submit_confirmation(page, verdict_holder, *,
     确认信号二选一（宽限窗内轮询）：
       a) publish_article 接口 code 判定已写入 verdict_holder（响应可能在途，
          这也顺带修掉了"按钮消失抢在 body 补抓完成之前返回"的竞态）；
-      b) 页面已导航离开编辑器（实测提交成功后 SPA 跳回 chapter-manage；
+      b) 页面已导航到 chapter-manage（实测提交成功后 SPA 跳回章节管理页；
          修改排期流程本就在 chapter-manage 页上弹窗，天然立即满足）。
+         只认 chapter-manage：会话掉线跳 /login 也离开了编辑器，但绝不能
+         当成功——否则又是静默漏章。见 _is_publish_success_url。
     返回 verdict（'success'/'fail'/'daily_limit'）或 'navigated'；
     宽限窗耗尽仍无任何信号返回 None，调用方按未提交处理（宁可失败重试，
     重复章可见可删，静默漏章不可见——151 章即为代价）。
@@ -375,7 +388,7 @@ async def _await_submit_confirmation(page, verdict_holder, *,
             url = page.url
         except Exception:
             url = ""
-        if url and not _is_editor_url(url):
+        if _is_publish_success_url(url):
             return "navigated"
         if time.monotonic() >= deadline:
             return None

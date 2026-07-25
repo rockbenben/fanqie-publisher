@@ -142,9 +142,10 @@ class FakePage:
     （真机实测：提交成功后 SPA 跳回章节管理页）。None = 一直停在编辑器。
     """
 
-    def __init__(self, clock, responses, nav_at=None):
+    def __init__(self, clock, responses, nav_at=None, nav_url=None):
         self.clock = clock
         self._nav_at = nav_at
+        self._nav_url = nav_url or "https://fanqienovel.com/main/writer/chapter-manage/123"
         self._handler = None
         self._responses = list(responses)  # [(t, FakeResp), ...]
         self._fired = set()
@@ -152,7 +153,7 @@ class FakePage:
     @property
     def url(self):
         if self._nav_at is not None and self.clock.t >= self._nav_at:
-            return "https://fanqienovel.com/main/writer/chapter-manage/123"
+            return self._nav_url
         return "https://fanqienovel.com/main/writer/test/publish"
 
     def _fire_due(self):
@@ -184,12 +185,12 @@ class FakePage:
         pass
 
 
-def run_sim(visible_fn, responses, timeout_ms=TIMEOUT_MS, nav_at=None):
+def run_sim(visible_fn, responses, timeout_ms=TIMEOUT_MS, nav_at=None, nav_url=None):
     clock = VirtualClock()
     real_time = fu.time
     fu.time = _TimeShim(clock)
     try:
-        page = FakePage(clock, responses, nav_at=nav_at)
+        page = FakePage(clock, responses, nav_at=nav_at, nav_url=nav_url)
         btn = FakeBtn(clock, visible_fn)
 
         async def go():
@@ -206,6 +207,9 @@ def run_sim(visible_fn, responses, timeout_ms=TIMEOUT_MS, nav_at=None):
             return (kind, msg), clock, btn
     finally:
         fu.time = real_time
+
+
+LOGIN_URL = "https://fanqienovel.com/login"
 
 
 def integration_tests():
@@ -277,6 +281,24 @@ def integration_tests():
     out, clk, btn = run_sim(lambda t: t < 1.0, [], nav_at=0.0)
     check("I10 chapter-manage页消失即成功", out == "success", f"out={out}")
 
+    # I11 会话掉线：按钮消失后 URL 跳 /login（离开了编辑器但≠chapter-manage）
+    # 绝不能当成功，否则又是静默漏章 → 判"未获确认"失败触发重试
+    out, clk, btn = run_sim(lambda t: t < 1.0, [], nav_url=LOGIN_URL, nav_at=1.5)
+    check("I11 掉登录页≠成功→失败",
+          out[0] == "error" and "未获确认" in out[1], f"out={out}")
+
+
+def success_url_unit_tests():
+    print("[_is_publish_success_url 纯函数]")
+    f = fu._is_publish_success_url
+    check("chapter-manage是成功页",
+          f("https://fanqienovel.com/main/writer/chapter-manage/123&%E4%B9%A6"))
+    check("编辑器页不是成功页",
+          not f("https://fanqienovel.com/main/writer/123/publish/?enter_from=x"))
+    check("登录页不是成功页", not f("https://fanqienovel.com/login"))
+    check("空串不是成功页", not f(""))
+    check("None不是成功页", not f(None))
+
 
 def editor_url_unit_tests():
     print("[_is_editor_url 纯函数]")
@@ -295,5 +317,6 @@ def editor_url_unit_tests():
 if __name__ == "__main__":
     interpret_unit_tests()
     editor_url_unit_tests()
+    success_url_unit_tests()
     integration_tests()
     print(f"\nALL PASSED ({PASS} 断言)")
