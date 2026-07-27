@@ -26,7 +26,8 @@ try:
     from fanqie_upload import (
         load_config,
         parse_md_file, parse_md_files, get_md_files, strip_md_formatting,
-        deduplicate_titles, compute_schedule, _validate_times,
+        deduplicate_titles, compute_schedule, compute_gap_schedule,
+        overdue_gap_nums, _validate_times,
         DailyLimitReached, _check_daily_limit, _wait_publish_result,
         _log_fail_list, _record_unprocessed,
         create_context, save_auth, close_browser_safely, goto_with_login_retry,
@@ -293,6 +294,7 @@ class FanqieGUI:
         self._timer_prerefresh_done = False  # 触发前 60 秒目录刷新是否已执行
         self._auto_run = False            # 守护同步弹窗阶段（定时触发时为 True）
         self._auto_run_pending = False    # 跨异步任务，供 _upload_done 抑制完成弹窗
+        self._backfill_pending = False    # 补漏点击时平台章节未加载 → 加载完自动续跑
 
         self._setup_style()
         self._build_ui()
@@ -781,6 +783,13 @@ class FanqieGUI:
         self.btn_upload = ttk.Button(
             frm, text="开始上传", style="Primary.TButton", command=self._on_upload)
         self.btn_upload.pack(side="left")
+        # 补漏章：把定时发布中段漏掉的章节按原排期插回正确位置（详见 _on_backfill）
+        self.btn_backfill = ttk.Button(
+            frm, text="补漏章", command=self._on_backfill)
+        self.btn_backfill.pack(side="left", padx=(8, 0))
+        self._attach_tooltip(
+            self.btn_backfill,
+            "检测平台缺章并按原排期补回（先刷新平台章节，再点此）")
         self.progress = ttk.Progressbar(frm, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=12)
         self.lbl_progress = ttk.Label(frm, text="")
@@ -1372,6 +1381,9 @@ class FanqieGUI:
         self.cmb_book.configure(state="disabled" if active else "readonly")
         self.cmb_account.configure(state="disabled" if active else "readonly")
         self.btn_open_manage.configure(state=ctrl_state)
+        # 补漏章按钮：上传/补漏期间禁用（避免同开第二个浏览器、并发写 AUTH_FILE）
+        if hasattr(self, "btn_backfill"):
+            self.btn_backfill.configure(state=ctrl_state)
         for rb in self._mode_radios:
             rb.configure(state=ctrl_state)
 
@@ -1392,6 +1404,8 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     def _on_book_changed(self):
         self._fetch_gen += 1
+        # 切换作品即放弃"待补漏"意图，避免新作品加载完后意外自动补漏
+        self._backfill_pending = False
         self._update_guidance()
 
         idx = self.cmb_book.current()
@@ -1580,6 +1594,9 @@ class FanqieGUI:
             return
 
         self._fetch_gen += 1  # 使正在进行的后台任务过期
+        # 切卷即放弃"待补漏"意图，避免旧卷加载结果作废后标志悬挂、
+        # 新卷键不存在时补漏按钮被 pending 守卫永久挡住
+        self._backfill_pending = False
 
         mode = self.mode_var.get()
         if mode in ("edit", "reschedule"):
@@ -1741,6 +1758,8 @@ class FanqieGUI:
             return  # 用户已切换作品，丢弃过期结果
 
         if error:
+            # 抓取失败：清掉待补漏标志，避免补漏按钮永远等一个不会来的加载
+            self._backfill_pending = False
             self.lbl_last_publish.configure(
                 text=f"获取章节列表失败: {error}（重新选择作品可重试）",
                 foreground="red")
@@ -1756,6 +1775,11 @@ class FanqieGUI:
         # 载入完成，恢复上传按钮
         if not self.uploading and self.mode_var.get() in ("edit", "reschedule"):
             self.btn_upload.configure(state="normal")
+        # 补漏点击时平台章节尚未加载 → 加载完成后自动续跑补漏（省去二次点击）
+        if self._backfill_pending and not self.uploading:
+            self._backfill_pending = False
+            self._on_backfill()
+            return
         self._refresh_preview()
 
     # -----------------------------------------------------------------------
@@ -3450,6 +3474,238 @@ class FanqieGUI:
 
             except Exception as e:
                 logger.error(f"修改排期异常: {e}")
+                self._after(0, self._upload_done, -1, -1)
+
+        self.worker.submit(task())
+
+    # -----------------------------------------------------------------------
+    # 补漏章：把定时发布中段漏掉的章节，按番茄原排期插回正确位置
+    # -----------------------------------------------------------------------
+    def _on_backfill(self):
+        """检测平台缺章并按原排期节奏补回。
+
+        缺章根因是定时发布"假成功"（已修）：日志记成功但平台无此章、正文只留
+        草稿。本按钮抓平台真实章节 → 算出每个缺口应插入的槽位（compute_gap_
+        schedule，与 CLI 工具 tools/republish 共用核心）→ 用本地正文补发。
+        每次都按平台真实状态算，已补的自动跳过，重复点不会产生重复章。
+        """
+        if self.uploading or self._login_in_progress:
+            self._notify("warning", "提示", "有任务正在进行，请先完成或停止。")
+            return
+        if not AUTH_FILE.exists():
+            self._notify("warning", "提示", "请先登录")
+            return
+        idx = self.cmb_book.current()
+        if idx < 0 or not self.books:
+            self._notify("warning", "提示", "请先刷新并选择作品")
+            return
+        if not self.parsed_chapters:
+            self._notify("warning", "提示",
+                         "请先选择章节文件夹（补漏需要本地正文）")
+            return
+        book_id = self.books[idx]["bookId"]
+        book_name = self.books[idx]["name"]
+
+        # 需要平台章节（含日期）。用与修改模式相同的缓存；未加载就触发抓取，
+        # 并置 _backfill_pending，让加载完成的回调自动续跑补漏（省去二次点击）。
+        # 关键：以「键是否存在」判定是否已加载，而非值真假——平台 0 章会缓存成
+        # 空列表 []，若按 `not rows` 会再次触发抓取，而抓取命中缓存又同步回调、
+        # 回调再自动续跑，形成死循环。键存在即视为已加载（空列表交给下方按
+        # "无缺口"正常处理）。
+        cache_key = self._chapter_cache_key(book_id)
+        if cache_key not in self._platform_chapters_cache:
+            if self._backfill_pending:
+                return  # 已在加载中，忽略重复点击（不禁用按钮，避免卡死在禁用态）
+            self._backfill_pending = True
+            self._set_preview("正在获取平台章节列表…加载完成后将自动开始补漏章。")
+            self._fetch_platform_chapters_for_edit()
+            return
+        # 走到这里说明缓存已就绪：清掉可能残留的待补漏标志
+        self._backfill_pending = False
+        rows = self._platform_chapters_cache[cache_key]
+
+        # 计算缺口排期（纯函数，主线程）
+        assign, warnings = compute_gap_schedule(rows)
+        for w in warnings:
+            logger.warning(f"补漏: {w}")
+        if not assign:
+            self._notify("info", "无缺口",
+                         "平台未检测到中段缺章（或未抓到带章节号的章节）。")
+            return
+
+        # 映射本地文件: 章号 -> (num, title, content)
+        local = {}
+        for num, title, content in self.parsed_chapters:
+            if num is None:
+                continue
+            try:
+                local[int(num)] = (num, title, content)
+            except (TypeError, ValueError):
+                pass
+        entries = []          # (num, date, time, (num,title,content))
+        no_file = []
+        for num in sorted(assign):
+            d, t = assign[num]
+            if num in local:
+                entries.append((num, d, t, local[num]))
+            else:
+                no_file.append(num)
+        if not entries:
+            self._notify(
+                "warning", "无法补",
+                f"检测到 {len(assign)} 个缺口，但本地都没有对应章节文件。\n"
+                f"请确认选对了内容目录。")
+            return
+
+        # 可选：限制本次补发数量（分月控量，避免一次撞每月字数上限）
+        default_limit = min(len(entries), 300)
+        limit = simpledialog.askinteger(
+            "补漏章",
+            f"平台缺 {len(assign)} 章，本地有文件可补 {len(entries)} 章。\n"
+            f"本次最多补多少章？（分月控量用；留默认即可）",
+            initialvalue=default_limit, minvalue=1,
+            maxvalue=len(entries), parent=self.root)
+        if limit is None:
+            return  # 用户取消
+        entries = entries[:limit]
+
+        # 过期缺口检测：原定排期时刻已过 → 番茄可能拒绝定时到过去，且该缺口
+        # 大概率已是读者可见的断档，应改用立即发布尽快补（此处仅醒目告警）。
+        now = datetime.now()
+        overdue = overdue_gap_nums(
+            assign, (now.strftime("%Y-%m-%d"), now.strftime("%H:%M")))
+        overdue_in_batch = [n for n, _, _, _ in entries if n in set(overdue)]
+
+        # 预览写入面板
+        preview = [f"补漏章：本次将补 {len(entries)} 章（平台共缺 {len(assign)} 章）"]
+        if no_file:
+            preview.append(f"⚠ 本地缺文件、跳过 {len(no_file)} 章: "
+                           f"{self._compress_nums(no_file)}")
+        if overdue_in_batch:
+            preview.append(
+                f"⚠ 排期已过期 {len(overdue_in_batch)} 章: "
+                f"{self._compress_nums(overdue_in_batch)}"
+                f"（番茄可能拒绝定时到过去，建议这些改用立即发布尽快补）")
+        preview.append("-" * 60)
+        for num, d, t, _ in entries[:200]:
+            preview.append(f"  第{num}章 -> {d} {t}")
+        if len(entries) > 200:
+            preview.append(f"  ... 共 {len(entries)} 章")
+        self._set_preview("\n".join(preview))
+
+        msg = (f"即将向「{book_name}」补发 {len(entries)} 章（按原排期插回缺口）。\n"
+               f"时间范围: {entries[0][1]} {entries[0][2]} ~ "
+               f"{entries[-1][1]} {entries[-1][2]}\n"
+               f"撞每月/每日字数上限会自动中止，下月可再点补漏续补。\n")
+        if overdue_in_batch:
+            msg += (f"\n⚠ 其中 {len(overdue_in_batch)} 章原定排期已过期"
+                    f"（番茄可能拒绝，建议先在平台或用「立即发布」补这些）。\n")
+        msg += "是否开始？"
+        if not self._ask_yes_no("确认补漏章", msg):
+            return
+
+        self._on_backfill_run(book_id, entries)
+
+    @staticmethod
+    def _compress_nums(nums):
+        """把章号列表压成区间字符串，如 [1,2,3,5] -> '1-3,5'。"""
+        uniq = sorted(set(nums))
+        parts, i = [], 0
+        while i < len(uniq):
+            j = i
+            while j + 1 < len(uniq) and uniq[j + 1] == uniq[j] + 1:
+                j += 1
+            parts.append(str(uniq[i]) if i == j else f"{uniq[i]}-{uniq[j]}")
+            i = j + 1
+        return ",".join(parts)
+
+    def _on_backfill_run(self, book_id, entries):
+        """执行补漏：逐章新建→填正文→按各自槽位定时发布（复用修复后的流程）。"""
+        self._set_uploading(True)
+        self.progress["maximum"] = max(len(entries), 1)
+        self.progress["value"] = 0
+        self._install_log_handler()
+        use_ai = self.use_ai_var.get()
+        max_retries = self._cfg.get("max_retries", 2)
+        items = list(entries)
+
+        async def task():
+            success, failed = 0, 0
+            fail_list = []
+            try:
+                url = NEW_CHAPTER_URL_TPL.format(book_id=book_id)
+                async with async_playwright() as p:
+                    browser, context = await create_context(p, headless=False)
+                    page = await context.new_page()
+                    await page.goto(url)
+                    try:
+                        await wait_for_editor_ready(page)
+                    except Exception as e:
+                        logger.error(f"无法进入编辑器（{e}），请检查登录状态。")
+                        await close_browser_safely(browser)
+                        self._after(0, self._upload_done, 0, 0)
+                        return
+
+                    total = len(items)
+                    for i, (num, date_str, time_str, parsed) in enumerate(items):
+                        if self._cancel_requested:
+                            logger.info("用户取消补漏。")
+                            for r in items[i:]:
+                                fail_list.append((r[0], "用户取消，未处理"))
+                                failed += 1
+                            break
+                        cnum, title, content = parsed
+                        logger.info(f"[{i+1}/{total}] 第{num}章 {title}"
+                                    f" -> {date_str} {time_str}")
+                        ok = False
+                        daily_limit = False
+                        for attempt in range(1, max_retries + 2):
+                            try:
+                                await page.goto(url)
+                                await wait_for_editor_ready(page)
+                                await fill_chapter(page, cnum, title, content)
+                                await publish_scheduled(
+                                    page, date_str, time_str, use_ai=use_ai)
+                                logger.info(f"    -> 定时发布成功 {date_str} {time_str}")
+                                ok = True
+                                break
+                            except DailyLimitReached as ex:
+                                logger.warning(f"    达发布字数上限（{ex}），中止整批")
+                                fail_list.append((num, f"字数上限:{ex}"))
+                                daily_limit = True
+                                break
+                            except Exception as ex:
+                                if attempt <= max_retries:
+                                    logger.warning(f"    第{attempt}次失败: {ex}，重试")
+                                    await page.wait_for_timeout(2000)
+                                else:
+                                    logger.error(f"    失败: {ex}")
+                                    fail_list.append((num, str(ex)[:120]))
+                        if daily_limit:
+                            failed += 1
+                            for r in items[i + 1:]:
+                                fail_list.append((r[0], "字数上限，未处理"))
+                                failed += 1
+                            break
+                        if ok:
+                            success += 1
+                        else:
+                            failed += 1
+                        self._after(0, self._update_progress, i + 1, total)
+
+                    await save_auth(context)
+                    await close_browser_safely(browser)
+
+                    logger.info(f"{'='*40}")
+                    logger.info(f"  补漏完成! 成功: {success}  失败: {failed}")
+                    if fail_list:
+                        nums = [n for n, _ in fail_list]
+                        logger.info(f"  未补章号: {self._compress_nums(nums)}"
+                                    f"（可再次点「补漏章」续补）")
+                    logger.info(f"{'='*40}")
+                    self._after(0, self._upload_done, success, failed)
+            except Exception as e:
+                logger.error(f"补漏异常: {e}")
                 self._after(0, self._upload_done, -1, -1)
 
         self.worker.submit(task())

@@ -1463,17 +1463,20 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
                 }
             }
 
-            allChapters.push({ title, chapterNum, editUrl, status, rowIndex: allChapters.length });
+            // 发布/排期日期（补漏章按此推算每个缺口的插入槽位）
+            const dm = row.textContent.match(dateRe);
+            const rowDate = dm ? dm[1].replace(/\//g, '-') : null;
+            const rowTime = dm ? dm[2] : null;
+
+            allChapters.push({ title, chapterNum, editUrl, status,
+                               date: rowDate, time: rowTime,
+                               rowIndex: allChapters.length });
             newCount++;
 
-            // 发布日期
-            const dm = row.textContent.match(dateRe);
             if (dm) {
-                const d = dm[1].replace(/\//g, '-');
-                const t = dm[2];
-                const pk = d + ' ' + t;
+                const pk = rowDate + ' ' + rowTime;
                 if (pk > lastPubKey) {
-                    lastPub = { date: d, time: t, chapter: title };
+                    lastPub = { date: rowDate, time: rowTime, chapter: title };
                     lastPubKey = pk;
                 }
             }
@@ -1835,6 +1838,106 @@ def compute_schedule(
         logger.warning(
             "排期：个别时刻冲突/临近午夜，已自动微调以保证同日时刻唯一且顺序不乱。")
     return fixed
+
+
+# ---------------------------------------------------------------------------
+# 缺章补发：把定时发布中段漏掉的章节，按原排期节奏插回正确位置
+# ---------------------------------------------------------------------------
+# 番茄每天 9 个定时槽位（与原排期一致）。缺口 = 这些槽位里空出来的位置。
+GAP_SLOTS = ["07:00", "07:01", "07:02", "12:00", "12:01", "12:02",
+             "20:00", "20:01", "20:02"]
+
+
+def _gap_grid_between(P, S):
+    """P、S 为 (date_str, time_str)。返回 P、S 之间(开区间)的所有 9 槽位。"""
+    dp = datetime.strptime(P[0], "%Y-%m-%d").date()
+    ds = datetime.strptime(S[0], "%Y-%m-%d").date()
+    out = []
+    d = dp
+    while d <= ds:
+        ds_iso = d.strftime("%Y-%m-%d")
+        for t in GAP_SLOTS:
+            cur = (ds_iso, t)
+            if P < cur < S:
+                out.append(cur)
+        d += timedelta(days=1)
+    return out
+
+
+def _gap_interp_between(P, S, n):
+    """退化兜底：P、S 之间均匀插 n 个时间点（分钟粒度），保证非递减、不越界。
+
+    窗口太窄（分钟粒度塞不下 n 个不同分钟）时允许同分钟重复——番茄按章节号
+    排序，同分钟不影响阅读顺序；但绝不越出 [P, S] 侵占邻章的时间。
+    """
+    a = datetime.strptime(f"{P[0]} {P[1]}", "%Y-%m-%d %H:%M")
+    b = datetime.strptime(f"{S[0]} {S[1]}", "%Y-%m-%d %H:%M")
+    total = (b - a).total_seconds()
+    out = []
+    for k in range(1, n + 1):
+        dt = a + timedelta(seconds=total * k / (n + 1))
+        dt = dt.replace(second=0, microsecond=0)
+        # 夹回开区间 [P, S]，防止四舍五入落到邻章时刻之外
+        cur = (dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M"))
+        cur = max(P, min(cur, S))
+        out.append(cur)
+    return out
+
+
+def compute_gap_schedule(rows):
+    """从平台章节行计算「缺口章节」的补发排期。
+
+    rows: 平台抓取的章节行，每项含 chapterNum / date / time（见 _EXTRACT_ALL_JS）。
+    缺口 = [1..平台最大章号] 中平台上不存在的章号。每个连续缺口段用 9 槽位网格
+    在前后邻章之间填空（槽位数≠缺章数时退化为均匀插值并告警），保证插到正确
+    阅读位置、补发时刻严格单调（同段内非递减）。
+
+    返回 (assign, warnings): assign={章号:(date,time)}；warnings=[str]。
+    """
+    byn = {r["chapterNum"]: r for r in rows if r.get("chapterNum") is not None}
+    if not byn:
+        return {}, ["平台未解析到任何带章节号的章节"]
+    mx = max(byn)
+    missing = [i for i in range(1, mx + 1) if i not in byn]
+    # 连续段
+    runs = []
+    i = 0
+    while i < len(missing):
+        j = i
+        while j + 1 < len(missing) and missing[j + 1] == missing[j] + 1:
+            j += 1
+        runs.append((missing[i], missing[j]))
+        i = j + 1
+
+    assign, warnings = {}, []
+    for a, b in runs:
+        pa, pb = byn.get(a - 1), byn.get(b + 1)
+        if (not pa or not pb or not pa.get("date") or not pb.get("date")
+                or not pa.get("time") or not pb.get("time")):
+            warnings.append(f"段 {a}-{b}: 前/后邻章缺日期或时间，跳过（需手动处理）")
+            continue
+        P = (pa["date"], pa["time"])
+        S = (pb["date"], pb["time"])
+        need = b - a + 1
+        slots = _gap_grid_between(P, S)
+        if len(slots) != need:
+            warnings.append(
+                f"段 {a}-{b}: 槽位数({len(slots)})≠缺章数({need})，"
+                f"改用均匀插值（{P[0]} {P[1]} ~ {S[0]} {S[1]}）")
+            slots = _gap_interp_between(P, S, need)
+        for k, ch in enumerate(range(a, b + 1)):
+            assign[ch] = slots[k]
+    return assign, warnings
+
+
+def overdue_gap_nums(assign, now):
+    """返回补发时刻已 ≤ now 的缺口章号（升序）。now = (date_str, time_str)。
+
+    这些缺口的原定排期时刻已过：①番茄通常拒绝把定时发布设到过去；②该缺口
+    大概率已是读者可见的断档（前后邻章都已发布）。应尽快改用「立即发布」补上，
+    而不是继续按已过去的时刻定时。调用方（GUI/CLI）据此醒目告警。
+    """
+    return sorted(n for n, (d, t) in assign.items() if (d, t) <= tuple(now))
 
 
 # 按【精确文本】点击可见元素：用于选项不是标准 <button> 的弹窗（如内容检测方式
