@@ -43,6 +43,19 @@ if not defined PYEXE (
     exit /b 1
 )
 
+REM ---- check Python version (code uses PEP 604 "X | None" annotations: needs 3.10+) ----
+%PYEXE% -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
+if errorlevel 1 (
+    if "%MODE%"=="hidden" (
+        powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Python 3.10+ is required (found an older version). Download: https://www.python.org/downloads/', 'fanqie') | Out-Null"
+    ) else (
+        echo [ERROR] Python 3.10+ is required ^(found an older version^).
+        echo         Download: https://www.python.org/downloads/
+        pause
+    )
+    exit /b 1
+)
+
 REM ---- check/install Python deps (pip show is fast, no browser init) ----
 REM In hidden mode an install pops its OWN visible console so progress is seen;
 REM when nothing is missing, no window ever appears.
@@ -88,11 +101,11 @@ REM ---- surface abnormal exits (no silent death behind a hidden console) ----
 if %EXITCODE% neq 0 (
     if "%MODE%"=="hidden" (
         >>"%LOGFILE%" echo.
-        >>"%LOGFILE%" echo [Program exited abnormally, code %EXITCODE%] Screenshot this window for the developer.
+        >>"%LOGFILE%" echo [Program exited abnormally, code %EXITCODE%] Send this log file to the developer.
         start "" notepad "%LOGFILE%"
     ) else (
         echo.
-        echo [Program exited abnormally, code %EXITCODE%] See error above; screenshot it for me.
+        echo [Program exited abnormally, code %EXITCODE%] See the error above; send it to the developer.
         pause
     )
 )
