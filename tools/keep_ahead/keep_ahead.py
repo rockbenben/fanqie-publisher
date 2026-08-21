@@ -113,7 +113,11 @@ def plan_refill(items, num2path, *, days_ahead=DEFAULT_DAYS_AHEAD, per_day=9,
     """
     today = today or datetime.now().date()
     tail = queue_tail_date(items, today=today)
-    start = tail + timedelta(days=1)
+    # 夹到今天: tail 落在过去是真实情况（队列已经排干、或有待发布章的
+    # 排期早就过了平台却没发出去），但起排日不能跟着回到过去——平台会拒
+    # 掉定时到过去的章，而 --daily 没有 GUI 那个「日期已过去」确认框：
+    # 第一章被拒 → 失败即停 → 那晚一章都没排上，而且每晚都会重现。
+    start = max(tail + timedelta(days=1), today)
 
     present = {fu.chapter_title_num(x.get("title")) for x in items}
     present.discard(None)
@@ -128,7 +132,9 @@ def plan_refill(items, num2path, *, days_ahead=DEFAULT_DAYS_AHEAD, per_day=9,
     if all_remaining:
         nums = todo
     else:
-        need_days = (today + timedelta(days=days_ahead) - tail).days
+        # 按夹过的 start 算，不然 tail 在过去时会把已经过去的那几天也算进来，
+        # 一口气排出超过目标深度的量。
+        need_days = (today + timedelta(days=days_ahead) - start).days + 1
         if need_days <= 0:
             return [], start, 0, tail, gaps
         nums = todo[:need_days * per_day]
@@ -307,6 +313,16 @@ def demo():
     assert tail == date(2026, 8, 22), tail
     assert days == 1 and start == date(2026, 8, 23), (days, start)
     assert nums == [5, 6], nums                      # 平台最大 4，接着排 5、6
+
+    # 待发布章的排期已经过去（平台卡住、或缓存行的日期早过了）：
+    # tail 落在过去是事实，但起排日不能跟着回到过去——平台会拒掉定时到
+    # 过去的章，而 --daily 没有确认框：第一章被拒 → 失败即停 → 那晚白跑。
+    items = [pub(1), pend(2, 15), pend(3, 16)]        # 排期都在 TODAY(8-20) 之前
+    nums, start, days, tail, _g = plan_refill(items, local, days_ahead=3, per_day=2,
+                                              today=TODAY)
+    assert tail == date(2026, 8, 16), tail            # tail 照实报过去
+    assert start == TODAY, start                      # 但起排日夹到今天
+    assert days == 4 and nums == [4, 5, 6, 7, 8, 9, 10, 11], (days, nums)
 
     # 队列已够深 → 什么都不补（幂等：一天跑几次都一样）
     deep = [pub(1), pend(2, 25)]

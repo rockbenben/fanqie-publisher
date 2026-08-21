@@ -1213,6 +1213,18 @@ async def settle_page(page, timeout=None):
         pass
 
 
+def _at_target_path(current_url, target_url) -> str:
+    """current_url 是否已经到了 target_url 那个页（只比 path，不比 query）。
+
+    宽松匹配: 目标 path 是当前 path 的前缀即可——SPA 可能在后面追段，
+    但不会把你送到一个不相干的 path。宁可放过一个变形，也不能把正常导航判成失败。
+    """
+    from urllib.parse import urlsplit
+    cur = urlsplit(current_url or "").path.rstrip("/")
+    want = urlsplit(target_url or "").path.rstrip("/")
+    return bool(want) and (cur == want or cur.startswith(want + "/"))
+
+
 async def goto_with_login_retry(page, url, *, wait_until="load"):
     """打开作家后台页面，并区分"会话真失效"与"误跳登录页"。
 
@@ -1221,8 +1233,14 @@ async def goto_with_login_retry(page, url, *, wait_until="load"):
     会话误判为未登录并跳转 /login。重试一次即可区分：瞬态失败第二次就能
     进入目标页，真失效则两次都被重定向。
 
-    返回 True=已进入目标页；False=两次均被重定向到登录页（会话失效）。
-    goto 超时不视为失败——页面可能已部分加载，以最终 URL 为准。
+    返回 True=已进入目标页；False=没进去（被重定向到登录页，或两次都没到目标页）。
+
+    goto 超时本身不算失败（页面可能已部分加载），但**必须确认真的到了目标页**：
+    自从 goto 加上超时上限后，它可能在导航**提交之前**就超时，此时 page.url
+    还停在上一个页面——而“不在登录页”并不等于“到了目标页”。早先只看
+    /login 的写法会在旧页面上报成功，调用方接着就在错页上干活：
+    fetch_chapter_items 拿到陈旧签名或直接报“没抓到 chapter_list”，而后者在
+    run_creation_batch 里等于整批静默关掉逐章防漏章的守卫。
 
     注意: SPA 的鉴权跳转是异步的——domcontentloaded 时 URL 往往还停在
     目标页，立刻检查会漏掉随后才发生的 /login 跳转（实测如此）。所以
@@ -1243,7 +1261,16 @@ async def goto_with_login_retry(page, url, *, wait_until="load"):
             except PWTimeout:
                 pass  # 观察窗内没跳登录页 = 真的进来了
         if "/login" not in page.url:
-            return True
+            # 到没到目标页看 path（忽略 query：SPA 会自己改 query）。
+            if _at_target_path(page.url, url):
+                return True
+            if attempt == 1:
+                await page.wait_for_timeout(1000)
+                continue
+            logger.error(
+                f"  导航未到达目标页（现在在 {page.url}）——多为 goto 在提交前超时，"
+                f"可适当调大 config.json 里的 browser_timeout")
+            return False
         if attempt == 1:
             await page.wait_for_timeout(3000)
     return False
@@ -2197,6 +2224,8 @@ def chapter_title_num(t):
 # 反过来制造大规模假漏章（对账要靠这份数据当真相，宁可报错也不能给半份）。
 _FETCH_ITEMS_JS = r"""async (u) => {
     const out = [];
+    const seen = new Set();
+    let total = null;
     for (let pg = 0; pg < 60; pg++) {
         // replace 匹配不上是静默 no-op：那样每一轮都在取同一页（或服务端默认
         // 页大小），第 0 页短于预期就被当成"全书就这么多"。对账拿这份当真相，
@@ -2219,13 +2248,32 @@ _FETCH_ITEMS_JS = r"""async (u) => {
                            ' ' + (j.message || '')};
         }
         if (!j || !j.data) return {error: '第' + pg + '页响应无 data 字段'};
+        if (typeof j.data.total === 'number') total = j.data.total;
         const list = j.data.item_list || [];
         if (!list.length) break;          // 真的翻完了
-        out.push(...list.map(x => ({index: x.index, title: x.title,
-            display_status: x.display_status, timer_time: x.timer_time,
-            create_time: x.create_time, item_id: x.item_id,
-            cant_modify_reason: x.cant_modify_reason})));
-        if (list.length < 100) break;     // 不满一页=最后一页，不必再请求
+        // 按 item_id 去重再累加：既能拼出全量，也能发现"服务端没理会 page_index、
+        // 每页都返回同一批"这种情况（下面 grew===0 就会停）。
+        let grew = 0;
+        for (const x of list) {
+            if (x.item_id !== undefined && seen.has(x.item_id)) continue;
+            if (x.item_id !== undefined) seen.add(x.item_id);
+            out.push({index: x.index, title: x.title,
+                display_status: x.display_status, timer_time: x.timer_time,
+                create_time: x.create_time, item_id: x.item_id,
+                cant_modify_reason: x.cant_modify_reason});
+            grew++;
+        }
+        if (!grew) break;                 // 整页都是见过的 = 分页没生效，别空转
+        // 这里**不能**用 list.length < 100 提前收工：平台会把页大小压到请求值
+        // 以下（草稿接口实测 page_count>=50 就 code=-100），那样第 0 页就"短"，
+        // 整本书只取到半份。对账拿这份当真相，半份数据会把几百章报成"平台上
+        // 没有"，用户照单补传就是几百章永远移不回去的重复。多发一个空页请求
+        // 是这里唯一划算的代价。
+    }
+    // 平台给了总数就必须对上——宁可报错也不能给半份（这是本文件的一贯原则）。
+    if (total !== null && out.length < total) {
+        return {error: '章节列表只取到 ' + out.length + '/' + total +
+                       ' 条（分页被平台截断？），拒绝返回半份数据'};
     }
     return {items: out};
 }"""
@@ -2658,6 +2706,14 @@ _DRAFT_LIST_JS = r"""async ([u, per]) => {
         out.push(...list.map(x => ({title: x.title, word_number: x.word_number,
                                     item_id: x.item_id})));
         if (list.length < per) break;
+    }
+    // 平台自己报了总数就必须对上。per 是调过的（实测 page_count>=50 会 code=-100），
+    // 所以短页收尾通常是对的；但万一平台又把页大小往下压，上面那句就会在第 0 页
+    // 收工、只返回半份。clean_drafts 的安全检查拿这份逐条比对本地源文件——半份
+    // 意味着没被看见的那些草稿从未参与检查，而 --force 会照删不误。
+    if (typeof total === 'number' && out.length < total) {
+        return {error: '草稿列表只取到 ' + out.length + '/' + total +
+                       ' 条（分页被平台截断？），拒绝返回半份数据'};
     }
     return {drafts: out, total: total};
 }"""

@@ -172,11 +172,6 @@ def print_plan(items, plan, skipped, num2path):
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 
 
-def start_daily_log():
-    """--daily 的日志接管，外壳在 fanqie_upload（多个定时作业共用一份）。"""
-    return fu.start_task_log(LOG_DIR, "remap")
-
-
 
 
 def needs_attention(rep, plan, *, now_ts=None):
@@ -201,7 +196,7 @@ def needs_attention(rep, plan, *, now_ts=None):
     return False, ""
 
 
-def margin_days(items, plan, *, now_ts=None):
+def margin_days(plan, *, now_ts=None):
     """余量: 发布前沿追上"第一个还没改对的位置"还有多少天。
 
     这是本工具真正要盯的指标——不是"还剩多少章要改"，而是"还有多少天可改"。
@@ -425,7 +420,7 @@ async def main_async(args):
             # 一章都改不动，而发布前沿照走。必须当场算余量够不够撑到下月。
             hit_monthly = any(fu.is_monthly_limit(w) for _i, w in fail)
             if hit_monthly:
-                md, _pos = margin_days(fresh, left)
+                md, _pos = margin_days(left)
                 today = datetime.now().date()
                 days_left = calendar.monthrange(today.year, today.month)[1] - today.day
                 bad, msg = monthly_limit_outlook(days_left, md)
@@ -547,9 +542,9 @@ def demo():
     assert monthly_limit_outlook(10, None) == (False, "")
 
     # 余量天数取"第一个未改对位置"的发布时刻
-    md, pos = margin_days([], [{"index": 9, "timer": now + 48 * H}], now_ts=now)
+    md, pos = margin_days([{"index": 9, "timer": now + 48 * H}], now_ts=now)
     assert abs(md - 2.0) < 0.01 and pos == 9, (md, pos)
-    assert margin_days([], [{"index": 9, "timer": 0}], now_ts=now) == (None, None)
+    assert margin_days([{"index": 9, "timer": 0}], now_ts=now) == (None, None)
 
     # --- 该不该惊动人 ---
     b_hit = {"in_window": [{"num": 5, "index": 9, "left_h": 12.0}],
