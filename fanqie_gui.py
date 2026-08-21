@@ -93,9 +93,9 @@ SECTION_HELP = {
                 "· 修改内容：用本地文件替换已发布章节的正文\n"
                 "· 修改排期：只改已有章节的发布时间，不动正文\n"
                 "所有模式都能「按章节号筛选」，只操作指定范围（如 1,3,5-10）的章节。\n"
-                "定时发布还可勾「自动接续」：不用自己填起始日期，工具读平台队列排到哪天、"
-                "从次日接着往后排；旁边「排到」填 N 表示只补到「今天+N 天」，"
-                "留空就把本地剩下的全排上去。",
+                "定时发布还可勾「接着上次往后排」：不用自己填起始日期、也不用挑哪几章——"
+                "工具去平台看已经排到哪天，从次日接着往后排，且只发平台上还没有的章。"
+                "旁边「排到 N 天后」留空就全排上去，填 N 则只排到那天为止。",
     "定时执行": "设定一个未来时刻（格式 YYYY-MM-DD HH:MM），到点自动执行当前所选操作（仅一次），"
                 "适合无人值守（比如半夜自动上传）。到点若有任务在跑会等它结束再执行，"
                 "触发前会重新读取一次章节目录。",
@@ -261,7 +261,11 @@ class FanqieGUI:
         # 还高的窗口，标题栏被顶出屏幕外、底部按钮压在任务栏下面，两头都够不着。
         self.root.update_idletasks()
         _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        _w = max(900, min(1280, _sw - 80))
+        # 上限 1400 是按**版式的自然宽度**定的，不是按某块屏幕：选项行需 534px，
+        # 双栏卡片与预览行到 1400 已经宽松，再宽主要是加空白。大屏用户拖一下
+        # 就行，而开箱就占满屏幕对小桌面是冒犯。减 80 给边框：1366 的本子
+        # 算出 1286，不比旧值差。下限 1000 与 minsize 一致。
+        _w = max(1000, min(1400, _sw - 80))
         # 下限 680 与 minsize 一致；预留 100 给任务栏+标题栏。
         # 原来是 max(560, _sh-120)，1366x768 的笔记本上算出 648 —— 开箱即「看不到任何章节预览」。
         _h = max(680, min(980, _sh - 100))
@@ -488,15 +492,6 @@ class FanqieGUI:
         body.pack(fill="both", expand=True, padx=12, pady=(2, 9))
         return card, body
 
-    def _popup_tools(self):
-        """在「工具」按钮正下方弹出菜单。"""
-        b = self.btn_tools
-        try:
-            self.menu_tools.tk_popup(b.winfo_rootx(),
-                                     b.winfo_rooty() + b.winfo_height())
-        finally:
-            self.menu_tools.grab_release()
-
     def _attach_tooltip(self, widget, text):
         """给控件加悬停提示（图标按钮无文字时用来说明用途）。
 
@@ -596,32 +591,27 @@ class FanqieGUI:
             self.btn_audit,
             "体检章节位置：未公开段可自动重排，已公开段只能在手机 App 里"
             "申请移动（限发布 3 天内），超期则永久错位")
-        # 工具菜单：低频但常用的维护操作收在这里，不往行动条上堆按钮。
-        # 只有两项：续排(keep_ahead)不在这里——它已经是「定时发布」模式下的
-        # 「自动接续」勾选框，再开一个菜单入口就是同一功能的第二条路径。
-        # 用普通 Button 而不是 Menubutton: 后者自带下拉箭头（文字里再写 ▾ 就成了
-        # 两个箭头），默认样式还会把它画成下拉框、与旁边的「检查缺口」不是一路货。
-        # 手动 popup 菜单外观统一。（Menubutton 并不影响 tooltip——实测它照常
-        # 收到 <Enter>，别把这两件事混为一谈。）
-        self.btn_tools = ttk.Button(frm, text="工具 ▾", command=self._popup_tools)
-        # Tk 的菜单项挂不了 tooltip，所以把说明直接做成灰色不可点的副标题行——
-        # 展开就能看懂每个工具干什么，不用去猜。
-        self.menu_tools = tk.Menu(self.btn_tools, tearoff=0)
-        for label, hint, cmd in (
-            ("章节重排…", "把未公开的待发布章按位置重装内容，消掉中段缺口",
-             self._on_tool_remap),
-            ("清空草稿箱…", "删掉草稿箱里的草稿（先查本地有没有源文件）",
-             self._on_tool_clean_drafts),
-        ):
-            if self.menu_tools.index("end") is not None:
-                self.menu_tools.add_separator()
-            self.menu_tools.add_command(label=label, command=cmd)
-            self.menu_tools.add_command(label="      " + hint, state="disabled")
-        self.btn_tools.pack(side="left", padx=(8, 0))
+        # 两项维护操作直接摆出来，不再收进「工具 ▾」下拉。
+        # 为两个条目做一个菜单，等于多一次点击、还把它们藏起来；而藏起来的代价
+        # 不只是麻烦——「检查缺口」报出未公开段错位之后，紧挨着的下一步正是
+        # 「章节重排」，两者本该并排可见。菜单项还挂不了 tooltip，说明只能做成
+        # 灰色副标题行，展开才看得到。
+        # （续排 keep_ahead 不在这里：它已经是「定时发布」模式下的「接着上次
+        # 往后排」勾选框，再开一个入口就是同一功能的第二条路径。）
+        self.btn_remap = ttk.Button(
+            frm, text="章节重排…", command=self._on_tool_remap)
+        self.btn_remap.pack(side="left", padx=(8, 0))
         self._attach_tooltip(
-            self.btn_tools,
-            "维护类操作：重排未公开章的内容、清空草稿箱。"
-            "每项都会先预览、确认后才动手")
+            self.btn_remap,
+            "把未公开的待发布章按位置重装内容，消掉中段缺口。\n"
+            "先预览计划，确认后才真改；排期不变。")
+        self.btn_clean = ttk.Button(
+            frm, text="清空草稿箱…", command=self._on_tool_clean_drafts)
+        self.btn_clean.pack(side="left", padx=(8, 0))
+        self._attach_tooltip(
+            self.btn_clean,
+            "删掉草稿箱里的草稿。删前强制核对：每条草稿的章号\n"
+            "在本地要有对应文件，有一条对不上就整批拒绝执行。")
         self.progress = ttk.Progressbar(frm, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=12)
         self.lbl_progress = ttk.Label(frm, text="")
@@ -800,9 +790,10 @@ class FanqieGUI:
         self.autocont_var = tk.BooleanVar(
             value=bool(self._cfg.get("auto_continue", False)))
         self.chk_autocont = ttk.Checkbutton(
-            row_opts, text="自动接续队列",
+            row_opts, text="接着上次往后排",
             variable=self.autocont_var, command=self._on_autocont_toggle)
         self.chk_autocont.pack(side="left", padx=6)
+        self._attach_tooltip(self.chk_autocont, "不用自己填起始日期、也不用挑哪几章：\n工具去平台看已经排到哪天，从次日接着往后排，\n并且只发平台上还没有的章。\n\n→ 攒了一批新稿，想直接接在现有排期后面时用。\n→ 要自己定日期、或只补某几章，就别勾。")
         self.autocont_var.trace_add("write", lambda *_: self._schedule_config_save())
         # 「排到 N 天后」的控件放在下面的排期参数行（r1）里，不放这一行：
         # 它本来就和「每天章数」同类，而这一行在 1280 宽以下已经装不下第 6 个控件
@@ -812,7 +803,7 @@ class FanqieGUI:
 
         # 上次发布信息（所有模式可见）
         self.lbl_last_publish = ttk.Label(
-            frm_mode, text="上次发布：选好作品后自动获取", foreground=CLR_INK_SOFT)
+            frm_mode, text="队列排到：选好作品后自动获取", foreground=CLR_INK_SOFT)
         self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
 
         # 卷选择器 + 合并所有卷（同一行，仅 edit/reschedule 模式 + 多卷时显示）
@@ -863,6 +854,9 @@ class FanqieGUI:
         self.ent_days_ahead.pack(side="left", padx=4)
         self.lbl_days_ahead_unit = ttk.Label(r1, text="天后")
         self.lbl_days_ahead_unit.pack(side="left")
+        for _w in (self.lbl_days_ahead, self.ent_days_ahead,
+                   self.lbl_days_ahead_unit):
+            self._attach_tooltip(_w, "留空 = 把本地剩下的全排上去。\n填 7 = 只排到 7 天后为止，剩下的下次再排。\n\n排得近，之后想改剧情只改本地文件就行；\n排到几个月后的章，想改得去平台一章章改。")
         self.days_ahead_var.trace_add("write",
                                       lambda *_: self._schedule_config_save())
 
@@ -1599,8 +1593,9 @@ class FanqieGUI:
         # 检查缺口按钮：任务进行中禁用（避免同开第二个浏览器、并发写 AUTH_FILE）
         if hasattr(self, "btn_audit"):
             self.btn_audit.configure(state=ctrl_state)
-        if hasattr(self, "btn_tools"):
-            self.btn_tools.configure(state=ctrl_state)
+        for _b in ("btn_remap", "btn_clean"):
+            if hasattr(self, _b):
+                getattr(self, _b).configure(state=ctrl_state)
         for rb in self._mode_radios:
             rb.configure(state=ctrl_state)
 
@@ -1659,51 +1654,63 @@ class FanqieGUI:
             # 有缓存直接用（_apply_last_publish 会通过 date_var trace 触发预览刷新）
             self._apply_last_publish(self._last_publish_cache[book_id])
         elif AUTH_FILE.exists():
-            # 后台获取（仅默认页，一般最新发布在首页即可看到）
-            self.lbl_last_publish.configure(
-                text="正在获取发布信息…", foreground=CLR_INK_SOFT)  # noqa
-
-            gen = self._fetch_gen
-            volumes_known = book_id in self._volumes_cache
-
-            async def task():
-                page = None
-                try:
-                    ctx = await self._shared.ensure()
-                    page = await ctx.new_page()
-                    if self._fetch_gen != gen:
-                        return
-                    url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
-                    await page.goto(url)
-                    await settle_page(page)
-                    try:
-                        await page.wait_for_selector(
-                            "tr td", timeout=get_browser_timeout())
-                    except PWTimeout:
-                        pass
-                    if self._fetch_gen != gen:
-                        return
-                    # 仅首次检测卷（结果会缓存，含 None 表示无多卷）
-                    if not volumes_known:
-                        vol_info = await detect_volumes(page)
-                        self._after(
-                            0, self._volumes_detected, book_id, vol_info)
-                    result = await page.evaluate(LAST_PUBLISH_JS)
-                    self._after(0, self._last_publish_fetched, book_id, result)
-                except Exception:
-                    if self._fetch_gen == gen:
-                        self._after(
-                            0, self._last_publish_fetched, book_id, None)
-                finally:
-                    if page:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-
-            self.worker.submit(task())
+            self._fetch_last_publish(book_id)
 
         self._refresh_preview()
+
+    def _fetch_last_publish(self, book_id):
+        """后台重取「队列排到哪天」（仅章节管理页首页）。
+
+        两个调用时机: 选作品时，以及**发完一批之后**。后者很容易漏:
+        上传结束会 _invalidate_caches("chapters") 把缓存清掉，但只有修改/排期
+        模式会重拉；定时发布模式清了不补，标签上那个日期也不会变——
+        于是刚把队列往后推了一截，界面上还写着推之前的日期，下一批照它填就插队了。
+        """
+        if not AUTH_FILE.exists():
+            return
+        self.lbl_last_publish.configure(
+            text="正在获取发布信息…", foreground=CLR_INK_SOFT)  # noqa
+
+        gen = self._fetch_gen
+        volumes_known = book_id in self._volumes_cache
+
+        async def task():
+            page = None
+            try:
+                ctx = await self._shared.ensure()
+                page = await ctx.new_page()
+                if self._fetch_gen != gen:
+                    return
+                url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
+                await page.goto(url)
+                await settle_page(page)
+                try:
+                    await page.wait_for_selector(
+                        "tr td", timeout=get_browser_timeout())
+                except PWTimeout:
+                    pass
+                if self._fetch_gen != gen:
+                    return
+                # 仅首次检测卷（结果会缓存，含 None 表示无多卷）
+                if not volumes_known:
+                    vol_info = await detect_volumes(page)
+                    self._after(
+                        0, self._volumes_detected, book_id, vol_info)
+                result = await page.evaluate(LAST_PUBLISH_JS)
+                self._after(0, self._last_publish_fetched, book_id, result)
+            except Exception:
+                if self._fetch_gen == gen:
+                    self._after(
+                        0, self._last_publish_fetched, book_id, None)
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+
+        self.worker.submit(task())
+
 
     def _last_publish_fetched(self, book_id, result):
         """后台获取完成，更新缓存和 UI。"""
@@ -1721,7 +1728,12 @@ class FanqieGUI:
                 text="暂无发布记录", foreground=CLR_INK_SOFT)
 
     def _apply_last_publish(self, info):
-        """将上次发布信息显示到 UI 并自动建议下一天起始日期。
+        """将「队列排到哪天」显示到 UI 并自动建议次日为起始日期。
+
+        取的是章节表里的**最大时间**，不过滤状态——包含待发布章，所以它是
+        「队列排到哪天」而不是「上次发了什么」。早先标成「上次发布」，结果是
+        用户看到一个未来日期也不敲他，反而手填一个早得多的日期——新章于是
+        插在了队列中间，比它前面的章先公开。
 
         只更新 date_var，不覆盖 time_var —— 时间是用户配置项，
         平台单条发布记录不应覆盖用户设定的多时间方案。
@@ -1734,7 +1746,7 @@ class FanqieGUI:
             self.lbl_last_publish.configure(text="暂无发布记录", foreground=CLR_INK_SOFT)
             return
         chapter = info.get("chapter", "")
-        label = f"上次发布: {date_str} {time_str}"
+        label = f"队列排到: {date_str} {time_str}"
         if chapter:
             label += f" ({chapter})"
         self.lbl_last_publish.configure(text=label, foreground=CLR_SCHED_TX)
@@ -2590,11 +2602,40 @@ class FanqieGUI:
 
         kept_count = len(kept_set)
 
+        # 自动接续: 预览必须跟真正发出去的一致。这段计算原来只在 _on_upload 里跑，
+        # 于是勾上之后预览显示的是「按你手填的日期排的全部本地章」，而实际发的是
+        # 另一批章、另一个日期——所见非所得，用户只能靠确认框里那个数字兜底。
+        autocont_start = None
+        autocont_wait = False
+        if mode == "schedule" and self.autocont_var.get():
+            _idx = self.cmb_book.current()
+            _bid = self.books[_idx]["bookId"] if _idx >= 0 and self.books else None
+            _cached = (self._platform_chapters_cache.get(self._chapter_cache_key(_bid))
+                       if _bid else None)
+            if _cached:
+                try:
+                    _keep, autocont_start, _gaps = self._autocont_plan(
+                        _cached, self.parsed_chapters)
+                except Exception:
+                    _keep, autocont_start = None, None
+                if _keep is not None:
+                    kept_set = {
+                        i for i in kept_set
+                        if self.parsed_chapters[i][0] is not None
+                        and str(self.parsed_chapters[i][0]).isdigit()
+                        and int(self.parsed_chapters[i][0]) in _keep
+                    }
+                    kept_count = len(kept_set)
+                    filter_active = True
+            else:
+                autocont_wait = True
+
         # 计算排期（仅筛选后的章节）
         schedule = None
         if mode == "schedule":
             try:
-                date_str = self.date_var.get()
+                date_str = (autocont_start.strftime("%Y-%m-%d") if autocont_start
+                            else self.date_var.get())
                 datetime.strptime(date_str, "%Y-%m-%d")
                 time_str = self.time_var.get().strip() or "08:00"
                 per_day = self.perday_var.get()
@@ -2639,6 +2680,10 @@ class FanqieGUI:
         count_str = (f"{kept_count}/{len(self.files)}" if filter_active
                      else str(len(self.files)))
         summary = f"总计: {count_str} 章, {display_words} 字 | 模式: {mode_labels[mode]}"
+        if autocont_wait:
+            summary += " | 自动接续: 正在读平台队列，稍候"
+        elif autocont_start:
+            summary += " | 自动接续: 只发平台还没有的章"
         if schedule:
             # 统计首天章数即为 effective per_day
             first_day = schedule[0][0]
@@ -2873,16 +2918,25 @@ class FanqieGUI:
             return True
         return messagebox.askyesno(title, msg)
 
-    def _begin_task(self, count):
+    def _begin_task(self, count, label=""):
         """任务开始前的统一开场：锁 UI、重置进度条、接日志，返回章节间延时。
 
         三条上传/修改路径原来各写一份。漏掉其中一步不会报错，只会表现成
         "任务在跑但日志框一直空白"这种难查的怪相。
+
+        开场先画一条分隔线：日志框不清空（历史对排查有用），而点「开始上传」
+        会自动切到日志页——没有分隔的话，开机那些「正在获取作品列表…」
+        正好排在本次任务的行前面，看起来就像是上传触发的。
         """
+        self._install_log_handler()
+        bar = "─" * 46
+        self._log(bar)
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self._log(f"▶ {label or '任务'} · {count} 章 · {stamp}")
+        self._log(bar)
         self._set_uploading(True)
         self.progress["value"] = 0
         self.progress["maximum"] = max(count, 1)
-        self._install_log_handler()
         return self._cfg.get("delay_between_chapters", 3)
 
     def _require_login(self):
@@ -3137,10 +3191,13 @@ class FanqieGUI:
             cached = self._platform_chapters_cache.get(
                 self._chapter_cache_key(book_id))
             if not cached:
+                # 不再叫用户去别的模式暿缓存（那是让人替工具跑腿）——直接发起抓取。
+                # 原先担心「在这里再开一次浏览器」，但上传下一步本来就要开。
+                self._ensure_platform_chapters()
                 self._notify(
-                    "warning", "需要先获取平台章节",
-                    "「自动接续队列」要先知道平台已经排到哪。\n"
-                    "请切到「修改内容」或「修改排期」模式等它加载完，再切回来。")
+                    "info", "正在获取平台章节",
+                    "「自动接续队列」要先知道平台排到哪天了。\n"
+                    "已开始获取，等它跑完再点一次「开始上传」即可。")
                 return
             keep, autocont_start, gaps = self._autocont_plan(
                 cached, self.parsed_chapters)
@@ -3163,7 +3220,7 @@ class FanqieGUI:
                 logger.warning(
                     f"平台中段还缺 {len(gaps)} 章（如 第"
                     + "、第".join(str(n) for n in gaps[:5])
-                    + "章…）——这些不能靠发布补回原位，请用「工具 ▾ → 章节重排」")
+                    + "章…）——这些不能靠发布补回原位，请用底部的「章节重排」")
 
         # 按章节序号筛选
         if autocont_subset is not None:
@@ -3206,7 +3263,7 @@ class FanqieGUI:
             return
 
         # 开始
-        delay = self._begin_task(count)
+        delay = self._begin_task(count, mode_labels[mode])
 
         # 无头开关在主线程读取（Tk 变量不能在事件循环线程里取）
         hl = self.headless_var.get()
@@ -3274,10 +3331,17 @@ class FanqieGUI:
         self._invalidate_caches("chapters")
         self._set_uploading(False)
 
-        # 修改/排期模式：缓存已清，主动重拉一次平台章节，避免后续切换筛选器时
-        # _refresh_edit_preview 拿不到平台章节而把 _matched_edit 置空
+        # 缓存刚被清掉，两种模式都得重拉，只是重拉的东西不同:
+        #   修改/排期 —— 要平台章节列表，否则切筛选器时 _refresh_edit_preview
+        #                拿不到数据会把 _matched_edit 置空；
+        #   新建类   —— 要「队列排到哪天」。刚把队列往后推了一截，不重取的话
+        #                标签和起始日期还停在推之前，下一批照它填就插队了。
         if self.mode_var.get() in ("edit", "reschedule"):
             self._fetch_platform_chapters_for_edit()
+        else:
+            _idx = self.cmb_book.current()
+            if _idx >= 0 and self.books:
+                self._fetch_last_publish(self.books[_idx]["bookId"])
 
         # 上传完成后将 .auth_state.json 回写到命名账号文件（保持 cookie 新鲜）
         acct = self._gui_state.get("current_account", "")
@@ -3322,7 +3386,7 @@ class FanqieGUI:
         if not self._ask_yes_no("确认修改", msg):
             return
 
-        delay = self._begin_task(count)
+        delay = self._begin_task(count, "修改内容")
         use_ai = self.use_ai_var.get()
         matched_copy = list(matched)
 
@@ -3470,7 +3534,7 @@ class FanqieGUI:
             return
 
         # 开始
-        delay = self._begin_task(count)
+        delay = self._begin_task(count, "修改排期")
         smap = dict(schedule_map)
         vol = self._get_selected_volume()
         # "合并所有卷"模式: 传入所有卷名列表
@@ -3574,9 +3638,29 @@ class FanqieGUI:
 
     # --- 清空草稿箱 ---------------------------------------------------------
     def _on_autocont_toggle(self):
-        """勾了自动接续就置灰起始日期（改由平台队列末尾决定）。"""
+        """勾了自动接续就置灰起始日期（改由平台队列末尾决定）。
+
+        勾上的同时就去取平台章节：这个功能本就要知道「队列排到哪天」，
+        等到用户点了「开始上传」才发现没数据，就只能把人挡回去。
+        """
         self._sync_autocont_state()
+        if self.autocont_var.get():
+            self._ensure_platform_chapters()
         self._refresh_preview()
+
+    def _ensure_platform_chapters(self):
+        """平台章节缓存没有就发起一次抓取；已有则 no-op。
+
+        返回 True = 缓存已就绪。不阻塞：抓取在后台跑，调用方自己决定怎么提示。
+        """
+        idx = self.cmb_book.current()
+        if idx < 0 or not self.books:
+            return False
+        ck = self._chapter_cache_key(self.books[idx]["bookId"])
+        if ck and ck in self._platform_chapters_cache:
+            return True
+        self._fetch_platform_chapters_for_edit()
+        return False
 
     def _sync_autocont_state(self):
         """按当前模式 + 勾选状态置灰/恢复起始日期输入框（不触发预览刷新）。
@@ -3726,7 +3810,7 @@ class FanqieGUI:
         """取界面上当前的章节目录，不读 config 缓存。
 
         _cfg["chapters_dir"] 由 _schedule_config_save 延迟 1 秒写入：刚选完文件夹
-        就开「工具 ▾」，子进程拿到的还是上一本书的目录——remap --run 会拿
+        就点「章节重排」，子进程拿到的还是上一本书的目录——remap --run 会拿
         错书的文件改写待发布章节。归属校验只是抽样启发式，拦不住所有情况。
         """
         try:
