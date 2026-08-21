@@ -1,0 +1,116 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1280px; height: 640px; }
+  body {
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+                 "Noto Sans CJK SC", sans-serif;
+    background: #17110F;
+    color: #FFF6F2;
+    display: flex;
+    overflow: hidden;
+    position: relative;
+  }
+  /* 番茄色暖光，从左下打上来 */
+  body::before {
+    content: "";
+    position: absolute;
+    left: -180px; bottom: -300px;
+    width: 900px; height: 900px;
+    background: radial-gradient(circle, rgba(232,69,47,.34) 0%, rgba(232,69,47,0) 62%);
+  }
+  body::after {
+    content: "";
+    position: absolute;
+    right: -220px; top: -260px;
+    width: 760px; height: 760px;
+    background: radial-gradient(circle, rgba(255,150,60,.16) 0%, rgba(255,150,60,0) 60%);
+  }
+
+  .left {
+    position: relative;
+    z-index: 2;
+    padding: 78px 0 78px 84px;
+    width: 700px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .eyebrow {
+    font-size: 25px;
+    letter-spacing: .10em;
+    color: #F0836E;
+    font-weight: 700;
+    margin-bottom: 26px;
+  }
+  h1 {
+    font-size: 88px;
+    line-height: 1.13;
+    font-weight: 800;
+    letter-spacing: -.01em;
+  }
+  .value {
+    margin-top: 30px;
+    font-size: 40px;
+    line-height: 1.42;
+    font-weight: 600;
+    color: #E4D6D0;
+  }
+  .value b { color: #FF6A4D; font-weight: 800; }
+  .foot {
+    margin-top: 42px;
+    font-size: 24px;
+    color: #9A8880;
+    letter-spacing: .02em;
+  }
+
+  /* 右侧：章节行 + 核对标记，暗示「逐章核对」 */
+  .right {
+    position: relative;
+    z-index: 2;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 15px;
+    padding-right: 74px;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    background: rgba(255, 255, 255, .055);
+    border: 1px solid rgba(255, 255, 255, .10);
+    border-radius: 13px;
+    padding: 17px 22px;
+    font-size: 24px;
+    color: #D9CBC5;
+  }
+  .row .n { font-weight: 700; color: #FFF6F2; min-width: 118px; }
+  .row .t { flex: 1; opacity: .62; }
+  .mark { font-size: 25px; font-weight: 800; }
+  .ok .mark { color: #4ADE80; }
+  .gap {
+    background: rgba(232, 69, 47, .16);
+    border-color: rgba(255, 106, 77, .55);
+    color: #FFC9BC;
+  }
+  .gap .n { color: #FF8E76; }
+  .gap .mark { color: #FF6A4D; }
+</style>
+
+<div class="left">
+  <div class="eyebrow">fanqie-publisher</div>
+  <h1>番茄作家<br>批量上传工具</h1>
+  <div class="value">定时排期 · <b>逐章核对不漏发</b></div>
+  <div class="foot">Windows / macOS / Linux · MIT 开源</div>
+</div>
+
+<div class="right">
+  <div class="row ok"><span class="n">第 708 章</span><span class="t">已发布</span><span class="mark">✓</span></div>
+  <div class="row ok"><span class="n">第 709 章</span><span class="t">已发布</span><span class="mark">✓</span></div>
+  <div class="row gap"><span class="n">第 710 章</span><span class="t">平台查不到 · 已记入补传</span><span class="mark">!</span></div>
+  <div class="row ok"><span class="n">第 711 章</span><span class="t">待发布 08:00</span><span class="mark">✓</span></div>
+  <div class="row ok"><span class="n">第 712 章</span><span class="t">待发布 12:00</span><span class="mark">✓</span></div>
+</div>
