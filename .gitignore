@@ -22,8 +22,9 @@ chapters/
 error_*.png
 fanqie_error.log
 fanqie_error.log.*
-# 重排工具的运行日志（含书名/章节标题，不入库）
-tools/remap/logs/
+# 工具的运行日志（含书名/章节标题，不入库）
+# 三个工具的 LOG_DIR 都是 <工具>/logs，只写 remap 会把另两个的漏进仓库。
+tools/*/logs/
 
 # IDE
 .idea/

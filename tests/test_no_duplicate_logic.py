@@ -123,14 +123,22 @@ for f in FILES:
         body = tuple(t for _, t in chunk)
         if sum(len(t) for t in body) < 160 or len(set(body)) < 5:
             continue
-        wins[body].add((f.name, chunk[0][0] // 12))
+        wins[body].add((f.name, chunk[0][0]))
+# 同一处重复会被滑动窗口命中多次（错开 1 行就是另一个 body）。
+# 早先用 行号//12 分桶去重，但桶边界是任意的——上方加几行就能把同一处
+# 重复挤成两组，让这个守卫在无关改动上变红。改成按实际行号合并：
+# 两组的位置集合能逐一配对到 W 行以内，就是同一处。
 groups = [b for b, v in wins.items() if len(v) > 1]
-seen, n = set(), 0
+clusters = []
 for body in sorted(groups, key=lambda b: -len(b)):
-    key = tuple(sorted(wins[body]))
-    if key not in seen:
-        seen.add(key)
-        n += 1
+    locs = sorted(wins[body])
+    for c in clusters:
+        if len(c) == len(locs) and all(
+                a[0] == b[0] and abs(a[1] - b[1]) < W for a, b in zip(c, locs)):
+            break
+    else:
+        clusters.append(locs)
+n = len(clusters)
 print(f"  当前重复块 {n} 组（上限 {CAP}）")
 check(f"重复块不超过 {CAP} 组", n <= CAP)
 

@@ -214,6 +214,51 @@ check("隔壁章出现不能算数",
       _confirm([["第1471章 丙", "第1469章 乙"]], window_s=0)[0] is False)
 check("裸数字标题也认", _confirm([["1470 甲"]])[0] is True)
 
+# --- 多卷: 探针必须问到新章真正落地的那一卷 ---
+# 章节列表接口一次只回一卷，而签名 URL 里烘的是 chapter-manage 当时渲染的
+# 那一卷。新建章永远追加到末卷——两者对不上时，接口好好的、clean_probe 为 True，
+# 于是 90 秒后把一个已发成功的章判成失败并中止整批。
+
+
+class _VolPage:
+    """按 URL 里的 volume_id 返回不同卷的章节，并记下被问过的 URL。"""
+
+    def __init__(self, by_vol):
+        self.by_vol = by_vol
+        self.asked = []
+
+    async def evaluate(self, _js, url):
+        self.asked.append(url)
+        import re as _re
+        m = _re.search(r"volume_id=(\d*)", url)
+        vid = m.group(1) if m else ""
+        return {"titles": self.by_vol.get(vid, [])}
+
+    async def wait_for_timeout(self, _ms):
+        pass
+
+
+SIGNED = "u?volume_id=11&page_index=0&page_count=15"
+BY_VOL = {"11": ["第1章 开篇"], "33": ["第1470章 甲"]}   # 新章在卷 33
+
+_pg = _VolPage(BY_VOL)
+_r = _aio.run(_K.fu.confirm_chapter_on_platform(_pg, [SIGNED], 1470,
+                                                poll_s=0, window_s=0))
+check("多卷不传 volume_id -> 在错的卷里找，判失败（就是这个 bug）", _r is False)
+
+_pg = _VolPage(BY_VOL)
+_r = _aio.run(_K.fu.confirm_chapter_on_platform(_pg, [SIGNED], 1470,
+                                                poll_s=0, volume_id="33"))
+check("多卷传了末卷 -> 确认成功", _r is True)
+check("探针 URL 真的换成了末卷", "volume_id=33" in _pg.asked[-1])
+
+# 单卷书（不传 volume_id）行为不变
+_pg = _VolPage({"11": ["第1470章 甲"]})
+check("单卷: 不传 volume_id 照样确认",
+      _aio.run(_K.fu.confirm_chapter_on_platform(_pg, [SIGNED], 1470,
+                                                 poll_s=0)) is True)
+check("单卷: 签名 URL 未被改动", _pg.asked[-1] == SIGNED)
+
 print()
 if FAILED:
     print(f"FAILED {len(FAILED)}: {FAILED}")

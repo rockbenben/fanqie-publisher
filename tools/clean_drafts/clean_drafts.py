@@ -162,7 +162,10 @@ async def delete_drafts(page, book_id, want):
 async def main_async(args):
     book_id, num2path, headless = fu.tool_startup(args)
     if not book_id:
-        return False
+        # 返回 True(=需人工)而不是 False：run_unattended 靠返回值决定 exit 3 与
+        # 弹窗。返回 False 会让 --daily 的计划任务每晚"成功"退出 0 却什么都没做，
+        # 而队列会一天天耗到断更才被发现。跟 remap 保持一致。
+        return True
     local_nums = set(num2path)
     async with async_playwright() as p:
         browser, ctx = await fu.create_context(p, headless=headless)

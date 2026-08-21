@@ -183,7 +183,17 @@ def compress_roundtrip():
 
     C = fu.compress_chapter_nums
     check("R9 连续段压缩", C([79, 80, 81, 83, 84, 114]) == "79-81,83-84,114")
-    check("R9 单元素", C([7]) == "7")
+    # 单元素必须是区间而不是裸数字: 裸数字在 GUI 会跟 ≤/≥ 下拉框拼成
+    # 阈值（默认 ≥7 = 第7章到末尾），而 CLI --chapters 7 只是第7章。
+    # 这串号是发给用户粘贴补传的，差一个字符就是整段重发。
+    check("R9 单元素用区间", C([7]) == "7-7")
+    for nums in ([7], [79, 80, 81, 83], list(range(79, 115))):
+        s = C(nums)
+        gui = ("≥" + s) if s.isdigit() else s   # GUI 对裸数字的处理
+        pool = list(range(1, 200))
+        a, _ = fu.filter_by_chapter_spec(pool, s, key=lambda x: x)
+        b, _ = fu.filter_by_chapter_spec(pool, gui, key=lambda x: x)
+        check(f"R9 两入口等价 {s}", a == b == sorted(nums))
     check("R9 乱序去重", C([3, 1, 2, 2, 10]) == "1-3,10")
     check("R9 空集", C([]) == "")
 

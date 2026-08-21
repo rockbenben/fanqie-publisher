@@ -541,14 +541,25 @@ def compress_chapter_nums(nums) -> str:
             j += 1
         parts.append(str(uniq[i]) if i == j else f"{uniq[i]}-{uniq[j]}")
         i = j + 1
-    return ",".join(parts)
+    out = ",".join(parts)
+    # 只有一章失败时输出会是裸数字，而裸数字在两个入口含义不同:
+    # CLI 的 --chapters 83 = 只第83章；GUI 的「按章节号筛选」会把单值跟下拉框
+    # 的 ≤/≥ 拼起来，默认就成了 ≥83 = 第83章到末尾。这串号是发给用户直接
+    # 粘贴去补传的——在新建类模式下粘错了会把后面所有章再发一遍，
+    # 而番茄只能往书尾追加，那些重复章永远移不回去。
+    # 写成 83-83（区间）两边都是集合命中，语义才真的一致。
+    if out.isdigit():
+        out = f"{out}-{out}"
+    return out
 
 
 def log_fail_list(fail_list):
     """批量结束时打印失败章节及原因清单（CLI/GUI 上传与修改共用）。
 
     末尾追加按筛选语法压缩的失败章节号（如 "79-81,83-114"）。同一串号在两个
-    入口都能直接用: GUI 粘进「按章节号筛选」，CLI 传给 --chapters（同一个解析器）。
+    入口都能直接用: GUI 粘进「按章节号筛选」，CLI 传给 --chapters。
+    单章会输出成 "83-83" 而不是 "83"：裸数字在 GUI 会跟 ≤/≥ 下拉框拼成阈值，
+    两边含义就不一样了（见 compress_chapter_nums）。
     """
     if not fail_list:
         return
@@ -2544,7 +2555,7 @@ def watch_chapter_list_url(page):
 
 
 async def confirm_chapter_on_platform(page, url_holder, num, *,
-                                      window_s=90, poll_s=10):
+                                      window_s=90, poll_s=10, volume_id=None):
     """确认「第num章」真的出现在平台上了。返回 True/False。
 
     **只有"新建"类操作需要它**（定时发布/立即发布/续排），因为失败不可逆:
@@ -2554,6 +2565,12 @@ async def confirm_chapter_on_platform(page, url_holder, num, *,
     改内容/改排期则相反——item 还在，重来一次即可，不该为确认牺牲吞吐。
 
     拿不到签名 URL 时返回 True（无从确认，不阻断任务）；调用方已有批末对账兜底。
+
+    volume_id: 多卷作品必须传。章节列表接口一次只返回一卷，而签名 URL 里
+    烘的是 chapter-manage 当时渲染的那一卷。新建章永远追加到全书末尾，也就是
+    **最后一卷**——两者对不上时，探针会在卷 1 里找卷 3 的章，永远找不到。
+    阴险之处在于接口好好的、clean_probe 为 True，于是 90 秒后当成真的没落地，
+    把一个已经发成功的章判成失败并中止整批。单卷作品传与不传等价。
     """
     if not url_holder:
         # 静默返回 True 等于「这一章不确认了」。整批都没捕获到签名请求时，
@@ -2568,7 +2585,12 @@ async def confirm_chapter_on_platform(page, url_holder, num, *,
     last_err = ""
     while True:
         try:
-            res = await page.evaluate(_PROBE_LATEST_JS, url_holder[-1])
+            probe_url = url_holder[-1]
+            if volume_id:
+                # 与 fetch_chapter_items 用同一条替换规则（\d* 兼容空参数值）
+                probe_url = re.sub(r"volume_id=\d*",
+                                   f"volume_id={volume_id}", probe_url, count=1)
+            res = await page.evaluate(_PROBE_LATEST_JS, probe_url)
         except Exception as e:
             res = {"error": str(e)}
         if isinstance(res, dict) and res.get("error"):
@@ -3136,13 +3158,29 @@ async def run_creation_batch(page, parsed, new_chapter_url, *, book_id,
     # confirm_chapter_on_platform 每章都走 not url_holder 的放行分支，
     # 防漏章的守卫整批静默关闭。keep_ahead 一直是先 append 再跑的。
     sig_urls, detach_sig = watch_chapter_list_url(page)
+    # 调用方进来时页面停在编辑器（它们用 goto+wait_for_editor_ready
+    # 做登录校验），所以第一章本可以省一次导航。但下面的签名预取会把
+    # 页面导到 chapter-manage，那个前提就不成立了——必须跟着改，否则
+    # 第 1 章会在章节管理页上填正文：max_retries>0 时白燒一个超时再重试成功，
+    # max_retries=0 时直接失败——而新建类是失败即停，整批当场中止。
+    on_editor = True
+    tail_vol = None        # 新章追加到的那一卷（全书最后一卷）；单卷书为 None
     if not is_draft and not sig_urls:
         try:
-            _, _seed, _ = await fetch_chapter_items(page, book_id)
+            _, _seed, _vols = await fetch_chapter_items(page, book_id)
+            on_editor = False      # fetch_chapter_items 内部 goto 了 chapter-manage
+            if _vols and len(_vols) > 1:
+                # 章节列表接口一次只回一卷，而签名里烘的是 chapter-manage
+                # 当时看的那一卷。不指定的话，逐章确认会在卷 1 里找卷 3 的章，
+                # 永远找不到 → 把发成功的章判成失败 → 中止整批。
+                tail_vol = _vols[-1].get("volume_id")
+                logger.info(f"  本作品 {len(_vols)} 卷，逐章确认针对末卷"
+                            f"「{_vols[-1].get('volume_name') or tail_vol}」")
             if _seed:
                 sig_urls.append(_seed)
                 logger.info("  已预取章节列表签名，逐章确认就绪")
         except Exception as e:
+            on_editor = False      # 异常也可能发生在导航之后，不能再当停在编辑器
             logger.warning(
                 f"  预取章节列表签名失败（逐章确认将依赖页面自发请求）: {e}")
     total = len(parsed)
@@ -3167,14 +3205,14 @@ async def run_creation_batch(page, parsed, new_chapter_url, *, book_id,
             if is_draft:
                 ok, this_draft_id, err = await draft_one_chapter(
                     page, new_chapter_url, chapter_num, title, content,
-                    max_retries=max_retries, skip_first_goto=(i == 0),
+                    max_retries=max_retries, skip_first_goto=(i == 0 and on_editor),
                     err_tag=err_tag_fn(i))
             else:
                 ok, err = await publish_one_chapter(
                     page, new_chapter_url, chapter_num, title, content,
                     schedule=schedule[i] if schedule else None,
                     use_ai=use_ai, max_retries=max_retries,
-                    skip_first_goto=(i == 0), err_tag=err_tag_fn(i))
+                    skip_first_goto=(i == 0 and on_editor), err_tag=err_tag_fn(i))
             if not ok:
                 # 重试与失败截图都在原语里做过了，这里只记账
                 fail_list.append((f"{num_str}{title}", err))
@@ -3206,7 +3244,7 @@ async def run_creation_batch(page, parsed, new_chapter_url, *, book_id,
                 except (TypeError, ValueError):
                     cnum_int = None
             if cnum_int is not None and not await confirm_chapter_on_platform(
-                    page, sig_urls, cnum_int):
+                    page, sig_urls, cnum_int, volume_id=tail_vol):
                 logger.error(
                     f"  ✗ 提交说成功，但平台上查不到 第{cnum_int}章 —— 中止整批"
                     f"（继续发下去会把缺口永久卡在中段）")

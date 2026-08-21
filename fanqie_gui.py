@@ -1376,13 +1376,14 @@ class FanqieGUI:
             self.chk_use_ai.pack(side="left", padx=6)
         if mode == "schedule":
             self.chk_autocont.pack(side="left", padx=6)
-            # 同步一次起始日期的置灰: _on_autocont_toggle 只在「点击」时触发，
-            # config 里存着 auto_continue:true 时启动后勾是勾上的、输入框却still
-            # 可编辑 —— 用户改了日期、看着被接受，实际用的是平台队列算出来的。
-            self._sync_autocont_state()
             self.lbl_days_ahead.pack(side="left", padx=(14, 0))
             self.ent_days_ahead.pack(side="left", padx=4)
             self.lbl_days_ahead_unit.pack(side="left")
+        # 无论哪个模式都同步一次起始日期的置灰:
+        # ① _on_autocont_toggle 只在「点击」时触发，config 里 auto_continue:true
+        #    时启动后勾是勾上的、输入框却还可编辑；
+        # ② 从定时发布切到修改排期时必须把灰取掉（那边没有自动接续）。
+        self._sync_autocont_state()
         self.chk_headless.pack(side="left", padx=6)
 
         # --- 3. 上传按钮文字和状态 ---
@@ -3578,15 +3579,19 @@ class FanqieGUI:
         self._refresh_preview()
 
     def _sync_autocont_state(self):
-        """按当前勾选状态置灰/恢复起始日期输入框（不触发预览刷新）。"""
-        on = self.autocont_var.get()
-        for attr in ("ent_date", "entry_date", "date_entry"):
-            w = getattr(self, attr, None)
-            if w is not None:
-                try:
-                    w.configure(state="disabled" if on else "normal")
-                except tk.TclError:
-                    pass
+        """按当前模式 + 勾选状态置灰/恢复起始日期输入框（不触发预览刷新）。
+
+        只有「定时发布 + 勾了自动接续」才该置灰——sched_frame 在「修改排期」
+        模式下同样会 pack，而那个模式没有自动接续。不看模式的话，在定时发布
+        里勾了再切过去，起始日期会一直灰着不能改，而排期照旧值跑。
+        """
+        on = self.autocont_var.get() and self.mode_var.get() == "schedule"
+        # 只有 ent_date 这一个控件。早先还猜了 entry_date / date_entry 两个名字，
+        # 那只会让 ent_date 被改名时静默失效。
+        try:
+            self.ent_date.configure(state="disabled" if on else "normal")
+        except tk.TclError:
+            pass
 
     def _autocont_plan(self, cached, parsed):
         """自动接续: 返回 (要发的章号集合, 起始日期, 中段缺口)。
@@ -3718,8 +3723,18 @@ class FanqieGUI:
             "已公开的一律不碰。")
 
     def _chapters_dir_for_tools(self):
-        d = (self._cfg.get("chapters_dir") or "").strip()
-        return d or str(SCRIPT_DIR / "chapters")
+        """取界面上当前的章节目录，不读 config 缓存。
+
+        _cfg["chapters_dir"] 由 _schedule_config_save 延迟 1 秒写入：刚选完文件夹
+        就开「工具 ▾」，子进程拿到的还是上一本书的目录——remap --run 会拿
+        错书的文件改写待发布章节。归属校验只是抽样启发式，拦不住所有情况。
+        """
+        try:
+            d = (self.dir_var.get() or "").strip()
+        except Exception:
+            d = ""
+        fallback = (self._cfg.get("chapters_dir") or "").strip()
+        return d or fallback or str(SCRIPT_DIR / "chapters")
 
     def _run_cli_tool(self, name, title, desc):
         """remap / keep_ahead 共用：先跑 dry-run 预览，确认后再 --run。
@@ -3735,6 +3750,10 @@ class FanqieGUI:
                 "--content-dir", self._chapters_dir_for_tools()]
         if self.headless_var.get():
             base.append("--headless")
+        # remap 重新提交正文走的是和上传/修改同一条发布流程，
+        # AI 申报漏传就成了界面上看不见的合规不一致。
+        if self.use_ai_var.get():
+            base.append("--use-ai")
 
         def run_cli(extra, on_done):
             def work():
