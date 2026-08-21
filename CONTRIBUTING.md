@@ -46,4 +46,22 @@ for f in tests/test_*.py; do python "$f" || break; done   # 整目录
 | 入口对等 | 每个能力和参数 CLI/GUI 都要有，且共用同一个解析器 |
 | 重复实现回归 | 一个功能只能有一份实现 |
 
+## CI
+
+`.github/workflows/ci.yml` 在推送和 PR 时跑下面这些（文档只改 `.md` / `docs/` 不触发）：
+
+| 检查 | 范围 |
+| ---- | ---- |
+| 回归测试 | 26 套件 × （Ubuntu / Windows）×（Python 3.10 / 3.14）= 4 个 job |
+| 工具自检 | remap / keep_ahead / clean_drafts 的 `--self-check` |
+| 子命令冒烟 | 7 个子命令的 `-h`（argparse 挂了不会有测试报错，但用户第一条命令就跑不通） |
+| pyflakes | 主程序 + tools + tests |
+
+**为什么矩阵里有 3.10：** README、支持范围表、`run.bat` 的版本检查三处都声称下限是 3.10，
+这个 job 就是那三句话的唯一证据。**为什么有 Windows：** 主要用户双击 `run.bat` 启动，
+路径与编码差异只有它能暴露。
+
+两个需要浏览器内核的 DOM 夹具测试不进每次推送（省掉每次约 150MB 下载），
+要跑在 Actions 页面手动触发 `browser-tests`。
+
 **改动核心逻辑后整目录跑一遍确认全绿。** 尤其是发布路径——这个项目历史上出过「日志说成功、平台实际漏 151 章」的静默故障，那两道防线全靠测试守着。
