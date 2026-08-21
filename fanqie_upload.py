@@ -9,8 +9,15 @@
     python fanqie_upload.py books                              列出你的作品
     python fanqie_upload.py upload ./chapters --book-id ID     批量上传章节(存草稿)
     python fanqie_upload.py upload ./chapters --book-id ID --publish  批量上传并发布
-    python fanqie_upload.py upload ./chapters --book-id ID --schedule 2026-03-14 --per-day 3
+    python fanqie_upload.py upload ./chapters --book-id ID --schedule 2026-09-01 --per-day 3
                                                                定时发布(每天3章)
+    python fanqie_upload.py upload ./chapters --book-id ID --chapters 79-114
+                                                               补传指定章节
+    python fanqie_upload.py reschedule --book-id ID --schedule 2026-09-01
+                                                               批量改待发布章的排期
+    python fanqie_upload.py audit                              缺口体检(只读)
+    python fanqie_upload.py remap --run                        修未公开段的位置错位
+    python fanqie_upload.py clean-drafts --run                 清空草稿箱
 
 MD 文件格式:
     文件名: 001_章节标题.md  或  第1章_标题.md  或  任意名称.md
@@ -24,6 +31,7 @@ import json
 import re
 import sys
 import time
+import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -75,6 +83,13 @@ DEFAULT_CONFIG = {
 _MOD_KEY = "Meta" if sys.platform == "darwin" else "Control"
 _browser_timeout = DEFAULT_CONFIG["browser_timeout"]  # 模块级超时(ms)
 
+# networkidle 的等待上限。番茄的埋点/轮询一直在发请求，这个页面**永远不会**
+# 进入 networkidle —— 每一处都必然走到超时。Playwright 默认是 30 秒，于是
+# 「正在获取章节列表…」这类状态每次都白等 30 秒才继续。
+# 真正的就绪判据是它后面的 wait_for_selector("tr td") / 提取 JS 自带的表格等待，
+# 所以这里只给一个「页面碰巧很快静下来就用上」的短窗口。
+NETWORKIDLE_MS = 3000
+
 
 def _safe_filename(name: str, max_len: int = 40) -> str:
     """移除 Windows 文件名非法字符并截断。"""
@@ -109,7 +124,7 @@ class DailyLimitReached(RuntimeError):
     虽然上限按字数计、非硬墙（2026-06-06 曾见 79-81 失败、82 字数较短仍
     成功），但实践中继续提交后续章节多半重复撞限、还会触发别的拦截，徒增
     额外错误。故上层捕获后中止整批，把本章与所有剩余未处理章节如实记入失败
-    清单（_log_fail_list 会压缩成章节号，可直接粘贴补传），留待明天接着发。
+    清单（log_fail_list 会压缩成章节号，可直接粘贴补传），留待明天接着发。
     """
 
 
@@ -211,7 +226,11 @@ def _classify_toasts(messages: list[str], notifications: list[str] = ()):
 
 
 def _interpret_publish_response(body: str):
-    """解析 /api/author/publish_article/v0/ 响应 body，返回 (verdict, message)。
+    """解析提交类接口响应 body，返回 (verdict, message)。
+
+    覆盖两个接口（两者的业务结果都在 200 响应的 JSON `code` 里）：
+      · /api/author/publish_article/v0/   新建/修改内容的提交
+      · /api/author/article/modify_timer/v0/  改期
 
     业务结果藏在 HTTP 200 的 JSON `code` 字段（2026-06-26 真机抓包实测）：
       成功 {"code":0,"data":{"item_id":"...","tips":""},"message":"success"}
@@ -265,10 +284,253 @@ async def _check_editor_validation(page):
             raise RuntimeError(f"章节字段校验未通过，页面提示: {t}")
 
 
-def _compress_chapter_nums(nums) -> str:
+# 退出码契约（计划任务/cron 读它）: 0=正常、1=崩溃、3=跑完了但需要人处理。
+# 定义在这里而不是各工具里：退出码是对外契约，而真正 exit 的只有
+# run_unattended 这一处。各工具曾各自定义一份，外壳合并后它们就成了死常量。
+EXIT_NEEDS_ATTENTION = 3
+
+
+def run_unattended(main_async, args, *, log_dir, name, hint="",
+                   readonly=False):
+    """跑一个工具的 main_async，带上无人值守该有的一切。
+
+    --daily 时: 接管日志到文件、崩溃弹窗兜底、需人工处理时弹窗并以退出码 3 退出。
+    非 --daily 时: 给 logger 挂控制台 handler，否则过程日志一条都看不见。
+
+    这套外壳 remap / keep_ahead / 主 CLI 曾各写一遍——它恰恰是最不能有分歧的
+    地方: 定时任务没人看着，哪一份漏了崩溃兜底，就会一天天静默失败。
+    """
+    log_path = None
+    if getattr(args, "daily", False):
+        if not readonly:      # 只读子命令（audit）绝不能被置成真改写
+            args.run = True
+        args.headless = True
+        log_path = start_task_log(log_dir, name)
+    else:
+        setup_logging()
+    try:
+        attn = asyncio.run(main_async(args))
+    except Exception as e:
+        if getattr(args, "daily", False):
+            import traceback
+            traceback.print_exc()
+            alert(f"番茄{name}今天没跑成",
+                  f"运行中断: {e}\n\n请尽快手动补跑。{hint}\n日志: {log_path}")
+            sys.exit(1)
+        raise
+    if attn and getattr(args, "daily", False):
+        why = ""
+        try:
+            for line in Path(log_path).read_text(encoding="utf-8").splitlines():
+                if "需要人工处理:" in line:
+                    why = line.split("需要人工处理:", 1)[1].strip()
+        except Exception:
+            pass
+        alert(f"番茄{name}告警",
+              "需要你处理：\n\n" + (why or "详见日志") + f"\n\n日志: {log_path}")
+    if attn:
+        sys.exit(EXIT_NEEDS_ATTENTION)
+
+
+def resolve_target(args=None):
+    """定时作业/工具的共同入口参数: (book_id, content_dir)。
+
+    book_id 缺省取 .gui_state.json 的 last_book_id，章节目录取 config.json 的
+    chapters_dir——但**无人值守作业强烈建议显式传**: 这两个值会跟着 GUI 里
+    "上次选的作品/目录"漂，切一次作品就可能让定时任务写到另一本书上。
+    """
+    book_id = getattr(args, "book_id", None) if args else None
+    content_dir = getattr(args, "content_dir", None) if args else None
+    if not book_id and GUI_STATE_FILE.exists():
+        try:
+            book_id = json.loads(
+                GUI_STATE_FILE.read_text(encoding="utf-8")).get("last_book_id")
+        except Exception:
+            pass
+    if not content_dir:
+        content_dir = load_config().get("chapters_dir")
+    return book_id, content_dir
+
+
+def local_chapter_index(content_dir):
+    """本地目录的 章号 -> 文件路径。同号取首个（与修改内容模式规则一致）。
+
+    复用 get_md_files + parse_md_file，覆盖 .md/.txt、子目录，以及
+    第X章/回/节/话、中文数字、数字前缀、chapter-N 等全部既有命名。
+    """
+    index = {}
+    for f in get_md_files(Path(content_dir)):
+        cnum, _title, _content = parse_md_file(f)
+        if cnum is None:
+            continue
+        try:
+            index.setdefault(int(cnum), str(f))
+        except (TypeError, ValueError):
+            continue
+    return index
+
+
+def tool_startup(args):
+    """三个工具共同的启动序幕: 定位目标 → 建本地章节索引 → 决定 headless。
+
+    返回 (book_id, num2path, headless)；定位不到目标时打印提示并返回
+    (None, None, None)。退出动作留在调用方——三个工具的返回值语义不同
+    （False / None / True 各有含义），这里只统一"怎么定位、怎么报"。
+    """
+    book_id, content_dir = resolve_target(args)
+    if not book_id or not content_dir:
+        print("缺 book_id 或 content_dir，请用 --book-id/--content-dir 指定")
+        return None, None, None
+    num2path = local_chapter_index(content_dir)
+    print(f"本地章节文件 {len(num2path)} 个  |  book_id {book_id}", flush=True)
+    return book_id, num2path, resolve_headless(args)
+
+
+def book_mismatch_abort(items, num2path):
+    """内容归属校验 + 统一的中止提示。返回 True 表示不匹配、必须中止。
+
+    book_id 和章节目录都可能来自 GUI 的"上次选择"，切过作品就会指向另一本
+    书。真写入前必须确认这批稿子确实属于这本书——写错书是补不回来的。
+    """
+    ok, detail = verify_content_matches_book(items, num2path)
+    print(f"归属校验: {detail}", flush=True)
+    if not ok:
+        print("⚠ 已中止，未做任何改动。请用 --book-id/--content-dir "
+              "显式指定，或检查 config.json 的 chapters_dir。", flush=True)
+    return not ok
+
+
+def resolve_headless(args=None):
+    """无头设置: config 的 headless 打底，--headless / --show-browser 覆盖。"""
+    headless = load_config().get("headless", False)
+    if getattr(args, "headless", False):
+        headless = True
+    if getattr(args, "show_browser", False):
+        headless = False
+    return headless
+
+
+async def reconcile_batch_auto(page, book_id, claimed_nums, fail_list,
+                               *, is_draft):
+    """批次收尾对账的统一入口：按模式挑对账方式，返回漏掉的章号。
+
+    发布类走章节列表对账，存草稿走草稿箱接口对账（后者覆盖"草稿ID读不到"
+    的推断盲区）。调用方拿返回值修正成功/失败计数——CLI 和 GUI 曾各写一遍
+    这段选择逻辑，加一种模式就得改两处。
+    """
+    if is_draft:
+        return await reconcile_drafts_after_batch(
+            page, book_id, claimed_nums, fail_list)
+    return await reconcile_after_batch(page, book_id, claimed_nums, fail_list)
+
+
+# 两套格式集是故意不同的，别合并:
+#   筛选允许纯日期（"某天之后改过的"，按当天 00:00 算是对的）
+#   定时必须带时分（只给日期会被静默当成凌晨 00:00 启动，是事故）
+# 不同的只是格式集，解析循环本身只能有一份 —— 曾经有三份。
+TIME_SPEC_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%d")
+TIMER_INPUT_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+
+
+def parse_datetime(raw, formats):
+    """按给定格式依次尝试解析，返回 datetime；都不匹配返回 None。"""
+    raw = (raw or "").strip()
+    for fmt in formats:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_time_spec(raw):
+    """解析 "YYYY-MM-DD" 或 "YYYY-MM-DD HH:MM"，返回时间戳；非法返回 None。
+
+    与 GUI「按修改日期筛选」同一套语义: 只给日期时按当天 00:00 算。
+    """
+    dt = parse_datetime(raw, TIME_SPEC_FORMATS)
+    return dt.timestamp() if dt is not None else None
+
+
+def parse_chapter_spec(raw):
+    """解析章节筛选表达式 → 区间列表 [(lo, hi), ...]；非法返回 None。
+
+    支持逗号分隔的单号与范围混用: "1,3,5-10"（范围亦可用 ~，
+    分隔符兼容 , ; 、以及 NFKC 归一后的全角逗号/分号）。
+    """
+    intervals = []
+    for token in re.split(r'[,;、]', raw):
+        token = token.strip()
+        if not token:
+            continue
+        m = re.match(r'^(\d+)\s*[-~]\s*(\d+)$', token)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo > hi:
+                lo, hi = hi, lo
+            intervals.append((lo, hi))
+            continue
+        if token.isdigit():
+            n = int(token)
+            intervals.append((n, n))
+            continue
+        return None  # 含非法 token
+    return intervals
+
+
+def filter_by_chapter_spec(items, spec, key=lambda x: x):
+    """按章节号表达式筛选。spec 支持 "30" / "5-10" / "1,3,5-10" / "≥30" / "<=30"。
+
+    与 GUI「按章节号筛选」同一套解析（parse_chapter_spec），所以补传清单里
+    压缩出来的章节号可以直接粘到 CLI 的 --chapters 上——CLI 曾经只在日志里
+    教用户"粘贴到按章节号筛选"，自己却没有这个入口。
+    返回 (筛选后的 items, 是否生效)。spec 非法时抛 ValueError。
+    """
+    if not spec:
+        return items, False
+    raw = unicodedata.normalize("NFKC", str(spec)).strip()
+    if not raw:
+        return items, False
+    op = None
+    m = re.match(r"^(≤|<=|≥|>=|<|>)\s*(\d+)$", raw)
+    if m:
+        op, raw = m.group(1), m.group(2)
+    if raw.isdigit():
+        n = int(raw)
+        # op 为 None = 裸数字，精确匹配那一章（不是阈值）。
+        # < 和 > 是严格的，不能并进 <= / >=：在不可逆的创建批次里，
+        # 「--chapters "<30"」多带一章第30章 = 多发一章用户明确排除的章节。
+        _OPS = {
+            None: lambda v: v == n,
+            "≤": lambda v: v <= n, "<=": lambda v: v <= n, "<": lambda v: v < n,
+            "≥": lambda v: v >= n, ">=": lambda v: v >= n, ">": lambda v: v > n,
+        }
+        _hit = _OPS[op]
+        kept = [x for x in items
+                if (_v := _spec_int(key(x))) is not None and _hit(_v)]
+        return kept, True
+    intervals = parse_chapter_spec(raw)
+    if not intervals:
+        raise ValueError(f"章节号筛选格式错误: {spec}（应为 30 / 5-10 / 1,3,5-10）")
+    kept = [x for x in items
+            if (v := _spec_int(key(x))) is not None
+            and any(lo <= v <= hi for lo, hi in intervals)]
+    return kept, True
+
+
+def _spec_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def compress_chapter_nums(nums) -> str:
     """把章节号集合压缩成筛选表达式: [79,80,81,83] -> "79-81,83"。
 
     输出与 GUI「按章节号筛选」的组合写法完全兼容，可直接粘贴补传。
+    CLI 的补传清单、GUI 的体检报告都用这一份——曾经两边各写一份逐字相同的
+    实现，属于"改一边漏一边"的典型温床。
     """
     uniq = sorted(set(nums))
     parts = []
@@ -282,11 +544,11 @@ def _compress_chapter_nums(nums) -> str:
     return ",".join(parts)
 
 
-def _log_fail_list(fail_list):
+def log_fail_list(fail_list):
     """批量结束时打印失败章节及原因清单（CLI/GUI 上传与修改共用）。
 
-    末尾追加按筛选语法压缩的失败章节号（如 "79-81,83-114"），
-    可直接粘贴到「按章节号筛选」输入框补传失败章节。
+    末尾追加按筛选语法压缩的失败章节号（如 "79-81,83-114"）。同一串号在两个
+    入口都能直接用: GUI 粘进「按章节号筛选」，CLI 传给 --chapters（同一个解析器）。
     """
     if not fail_list:
         return
@@ -300,19 +562,20 @@ def _log_fail_list(fail_list):
             nums.append(int(m.group(1)))
     if nums:
         logger.info(
-            f"  失败章节号: {_compress_chapter_nums(nums)}"
-            f"（可直接粘贴到「按章节号筛选」补传）")
+            f"  失败章节号: {compress_chapter_nums(nums)}"
+            f"（补传: GUI 粘进「按章节号筛选」，命令行加 --chapters）")
 
 
-def _record_unprocessed(fail_list, remaining, reason="每日字数上限，未处理"):
+def record_unprocessed(fail_list, remaining, reason="每日字数上限，未处理"):
     """中止整批后，把剩余未处理章节如实记入失败清单（不静默丢弃）。
 
     remaining: 可迭代的 (章节号, 标题) 二元组，章节号可为 None/空字符串。
     reason: 记入清单的原因文案（每日上限 / 流程异常中止等）。
     返回追加的条数，供上层据此累加 failed 计数，使「成功+失败=总数」对得上。
 
-    这些条目带"第N章"标签，会被 _log_fail_list 末尾的章节号压缩收进去，
-    用户明天可直接粘贴到「按章节号筛选」接着发——这正是"记录剩余"的落点。
+    这些条目带"第N章"标签，会被 log_fail_list 末尾的章节号压缩收进去，
+    用户明天粘进 GUI 的「按章节号筛选」或 CLI 的 --chapters 就能接着发——
+    这正是"记录剩余"的落点。
     """
     n = 0
     for ch_num, title in remaining:
@@ -418,6 +681,10 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
 
     接口判定 2026-06-26 真机抓包接入：提交最终调 /api/author/publish_article/v0/，
     业务结果在 200 响应的 JSON `code` 里（按钮消失区分不了 code!=0 的被拒）。
+
+    注意本函数只是**单章实时判定**，依据是页面/接口层面的信号。批次收尾还有
+    一道 reconcile_after_batch：拿平台真实章节列表核对"日志记成功的章"是否
+    真的存在。两道都要有——2026-07-24 漏 151 章那次，日志全程"成功"。
     """
     if timeout is None:
         timeout = _browser_timeout
@@ -445,7 +712,12 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
                 # 提交接口(实测 /api/author/publish_article/v0/，业务结果藏在
                 # 200 响应的 JSON `code` 里)——异步补抓 body，解析 code 写入
                 # verdict_holder 作为权威判定信号。
-                if "publish_article" in url:
+                # 改期走 /api/author/article/modify_timer/v0/，业务结果同样在
+                # 200 响应的 code 里。不认它的话改期只剩"按钮消失"这一个启发式：
+                # 2026-08-20 改期 609 章时，第1396章 接口已 200、toast 已"修改成功"，
+                # 只因按钮没消失被判失败，还白重试两次（去改一个已改好的章，
+                # 反而引出"服务器开小差了"）。平台真实排期核对确认那次是成功的。
+                if "publish_article" in url or "modify_timer" in url:
                     async def _grab(i=idx, r=resp):
                         try:
                             full = await r.text()
@@ -913,6 +1185,23 @@ async def create_context(p, headless=False):
     return browser, context
 
 
+async def settle_page(page, timeout=None):
+    """给页面一个「碰巧很快静下来就用上」的短窗口，静不下来立刻返回。
+
+    番茄的埋点/轮询一直在发请求，作家后台**永远不会**进入 networkidle —— 每次
+    都必然走到超时。Playwright 默认 30 秒，于是「正在获取章节列表…」这类状态
+    每次白等 30 秒。真正的就绪判据是调用方后面的 wait_for_selector / 提取 JS
+    自带的表格等待，所以这里超时不是错误，是常态。
+
+    六处调用点原来各写一遍这个 try/except，改一次上限要改六处。
+    """
+    try:
+        await page.wait_for_load_state(
+            "networkidle", timeout=timeout or NETWORKIDLE_MS)
+    except PWTimeout:
+        pass
+
+
 async def goto_with_login_retry(page, url, *, wait_until="load"):
     """打开作家后台页面，并区分"会话真失效"与"误跳登录页"。
 
@@ -930,7 +1219,11 @@ async def goto_with_login_retry(page, url, *, wait_until="load"):
     """
     for attempt in (1, 2):
         try:
-            await page.goto(url, wait_until=wait_until)
+            # 必须给上限: wait_until="load" 要等所有子资源，而平台的埋点/广告连接
+            # 可能一直不结束；超时又在下面被吞掉，于是每次白等 Playwright 默认的
+            # 30 秒。本函数本来就"以最终 URL 为准、不把超时当失败"，短上限无损。
+            await page.goto(url, wait_until=wait_until,
+                            timeout=get_browser_timeout())
         except PWTimeout:
             pass
         if "/login" not in page.url:
@@ -1463,7 +1756,8 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
                 }
             }
 
-            // 发布/排期日期（补漏章按此推算每个缺口的插入槽位）
+            // 发布/排期日期（修改排期要用；「检查缺口」据此判断已发布章
+            // 是否还在 3 天可移动窗口内）
             const dm = row.textContent.match(dateRe);
             const rowDate = dm ? dm[1].replace(/\//g, '-') : null;
             const rowTime = dm ? dm[2] : null;
@@ -1483,6 +1777,12 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
         }
 
         pageCount++;
+        // 章节多的书要翻十几页，逐页回报进度，界面才不会看着像卡死。
+        // 没暴露这个函数的调用方（CLI）自然跳过。
+        if (typeof __fanqiePageProgress === 'function') {
+            try { await __fanqiePageProgress(pageCount, totalPages,
+                                             allChapters.length); } catch (e) {}
+        }
         if (newCount === 0 && pageCount > 1) break;
 
         // 下一页
@@ -1600,13 +1900,23 @@ async def select_volume(page, volume_text: str) -> bool:
 
 
 async def extract_chapters_from_page(
-    page, book_id: str = "",
+    page, book_id: str = "", on_progress=None,
 ) -> tuple[list[dict], dict | None]:
     """从章节管理页提取全部章节列表（单次 JS 调用完成全部翻页）。
 
     返回 (chapters, last_publish_info)。
     last_publish_info: {date, time, chapter} 或 None。
+
+    on_progress(已翻页数, 总页数, 已抓章数): 可选。章节多的书要翻十几页、耗时十
+    几秒，没有进度的话界面看着像卡死。CLI 不传，行为完全不变。
     """
+    if on_progress is not None:
+        try:
+            await page.expose_function(
+                "__fanqiePageProgress",
+                lambda done, total, n: on_progress(done, total, n))
+        except Exception:
+            pass   # 同一个 page 上已暴露过（换卷时会复用），忽略即可
     result = await page.evaluate(
         _EXTRACT_ALL_JS,
         # maxTime = 8x: 自动翻页可能需要遍历多页，总时长需大于单页超时
@@ -1700,7 +2010,7 @@ async def click_next_step(page):
 # ---------------------------------------------------------------------------
 # 定时发布
 # ---------------------------------------------------------------------------
-def _validate_times(raw: str) -> list[str]:
+def validate_times(raw: str) -> list[str]:
     """解析、校验、排序、去重时间字符串。
 
     输入: 逗号分隔的时间 (如 "20:00, 08:00, 12:00")
@@ -1745,7 +2055,7 @@ def compute_schedule(
     """
     per_day = max(1, per_day)
     base = datetime.strptime(start_date, "%Y-%m-%d")
-    times = _validate_times(pub_time)
+    times = validate_times(pub_time)
     if not times:
         times = ["08:00"]
     # 时间点数量 > per_day 时，以时间点为准
@@ -1841,103 +2151,611 @@ def compute_schedule(
 
 
 # ---------------------------------------------------------------------------
-# 缺章补发：把定时发布中段漏掉的章节，按原排期节奏插回正确位置
+# 章节位置体检（CLI 工具 tools/remap 与 GUI「检查缺口」共用）
+#
+# 2026-08-20 实测: 番茄的目录顺序 = 章节 item 在卷内的位置（接口 chapter_list
+# 的 index），既不是标题里的「第N章」（接口里根本没有章节号字段，编辑器那个框
+# 只是拼进标题文本），也不是定时发布时间。新建章一律追加到全书末尾，网页端没有
+# 任何插入/排序入口。已发布章只能在手机 App 里「申请→审批→单章选中→移动位置」，
+# 且**只对发布 3 天内的章有效**，超期即永久错位。
 # ---------------------------------------------------------------------------
-# 番茄每天 9 个定时槽位（与原排期一致）。缺口 = 这些槽位里空出来的位置。
-GAP_SLOTS = ["07:00", "07:01", "07:02", "12:00", "12:01", "12:02",
-             "20:00", "20:01", "20:02"]
+DISPLAY_PUBLISHED = 1      # display_status: 已公开，网页端动不了
+DISPLAY_PENDING = 10       # display_status: 待发布，可改内容
+MOVE_WINDOW_H = 72         # App 里能申请移动的窗口（3 天）
 
 
-def _gap_grid_between(P, S):
-    """P、S 为 (date_str, time_str)。返回 P、S 之间(开区间)的所有 9 槽位。"""
-    dp = datetime.strptime(P[0], "%Y-%m-%d").date()
-    ds = datetime.strptime(S[0], "%Y-%m-%d").date()
-    out = []
-    d = dp
-    while d <= ds:
-        ds_iso = d.strftime("%Y-%m-%d")
-        for t in GAP_SLOTS:
-            cur = (ds_iso, t)
-            if P < cur < S:
-                out.append(cur)
-        d += timedelta(days=1)
-    return out
+def chapter_title_num(t):
+    """平台章节标题里的章节号 —— 只是文本，不是平台的排序依据。
 
-
-def _gap_interp_between(P, S, n):
-    """退化兜底：P、S 之间均匀插 n 个时间点（分钟粒度），保证非递减、不越界。
-
-    窗口太窄（分钟粒度塞不下 n 个不同分钟）时允许同分钟重复——番茄按章节号
-    排序，同分钟不影响阅读顺序；但绝不越出 [P, S] 侵占邻章的时间。
+    判据与 _EXTRACT_ALL_JS 保持一致（两处都在解析同一批平台标题，不对称会让
+    对账把「1 开端」这类裸数字标题当成"平台上没有第1章"而误报漏章）：
+    先认「第N章/回/节/话」，再退到裸数字开头且后面是结尾/分隔符——后者的守卫
+    是为了不把「2023年的夏天」误判成第 2023 章。
     """
-    a = datetime.strptime(f"{P[0]} {P[1]}", "%Y-%m-%d %H:%M")
-    b = datetime.strptime(f"{S[0]} {S[1]}", "%Y-%m-%d %H:%M")
-    total = (b - a).total_seconds()
-    out = []
-    for k in range(1, n + 1):
-        dt = a + timedelta(seconds=total * k / (n + 1))
-        dt = dt.replace(second=0, microsecond=0)
-        # 夹回开区间 [P, S]，防止四舍五入落到邻章时刻之外
-        cur = (dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M"))
-        cur = max(P, min(cur, S))
-        out.append(cur)
-    return out
+    t = t or ""
+    m = re.match(r"^第\s*(\d+)\s*[章回节话]", t)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"^(\d+)(?=$|[\s:：_\-.、章回节话])", t)
+    return int(m.group(1)) if m else None
 
 
-def compute_gap_schedule(rows):
-    """从平台章节行计算「缺口章节」的补发排期。
+# 复用页面自己发出的已签名 chapter_list 请求，只换 page_index/page_count 翻页。
+# 关键: 不能把"这一页没数据"一律当成翻完了。限流、鉴权失效、data=null 等异常
+# 响应同样返回空 item_list，静默截断会让上层把"没抓到的章"当成"平台上没有"，
+# 反过来制造大规模假漏章（对账要靠这份数据当真相，宁可报错也不能给半份）。
+_FETCH_ITEMS_JS = r"""async (u) => {
+    const out = [];
+    for (let pg = 0; pg < 60; pg++) {
+        // replace 匹配不上是静默 no-op：那样每一轮都在取同一页（或服务端默认
+        // 页大小），第 0 页短于预期就被当成"全书就这么多"。对账拿这份当真相，
+        // 半份数据会把几百章报成"平台上没有"，用户照单补传就是几百章重复。
+        if (!/page_index=\d+/.test(u) || !/page_count=\d+/.test(u)) {
+            return {error: '签名 URL 里没有 page_index/page_count，无法翻页'};
+        }
+        const uu = u.replace(/page_index=\d+/, 'page_index=' + pg)
+                    .replace(/page_count=\d+/, 'page_count=100');
+        let r, j;
+        try {
+            r = await fetch(uu, {credentials: 'include'});
+            j = await r.json();
+        } catch (e) {
+            return {error: '第' + pg + '页请求失败: ' + e};
+        }
+        if (!r.ok) return {error: '第' + pg + '页 HTTP ' + r.status};
+        if (j && j.code !== undefined && j.code !== 0 && j.code !== '0') {
+            return {error: '第' + pg + '页接口 code=' + j.code +
+                           ' ' + (j.message || '')};
+        }
+        if (!j || !j.data) return {error: '第' + pg + '页响应无 data 字段'};
+        const list = j.data.item_list || [];
+        if (!list.length) break;          // 真的翻完了
+        out.push(...list.map(x => ({index: x.index, title: x.title,
+            display_status: x.display_status, timer_time: x.timer_time,
+            create_time: x.create_time, item_id: x.item_id,
+            cant_modify_reason: x.cant_modify_reason})));
+        if (list.length < 100) break;     // 不满一页=最后一页，不必再请求
+    }
+    return {items: out};
+}"""
 
-    rows: 平台抓取的章节行，每项含 chapterNum / date / time（见 _EXTRACT_ALL_JS）。
-    缺口 = [1..平台最大章号] 中平台上不存在的章号。每个连续缺口段用 9 槽位网格
-    在前后邻章之间填空（槽位数≠缺章数时退化为均匀插值并告警），保证插到正确
-    阅读位置、补发时刻严格单调（同段内非递减）。
 
-    返回 (assign, warnings): assign={章号:(date,time)}；warnings=[str]。
+VOLUME_INDEX_STRIDE = 10000    # index = 卷序号(0起) * 10000 + 卷内位置
+
+
+def global_position(index, offsets):
+    """把 chapter_list 的 index 换算成「全书第几个位置」。
+
+    2026-08-20 在真多卷作品（3 卷 100+150+115=365 章）上实测:
+      卷1 index 1~100、卷2 index 10001~10150、卷3 index 20001~20115
+    即 index = 卷序号(0 起) * 10000 + 卷内位置。全书位置 = 前面各卷章数之和
+    + 卷内位置，365 章逐条比对「全局位置 == 标题第N章」零偏差。
+
+    offsets: {卷序号: 前面各卷 item_count 之和}。单卷书 offsets={0:0}，
+    此时返回值就等于 index，与单卷逻辑完全一致（所以调用方不必分叉）。
     """
-    byn = {r["chapterNum"]: r for r in rows if r.get("chapterNum") is not None}
-    if not byn:
-        return {}, ["平台未解析到任何带章节号的章节"]
-    mx = max(byn)
-    missing = [i for i in range(1, mx + 1) if i not in byn]
-    # 连续段
-    runs = []
-    i = 0
-    while i < len(missing):
-        j = i
-        while j + 1 < len(missing) and missing[j + 1] == missing[j] + 1:
-            j += 1
-        runs.append((missing[i], missing[j]))
-        i = j + 1
+    vol = index // VOLUME_INDEX_STRIDE
+    return offsets.get(vol, 0) + index % VOLUME_INDEX_STRIDE
 
-    assign, warnings = {}, []
-    for a, b in runs:
-        pa, pb = byn.get(a - 1), byn.get(b + 1)
-        if (not pa or not pb or not pa.get("date") or not pb.get("date")
-                or not pa.get("time") or not pb.get("time")):
-            warnings.append(f"段 {a}-{b}: 前/后邻章缺日期或时间，跳过（需手动处理）")
+
+async def fetch_volume_list(page, signed_volume_url):
+    """按 index 升序返回 [{volume_id, volume_name, item_count, index}]。"""
+    data = await page.evaluate(
+        "async (u) => (await (await fetch(u, {credentials:'include'})).json())",
+        signed_volume_url)
+    vols = ((data or {}).get("data") or {}).get("volume_list") or []
+    return sorted(vols, key=lambda v: v.get("index", 0))
+
+
+async def fetch_chapter_items(page, book_id):
+    """抓平台章节的真实状态（全书、跨卷），返回 (items, signed_url, volumes)。
+
+    章节列表接口带 volume_id，一次只返回一卷。这里遍历每一卷（把签名 URL 里
+    的 volume_id 换掉，实测接口认），拼成全书视图——漏章对账必须看全书，
+    只看当前卷会把别卷的章全判成"平台上没有"。
+
+    每个 item 额外带:
+      pos         全书第几个位置（跨卷连续，见 global_position）
+      volume_id / volume_name
+    单卷作品 pos == index，与单卷逻辑完全一致。
+
+    signed_url 供调用方继续按页回读做对账；volumes 是卷列表（长度即卷数）。
+
+    防错位铁律（错了会让 remap 把章改写成不相干正文，必须炸而不是猜）:
+      · 每卷抓回的 item 必须满足 index//10000 == 卷序号——这同时抓住
+        「volume_id 替换没生效、其实每次都在抓当前卷」和「平台改了编号规则」；
+      · 抓到带卷偏移的 index 却没有卷列表 → 多卷书按单卷算，pos 全错，直接报错。
+    """
+    seen_ch, seen_vol = [], []
+
+    def _grab(r):
+        if "chapter/chapter_list" in r.url:
+            seen_ch.append(r.url)
+        elif "volume/volume_list" in r.url:
+            seen_vol.append(r.url)
+
+    # 用完必须摘掉：本函数在长任务里会被反复调用（每次对账都可能重取签名），
+    # 监听器只加不减会一路累积到页面销毁。
+    page.on("request", _grab)
+    try:
+        if not await goto_with_login_retry(
+                page, CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)):
+            raise RuntimeError("会话失效，请先重新登录")
+        for _ in range(20):
+            await page.wait_for_timeout(500)
+            if seen_ch:
+                break
+        if not seen_ch:
+            raise RuntimeError("没抓到 chapter_list 请求，页面结构可能已变")
+        # volume_list 通常先于 chapter_list 发出，但别赌时序——再宽限几秒。
+        # 多卷书漏了卷列表不是"降级"，是 pos 全错（见铁律②），所以必须等。
+        for _ in range(6):
+            if seen_vol:
+                break
+            await page.wait_for_timeout(500)
+        ch_url = seen_ch[-1]
+
+        vols = []
+        if seen_vol:
+            try:
+                vols = await fetch_volume_list(page, seen_vol[-1])
+            except Exception as e:
+                logger.debug(f"取分卷列表失败，按单卷处理: {e}")
+
+        # 逐卷抓；偏移量按卷序累加，得到跨卷连续的全书位置
+        items, acc = [], 0
+        targets = vols or [None]
+        for ordinal, v in enumerate(targets):
+            # volume_id=\d* 兼容空参数值（\d+ 匹配不上会静默抓成当前卷）
+            url = ch_url if v is None else re.sub(
+                r"volume_id=\d*", f"volume_id={v['volume_id']}", ch_url, count=1)
+            res = await page.evaluate(_FETCH_ITEMS_JS, url)
+            if res.get("error"):
+                raise RuntimeError(f"抓取章节列表失败: {res['error']}")
+            got = res.get("items") or []
+            bad = [it["index"] for it in got
+                   if it["index"] // VOLUME_INDEX_STRIDE != ordinal]
+            if bad:
+                raise RuntimeError(
+                    f"卷{ordinal + 1} 抓回的 index 不符（如 {bad[:3]}），"
+                    f"疑似 volume_id 替换未生效或平台编号规则已变——中止以防错位")
+            if v is not None and got and len(got) != (v.get("item_count") or len(got)):
+                logger.warning(f"  卷「{v.get('volume_name')}」抓到 {len(got)} 章，"
+                               f"与卷信息声明的 {v.get('item_count')} 不一致")
+            for it in got:
+                # 走 global_position 而不是内联公式: demo 里的多卷断言测的就是它，
+                # 内联一份等于断言盖不住生产路径（卷偏移算错=全书错位，代价极大）
+                it["pos"] = global_position(it["index"], {ordinal: acc})
+                if v is not None:
+                    it["volume_id"] = v.get("volume_id")
+                    it["volume_name"] = v.get("volume_name")
+            items.extend(got)
+            acc += len(got)
+        if not vols and any(it["index"] >= VOLUME_INDEX_STRIDE for it in items):
+            raise RuntimeError(
+                "抓到带卷偏移的 index 但没取到卷列表——多卷作品按单卷算会全错，"
+                "请重试（多为 volume_list 请求未捕获）")
+        return items, ch_url, vols
+    finally:
+        try:
+            page.remove_listener("request", _grab)
+        except Exception:
+            pass
+
+
+def volume_count(volumes):
+    """卷数（拿不到就当 1 卷）。兼容 detect_volumes 结果与 fetch 返回的卷列表。"""
+    try:
+        if isinstance(volumes, dict):
+            return max(1, len(volumes.get("volumes") or []))
+        return max(1, len(volumes or []))
+    except Exception:
+        return 1
+
+
+def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
+    """缺口体检: 按「谁能修」把问题分三段。
+
+    A pending_bad 未公开段位置与章号不符 → 可用 tools/remap 自动改写内容。
+    B in_window  已公开、发布在 window_h 内、且排在了它该在的位置之后
+                 → 只能手机 App 申请+审批+逐章移动，很贵，必须在窗口内知道。
+    C expired    已公开、超窗口 → 永久错位，只能登记在案。
+
+    "排在了该在的位置之后"判据: 该 item 的章号 < 它前面所有位置出现过的最大
+    章号。均匀后移（前面漏章导致整段偏移）不算——那只是缺号，阅读顺序仍单调；
+    真正伤读者的是顺序倒挂（读到第699章之后突然接第480章）。
+    已发布章的 create_time 就是实际发布时刻（平台在发布时改写该字段）。
+    """
+    now_ts = int(time.time()) if now_ts is None else now_ts
+    pend_bad, in_window, expired = [], [], []
+    running_max = 0
+    # 按全书位置排序/比对：多卷作品的 index 带卷序号偏移（见 global_position），
+    # 直接拿 index 和「第N章」比会把整卷判成错位。单卷时 pos 缺省等于 index。
+    for it in sorted(items, key=lambda x: x.get("pos", x["index"])):
+        pos = it.get("pos", it["index"])
+        n = chapter_title_num(it["title"])
+        if it["display_status"] == DISPLAY_PUBLISHED:
+            if n is not None and n < running_max:
+                try:
+                    pub_at = int(it.get("create_time") or 0)
+                except (TypeError, ValueError):
+                    pub_at = 0
+                left_h = (pub_at + window_h * 3600 - now_ts) / 3600
+                row = {"index": pos, "num": n, "title": it["title"],
+                       "pub_at": pub_at, "left_h": left_h}
+                (in_window if left_h > 0 else expired).append(row)
+            if n is not None:
+                running_max = max(running_max, n)
+        elif (it["display_status"] == DISPLAY_PENDING
+              and n is not None and n != pos):
+            # n is None = 标题里没有「第N章」（楔子/番外/作者的话）。它本来就
+            # 不参与主线编号，拿 pos 去比必然不等 —— 判成错位会让 remap 把它
+            # 排进改写计划，标题和正文被第pos章的内容覆盖。
+            pend_bad.append(pos)
+    return {"pending_bad": pend_bad, "in_window": in_window, "expired": expired}
+
+
+# ---------------------------------------------------------------------------
+# 无人值守外壳（tools/ 下的定时作业共用：remap 重排、keep_ahead 续排…）
+#
+# 放在这里而不是各工具各写一份：日志接管、告警弹窗、崩溃兜底这几件事每个
+# 定时作业都要，抄第二遍就会漂移（一个改了另一个没改）。
+# ---------------------------------------------------------------------------
+def start_task_log(log_dir, prefix):
+    """把本进程输出接到带时间戳的日志文件，并接管 logger 的控制台 handler。
+
+    无人值守跑（Windows 计划任务用 pythonw / cron）时没有终端接输出：
+    print 会打到不存在的 stdout，logger 的 StreamHandler 也写不出去。这里
+    统一换成写同一个文件对象——共用一个句柄，两路输出不会互相截断。
+    返回日志路径。
+    """
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"{prefix}_{datetime.now():%Y%m%d_%H%M}.log"
+    f = open(path, "w", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = f
+    for h in list(logger.handlers):
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+            logger.removeHandler(h)
+    fh = logging.StreamHandler(f)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                                      datefmt="%H:%M:%S"))
+    logger.addHandler(fh)
+    return path
+
+
+def alert(title, text):
+    """弹窗提醒。tkinter 是本项目已有依赖（GUI 就用它），跨平台可用。
+
+    没有图形环境（headless 服务器 / cron）时静默失败——日志里已经写了原因，
+    弹不出来不该把整次运行搞崩。
+    """
+    try:
+        import tkinter
+        from tkinter import messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showwarning(title, text)
+        root.destroy()
+    except Exception as e:
+        print(f"（弹窗失败，仅记日志: {e}）", flush=True)
+
+
+def verify_content_matches_book(items, num2path, *, sample=8):
+    """确认「本地这批稿子」确实属于「平台这本书」。返回 (ok, 说明)。
+
+    为什么必须查: 无人值守作业的 book_id 取自 .gui_state.json 的 last_book_id、
+    章节目录取自 config.json 的 chapters_dir——**在 GUI 里切一次作品，今晚的
+    定时任务就换了目标**。而这些作业都是真写入（改写正文 / 发布新章），把 A 书
+    的稿子发进 B 书，后果和漏章一个量级且更难收拾。
+
+    做法: 取平台上已发布的若干章，跟本地同章号文件的标题比。标题是作者自己
+    写的、跨书重合概率极低，比对不上就是拿错目录。平台标题形如
+    「第N章 标题」，本地 parse 出来的是纯标题，所以做包含比较。
+    """
+    pub = [x for x in items if x.get("display_status") == DISPLAY_PUBLISHED]
+    checked = matched = 0
+    misses = []
+    for it in sorted(pub, key=lambda x: x.get("pos", x.get("index", 0)),
+                     reverse=True):
+        if checked >= sample:
+            break
+        n = chapter_title_num(it.get("title"))
+        if n is None or n not in num2path:
             continue
-        P = (pa["date"], pa["time"])
-        S = (pb["date"], pb["time"])
-        need = b - a + 1
-        slots = _gap_grid_between(P, S)
-        if len(slots) != need:
-            warnings.append(
-                f"段 {a}-{b}: 槽位数({len(slots)})≠缺章数({need})，"
-                f"改用均匀插值（{P[0]} {P[1]} ~ {S[0]} {S[1]}）")
-            slots = _gap_interp_between(P, S, need)
-        for k, ch in enumerate(range(a, b + 1)):
-            assign[ch] = slots[k]
-    return assign, warnings
+        checked += 1
+        try:
+            _c, local_title, _b = parse_md_file(Path(num2path[n]))
+        except Exception:
+            continue
+        if local_title and local_title.strip() and local_title.strip() in it["title"]:
+            matched += 1
+        else:
+            misses.append(f"第{n}章 平台「{it['title'][:22]}」≠ 本地「{local_title[:16]}」")
+    if checked == 0:
+        return True, "无可比对样本（平台已发布章都不在本地），跳过校验"
+    if matched * 2 < checked:      # 过半对不上 = 拿错目录
+        return False, (f"抽查 {checked} 章仅 {matched} 章标题吻合，"
+                       f"本地目录疑似不属于这本书：" + "；".join(misses[:3]))
+    return True, f"抽查 {checked} 章，{matched} 章标题吻合"
 
 
-def overdue_gap_nums(assign, now):
-    """返回补发时刻已 ≤ now 的缺口章号（升序）。now = (date_str, time_str)。
+_MONTHLY_LIMIT_RE = re.compile(r"(每月|本月|单月|月度)[^，。;；]{0,12}上限")
 
-    这些缺口的原定排期时刻已过：①番茄通常拒绝把定时发布设到过去；②该缺口
-    大概率已是读者可见的断档（前后邻章都已发布）。应尽快改用「立即发布」补上，
-    而不是继续按已过去的时刻定时。调用方（GUI/CLI）据此醒目告警。
+
+def is_monthly_limit(msg):
+    """这条上限提示是「每月」而不是「每日」吗？
+
+    两者的处置完全不同，不该混为一谈:
+      · 撞每日上限 —— 常态，明天接着跑，进度不受影响（每月额度才是硬顶）。
+      · 撞每月上限 —— 本月到此为止，后面十几二十天一章都改不动，而发布前沿
+        仍在推进。此时必须立刻检查"余量够不够撑到下月"，不够就得再降速。
     """
-    return sorted(n for n, (d, t) in assign.items() if (d, t) <= tuple(now))
+    return bool(_MONTHLY_LIMIT_RE.search(str(msg or "")))
+
+
+# 新章确认: 只拉列表第一页（新建章必是最新的），1 个请求就够
+# 必须区分「平台确实没这章」和「这次问不出来」: 接口 429 / code=-100
+# （平台真会返回"服务器开小差了"）时 j.data 为空，若当成"没有"就会判定
+# 新章没落地 -> 中止整批 + 记入补传清单 -> 用户照单补传 -> 书尾多一章重复，
+# 而重复章按番茄的追加序永远移不回去。宁可报 unknown 让上层继续轮询。
+_PROBE_LATEST_JS = r"""async (u) => {
+    const uu = u.replace(/page_index=\d+/, 'page_index=0')
+                .replace(/page_count=\d+/, 'page_count=30');
+    try {
+        const r = await fetch(uu, {credentials: 'include'});
+        if (!r.ok) return {error: 'http ' + r.status};
+        const j = await r.json();
+        if (j && j.code !== undefined && j.code !== 0)
+            return {error: 'code ' + j.code + ' ' + (j.message || '')};
+        if (!j || !j.data || !Array.isArray(j.data.item_list))
+            return {error: 'no item_list'};
+        return {titles: j.data.item_list.map(x => x.title)};
+    } catch (e) {
+        return {error: String(e)};
+    }
+}"""
+
+
+def watch_chapter_list_url(page):
+    """持续记录页面自己发出的、最新的已签名 chapter_list 请求 URL。
+
+    返回 (holder, detach)。holder[-1] 就是最新可用的签名 URL。
+    发布成功后 SPA 会跳回 chapter-manage，那次跳转天然带来一条新鲜签名——
+    所以不必为了确认新章而额外导航，也不怕签名过期。
+    """
+    holder = []
+
+    def _grab(r):
+        if "chapter/chapter_list" in r.url:
+            # 只留最新一条: 调用方只读 holder[-1]，而每次确认轮询都会
+            # 触发一次 chapter_list 请求，748 章的批次会攒下几千条长 URL。
+            holder[:] = [r.url]
+
+    page.on("request", _grab)
+
+    def detach():
+        try:
+            page.remove_listener("request", _grab)
+        except Exception:
+            pass
+
+    return holder, detach
+
+
+async def confirm_chapter_on_platform(page, url_holder, num, *,
+                                      window_s=90, poll_s=10):
+    """确认「第num章」真的出现在平台上了。返回 True/False。
+
+    **只有"新建"类操作需要它**（定时发布/立即发布/续排），因为失败不可逆:
+    章节根本不存在，而新建只能追加到全书末尾，中段缺口再也补不回原位
+    （2026-07-24 那次 748 章漏 151 章正是如此: "按钮消失=成功"误判，
+    日志全绿、平台没有，三周后发现时已超过手机 App 的 3 天移动窗口）。
+    改内容/改排期则相反——item 还在，重来一次即可，不该为确认牺牲吞吐。
+
+    拿不到签名 URL 时返回 True（无从确认，不阻断任务）；调用方已有批末对账兜底。
+    """
+    if not url_holder:
+        # 静默返回 True 等于「这一章不确认了」。整批都没捕获到签名请求时，
+        # 防漏章的守卫就整批关闭了却没人知道 —— 至少要留一条日志，
+        # 让批末对账的告警有迹可循。
+        logger.warning(
+            f"  第{num}章 无法确认: 还没捕获到章节列表的签名请求，"
+            f"本章跳过确认（批末对账仍会核对）")
+        return True
+    deadline = time.monotonic() + window_s
+    clean_probe = False   # 窗口内是否至少成功问到过一次章节列表
+    last_err = ""
+    while True:
+        try:
+            res = await page.evaluate(_PROBE_LATEST_JS, url_holder[-1])
+        except Exception as e:
+            res = {"error": str(e)}
+        if isinstance(res, dict) and res.get("error"):
+            # 问不出来 ≠ 平台上没有。继续轮询，别拿一次网络抖动去中止整批。
+            last_err = str(res["error"])
+        else:
+            clean_probe = True
+            titles = (res or {}).get("titles") or []
+            if any(chapter_title_num(t) == num for t in titles):
+                return True
+        if time.monotonic() >= deadline:
+            if not clean_probe:
+                # 整个窗口一次都没问通（接口挂了/限流）——此时判"没落地"会造成
+                # 假失败并诱发重复补传，而重复章补不回原位。放行交给批末对账，
+                # 那条路会拿完整章节列表核对，代价只是晚一点发现。
+                logger.warning(
+                    f"  确认第{num}章时始终读不到章节列表（{last_err}），"
+                    f"本章不判失败，交由批末对账核实")
+                return True
+            return False
+        await page.wait_for_timeout(poll_s * 1000)
+
+
+def find_missing_after_batch(items, claimed_nums):
+    """纯函数: 我们以为发成功的章号里，平台上实际不存在的是哪些（升序）。
+
+    claimed_nums: 本批"日志记成功"的章节号集合。
+    items: 平台真实章节（fetch_chapter_items 的返回）。
+    平台上一章是否存在，只看它的标题里有没有那个「第N章」——章节号在番茄
+    只是标题文本，但对"这一章到底发出去没有"这个问题，它就是唯一可比的键。
+    """
+    present = {chapter_title_num(x.get("title")) for x in items}
+    present.discard(None)
+    return sorted(n for n in claimed_nums if n is not None and n not in present)
+
+
+# 草稿接口的每页上限比章节接口低: 实测 page_count=30 可以、50 起就返回
+# code=-100「服务器开小差了」（章节接口 100 没问题）。别照抄那边的 100。
+_DRAFT_PAGE = 30
+_DRAFT_LIST_JS = r"""async ([u, per]) => {
+    const out = [];
+    let total = null;
+    for (let pg = 0; pg < 200; pg++) {
+        const uu = u.replace(/page_index=\d+/, 'page_index=' + pg)
+                    .replace(/page_count=\d+/, 'page_count=' + per);
+        let r, j;
+        try {
+            r = await fetch(uu, {credentials: 'include'});
+            // 先判 r.ok 再 json(): 502/429 常返回 HTML，先 json() 会直接抛，
+            // 而外层没有 try 包 evaluate，于是走不到下面那句友好报错，
+            // clean_drafts 拿到的是一条生的 Playwright 异常。
+            if (!r.ok) return {error: '第' + pg + '页 HTTP ' + r.status};
+            j = await r.json();
+        } catch (e) {
+            return {error: '第' + pg + '页请求失败: ' + e};
+        }
+        if (j && j.code !== undefined && j.code !== 0 && j.code !== '0') {
+            return {error: '第' + pg + '页接口 code=' + j.code};
+        }
+        const d = j && j.data;
+        if (!d) return {error: '第' + pg + '页响应无 data'};
+        if (total === null) total = d.total_count;
+        const list = d.draft_list || [];
+        if (!list.length) break;
+        out.push(...list.map(x => ({title: x.title, word_number: x.word_number,
+                                    item_id: x.item_id})));
+        if (list.length < per) break;
+    }
+    return {drafts: out, total: total};
+}"""
+
+
+async def fetch_draft_list(page, book_id):
+    """抓草稿箱真实内容，返回 (drafts, total_count)。
+
+    草稿箱走 /api/author/chapter/draft_list/v1（与章节列表不是同一个接口）。
+    """
+    seen = []
+
+    def _grab(r):
+        if "chapter/draft_list" in r.url:
+            seen.append(r.url)
+
+    page.on("request", _grab)
+    try:
+        if not await goto_with_login_retry(
+                page, CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)):
+            raise RuntimeError("会话失效，请先重新登录")
+        await page.wait_for_timeout(2000)
+        # 点「草稿箱」标签，让页面自己发出带签名的 draft_list 请求
+        await page.evaluate("""() => {
+            for (const el of document.querySelectorAll('*')) {
+                if (el.children.length === 0 &&
+                    (el.textContent || '').trim() === '草稿箱') { el.click(); return; }
+            } }""")
+        for _ in range(20):
+            await page.wait_for_timeout(500)
+            if seen:
+                break
+        if not seen:
+            raise RuntimeError("没抓到 draft_list 请求，页面结构可能已变")
+        res = await page.evaluate(_DRAFT_LIST_JS, [seen[-1], _DRAFT_PAGE])
+        if res.get("error"):
+            raise RuntimeError(f"抓取草稿列表失败: {res['error']}")
+        _drafts = res.get("drafts") or []
+        # total 必须是 int: 接口偶尔不给 total_count，返回 None 会让调用方的
+        # min(limit, total) 直接崩，GUI 的 if not total 又会误报「草稿箱是
+        # 空的」而不去清理。拿不到就退回已抓到的条数。
+        _total = res.get("total")
+        if not isinstance(_total, int):
+            _total = len(_drafts)
+        return _drafts, _total
+    finally:
+        try:
+            page.remove_listener("request", _grab)
+        except Exception:
+            pass
+
+
+async def reconcile_drafts_after_batch(page, book_id, claimed_nums, fail_list):
+    """存草稿批次收尾对账: 拿草稿箱真实内容核对"日志记已存"的章。
+
+    **草稿只做批末对账，不做逐章确认**——判据仍是"失败可不可逆":
+    草稿丢了重传即可、不影响正文顺序，为一次确认失败中止整批得不偿失；
+    而定时/立即发布漏一章是永久缺口，才值得逐章确认+失败即停。
+
+    这里补的是一个真盲区: 原本只能靠"草稿ID 被复用"**推断**上一章被覆盖，
+    读不到草稿ID 时只能提示"请到草稿箱核对"。改成拿平台真实草稿列表比对，
+    漏了哪几章直接列出来（番茄会把连续两次新建章草稿并到同一槽位，
+    覆盖丢失是这条路径的常见故障）。
+    """
+    if not claimed_nums:
+        return []
+    try:
+        drafts, total = await fetch_draft_list(page, book_id)
+    except Exception as e:
+        logger.warning(f"草稿对账失败（不影响已存草稿）: {e}")
+        return []
+    present = {chapter_title_num(d.get("title")) for d in drafts}
+    present.discard(None)
+    missing = sorted(n for n in claimed_nums if n not in present)
+    logger.info(f"草稿对账: 本批 {len(claimed_nums)} 章，草稿箱共 {total} 条")
+    if missing:
+        logger.error(f"⚠ 有 {len(missing)} 章日志记已存草稿但草稿箱里没有: "
+                     f"{'、'.join(f'第{n}章' for n in missing[:20])}"
+                     f"{' …' if len(missing) > 20 else ''}")
+        logger.error("  多为番茄把相邻两章并到同一草稿槽导致覆盖；重存这些章即可"
+                     "（草稿无顺序问题，重传无副作用）")
+        for n in missing:
+            fail_list.append((f"第{n}章 ", "对账: 日志记已存草稿但草稿箱里没有"))
+    else:
+        logger.info("草稿对账通过: 本批章节在草稿箱里都能查到")
+    return missing
+
+
+async def reconcile_after_batch(page, book_id, claimed_nums, fail_list):
+    """批次收尾对账：拿平台真实数据核对"日志说发成功的章"是不是真的在。
+
+    为什么必须有: 提交判定再严也只是页面/接口层面的信号。2026-07-24 那次
+    748 章定时发布，日志记"成功 736"，平台上却少 151 章——直到三周后人工
+    只读枚举才发现，那时早已超过手机 App 的 3 天移动窗口，全部永久错位。
+    发完立刻对一次账，漏章当天就暴露，窗口还剩 72 小时、要手动移的是 1 章。
+
+    漏掉的章写入 fail_list，由 log_fail_list 压进可直接补传的章节号。
+    返回漏掉的章号列表；对账本身失败（网络/会话）只告警，不影响批次结果。
+    """
+    if not claimed_nums:
+        return []
+    try:
+        items, _, volumes = await fetch_chapter_items(page, book_id)
+    except Exception as e:
+        logger.warning(f"批次对账失败（不影响已发章节）: {e}")
+        return []
+    if volume_count(volumes) > 1:
+        logger.info(f"  （本作品 {volume_count(volumes)} 卷，已跨卷合并 {len(items)} 章对账）")
+    missing = find_missing_after_batch(items, claimed_nums)
+    if missing:
+        logger.error(f"⚠ 对账发现 {len(missing)} 章日志记成功但平台上没有: "
+                     f"{'、'.join(f'第{n}章' for n in missing[:20])}"
+                     f"{' …' if len(missing) > 20 else ''}")
+        logger.error("  这些章需要重发；番茄新建章只会追加到全书末尾，"
+                     "所以越早补越好（已公开章的顺序只能在手机 App 里申请移动，限 3 天）")
+        for n in missing:
+            fail_list.append((f"第{n}章 ", "对账: 日志记成功但平台上不存在"))
+    else:
+        logger.info(f"对账通过: 本批 {len(claimed_nums)} 章在平台上都能查到")
+    return missing
 
 
 # 按【精确文本】点击可见元素：用于选项不是标准 <button> 的弹窗（如内容检测方式
@@ -2220,6 +3038,19 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
         await page.wait_for_timeout(300)
 
     # 5. 确认发布
+    await _submit_confirm_publish(page)
+
+
+async def _submit_confirm_publish(page):
+    """点「确认发布」并等接口判定。三条提交路径共用同一份动作。
+
+    调用方: publish_scheduled（定时发布）、publish_one_chapter（立即发布）、
+    edit_one_chapter（修改内容）。
+
+    这是全流程最关键的一步——判定"是否真的提交成功"。曾经按"按钮消失"算成功，
+    对话框异常关闭时按钮同样消失，748 章漏了 151 章。散成三份写就意味着以后改
+    判定逻辑可能只改到其中一两处。
+    """
     await _check_daily_limit(page)
     confirm_btn = page.locator("button", has_text="确认发布")
     if await confirm_btn.count() == 0:
@@ -2237,12 +3068,7 @@ async def cmd_login():
         browser, context = await create_context(p, headless=False)
         page = await context.new_page()
         await page.goto(ZONE_URL)
-        try:
-            await page.wait_for_load_state("networkidle")
-        except PWTimeout:
-            # 平台埋点/轮询会拖死 networkidle（GUI 登录路径同因已改用
-            # domcontentloaded）；登录页只需渲染出来供用户手动登录
-            pass
+        await settle_page(page)
 
         logger.info("")
         logger.info("=" * 50)
@@ -2262,10 +3088,509 @@ async def cmd_login():
 
 # ---------------------------------------------------------------------------
 # 命令: books
+def record_rest_unprocessed(fail_list, parsed, start, stop, **kw):
+    """中止整批时把 [start, stop) 的剩余章节记入补传清单，返回失败增量。
+
+    CLI 和 GUI 的中止分支各有 5 条（每日上限 / 提交后查不到 / 不可逆失败 /
+    连续失败熔断 / 页面已死），原来两边各写一份这个生成器表达式。漏掉一处的
+    表现是汇总里"成功 + 失败 < 总数"，而且补传清单缺这几章——创建路径缺章
+    补不回原位（番茄目录按追加序排，后补的只会吊在书尾）。
+    """
+    return record_unprocessed(
+        fail_list, ((parsed[j][0], parsed[j][1]) for j in range(start, stop)),
+        **kw)
+
+
+async def run_creation_batch(page, parsed, new_chapter_url, *, book_id,
+                             schedule=None, is_draft=False, use_ai=False,
+                             max_retries=2, delay=3,
+                             cancel_check=None, progress_cb=None,
+                             err_tag_fn=None):
+    """新建类批次（定时发布 / 立即发布 / 存草稿）的完整执行循环。
+
+    这段循环就是当初 748 章漏 151 章的那条路径。它曾在 CLI 和 GUI 各写一份
+    （约 190 行逐行相同），历史上的每一类 bug 都是修一边漏一边；现在只有这一份，
+    两个入口只做参数收集和结果展示。
+
+    策略（判据 = 失败可不可逆）:
+      · 发布类逐章确认新章真落地；确认不到或提交失败 → 中止整批——新建只能
+        追加到书尾，跳过失败继续发会把缺口永久卡在中段，停在队尾才是无害的。
+      · 存草稿保留连续 3 次熔断（草稿丢失不影响正文顺序），批末拿草稿箱对账。
+      · 撞每日字数上限 → 中止整批，本章与剩余章节全部记入补传清单。
+      · 收尾统一走 reconcile_batch_auto: 日志记成功 ≠ 平台上真有。
+
+    cancel_check(): 返回 True 则在章节边界停下（GUI 的「停止」按钮；CLI 不传）。
+    progress_cb(done, total): 每章之后与各中止点回报进度（GUI 进度条；CLI 不传）。
+    err_tag_fn(i): 第 i 章失败截图的文件名标签。
+    返回 (success, failed, fail_list)。
+    """
+    success = 0
+    failed = 0
+    consec_fail = 0
+    fail_list: list[tuple[str, str]] = []  # (章节标签, 失败原因)
+    draft_owner: dict[str, tuple] = {}  # 防覆盖漏账: draftId -> (章节标签, 章号)
+    claimed_nums: list[int] = []      # 日志记成功的章号，收尾与平台对账
+    # 新建类模式要逐章确认新章真落地了；签名 URL 从页面自己的请求里捡。
+    # 必须先主动取一条: watch 只记录「挂上之后」页面自己发的请求，而发布走
+    # 接口判定成功时 SPA 未必会跳回 chapter-manage —— 那样整批都捡不到签名，
+    # confirm_chapter_on_platform 每章都走 not url_holder 的放行分支，
+    # 防漏章的守卫整批静默关闭。keep_ahead 一直是先 append 再跑的。
+    sig_urls, detach_sig = watch_chapter_list_url(page)
+    if not is_draft and not sig_urls:
+        try:
+            _, _seed, _ = await fetch_chapter_items(page, book_id)
+            if _seed:
+                sig_urls.append(_seed)
+                logger.info("  已预取章节列表签名，逐章确认就绪")
+        except Exception as e:
+            logger.warning(
+                f"  预取章节列表签名失败（逐章确认将依赖页面自发请求）: {e}")
+    total = len(parsed)
+    if err_tag_fn is None:
+        err_tag_fn = str
+    _progress = progress_cb or (lambda done, tot: None)
+
+    for i in range(total):
+        if cancel_check and cancel_check():
+            logger.info("用户取消，中止批次。")
+            break
+
+        chapter_num, title, content = parsed[i]
+        num_str = f"第{chapter_num}章 " if chapter_num else ""
+        sched_info = f" -> {schedule[i][0]} {schedule[i][1]}" if schedule else ""
+        logger.info(f"[{i+1}/{total}] {num_str}{title}{sched_info}")
+
+        ok = False
+        daily_limit = False
+        this_draft_id = None
+        try:
+            if is_draft:
+                ok, this_draft_id, err = await draft_one_chapter(
+                    page, new_chapter_url, chapter_num, title, content,
+                    max_retries=max_retries, skip_first_goto=(i == 0),
+                    err_tag=err_tag_fn(i))
+            else:
+                ok, err = await publish_one_chapter(
+                    page, new_chapter_url, chapter_num, title, content,
+                    schedule=schedule[i] if schedule else None,
+                    use_ai=use_ai, max_retries=max_retries,
+                    skip_first_goto=(i == 0), err_tag=err_tag_fn(i))
+            if not ok:
+                # 重试与失败截图都在原语里做过了，这里只记账
+                fail_list.append((f"{num_str}{title}", err))
+        except DailyLimitReached as e:
+            # 每日字数上限 = 平台当日发布额度已耗尽。继续提交后续章节
+            # 只会重复撞限或触发别的拦截（实测续发会产生额外错误），
+            # 故中止整批；本章与所有剩余章节如实记入清单，留待明天接着发。
+            logger.warning(f"  达每日字数上限（{e}），中止整批")
+            fail_list.append((f"{num_str}{title}", str(e)))
+            daily_limit = True
+
+        if daily_limit:
+            failed += 1
+            # 中止整批：把所有剩余未处理章节如实记入清单（不是静默丢弃）。
+            rest = record_rest_unprocessed(fail_list, parsed, i + 1, total)
+            failed += rest
+            if rest:
+                logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
+            _progress(total, total)
+            break
+        elif ok:
+            # 新建类（定时/立即发布）必须逐章确认: 失败不可逆——章节根本
+            # 不存在，而新建只能追加到书尾，中段缺口补不回原位。改内容/
+            # 改排期不需要（item 还在，重来即可），存草稿也不需要。
+            cnum_int = None
+            if not is_draft and chapter_num is not None:
+                try:
+                    cnum_int = int(chapter_num)
+                except (TypeError, ValueError):
+                    cnum_int = None
+            if cnum_int is not None and not await confirm_chapter_on_platform(
+                    page, sig_urls, cnum_int):
+                logger.error(
+                    f"  ✗ 提交说成功，但平台上查不到 第{cnum_int}章 —— 中止整批"
+                    f"（继续发下去会把缺口永久卡在中段）")
+                failed += 1
+                fail_list.append((f"{num_str}{title}", "提交后平台查不到该章"))
+                failed += record_rest_unprocessed(
+                    fail_list, parsed, i + 1, total, reason="前方中止，未处理")
+                _progress(total, total)
+                break
+            success += 1
+            consec_fail = 0
+            if cnum_int is not None:
+                claimed_nums.append(cnum_int)
+            elif is_draft and chapter_num is not None:
+                # 草稿也记账，收尾拿草稿箱真实内容对账（不逐章确认）
+                try:
+                    claimed_nums.append(int(chapter_num))
+                except (TypeError, ValueError):
+                    pass
+            # 存草稿防覆盖漏账：番茄有时把"新建章"复用到同一个进行中的草稿上，
+            # 本章会覆盖上一章。若检测到 draftId 被复用，说明上一占用者其实已被
+            # 覆盖、未独立保存——把它移出成功、记入补传清单（第N章号会被
+            # log_fail_list 压进补传号），避免"报存成功却实际丢章"。
+            if is_draft and this_draft_id:
+                prev = draft_owner.get(this_draft_id)
+                if prev is not None:
+                    prev_label, prev_num = prev
+                    logger.warning(
+                        f"  ⚠ 本章复用草稿ID {this_draft_id}，"
+                        f"覆盖了上一章「{prev_label.strip()}」")
+                    fail_list.append(
+                        (prev_label, "草稿被后续章节覆盖（平台复用草稿ID），未独立保存"))
+                    success -= 1
+                    failed += 1
+                    # 必须同时从对账名单里摘掉：它已经在这里记过一次失败了，
+                    # 而批末对账在草稿箱里同样找不到它（本来就是同一件事），
+                    # 不摘就会被重复计一次 —— 成功数能被减成负的，
+                    # 而 _upload_done 把 success<0 当成运行异常报「定时执行失败」。
+                    if prev_num is not None and prev_num in claimed_nums:
+                        claimed_nums.remove(prev_num)
+                _cur_num = None
+                if chapter_num is not None:
+                    try:
+                        _cur_num = int(chapter_num)
+                    except (TypeError, ValueError):
+                        _cur_num = None
+                draft_owner[this_draft_id] = (f"{num_str}{title}", _cur_num)
+            elif is_draft and not this_draft_id:
+                logger.warning("  ⚠ 未能读取草稿ID，无法确认是否独立保存，请到草稿箱核对")
+        else:
+            failed += 1
+            consec_fail += 1
+            if not is_draft:
+                # 新建类失败即停: 跳过这一章继续发，缺口就永久卡在中段了
+                # （新建只能追加到书尾，补不回原位）。停在队尾无害——
+                # 修好原因后按补传清单接着发即可。
+                logger.error(
+                    f"  发布失败且不可逆（缺章补不回原位），中止整批，"
+                    f"剩余 {total - (i + 1)} 章未处理")
+                failed += record_rest_unprocessed(
+                    fail_list, parsed, i + 1, total, reason="前方中止，未处理")
+                _progress(total, total)
+                break
+            if consec_fail >= 3:
+                rest = total - (i + 1)
+                logger.error(
+                    f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
+                    f"中止任务，剩余 {rest} 章未处理")
+                # 与每日上限路径一致：剩余章节记入清单并计数，
+                # 否则汇总"成功+失败<总数"、且补传清单缺这些章节。
+                failed += record_rest_unprocessed(
+                    fail_list, parsed, i + 1, total, reason="流程异常中止，未处理")
+                _progress(total, total)
+                break
+
+        _progress(i + 1, total)
+
+        if i < total - 1 and delay > 0:
+            try:
+                await page.wait_for_timeout(delay * 1000)
+            except Exception:
+                # 章节间等待时页面已死（如用户关掉浏览器窗口）：停止循环，
+                # 但仍走收尾对账与汇总，保住失败清单。剩余未发章节记入清单，
+                # 否则汇总漏账、补传清单缺这些章。
+                failed += record_rest_unprocessed(
+                    fail_list, parsed, i + 1, total, reason="页面已失效，未处理")
+                break
+
+    # 解绑请求监听：每次确认轮询都会往 sig_urls 追加一条完整签名 URL，
+    # 748 章的批次会攒下几千条字符串，监听器还要对页面的每个请求做子串判断。
+    # fetch_chapter_items / _wait_publish_result 都在 finally 里解绑，这里同理。
+    try:
+        detach_sig()
+    except Exception:
+        pass
+
+    # 收尾对账：日志记成功 ≠ 平台上真有（漏 151 章的教训）
+    miss = await reconcile_batch_auto(
+        page, book_id, claimed_nums, fail_list, is_draft=is_draft)
+    success -= len(miss)
+    failed += len(miss)
+    return success, failed, fail_list
+
+
+async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
+                         delay=3, cancel_check=None, progress_cb=None):
+    """修改内容批次的完整执行循环（含批末二次尝试）。
+
+    曾在 CLI 和 GUI 各写一份，且各自带着对方没有的防护——CLI 的二次尝试有
+    「页面死亡短路」（页面关了不再逐个 goto 刷屏），GUI 有「用户取消」记账；
+    合并后两个入口都同时具备。
+
+    策略: 修改可逆（item 还在，重来即可）→ 单章失败记清单继续，连续 3 次
+    原因不明失败才熔断；「标题重复」是本地重新编号的临时冲突，留待批末二次
+    尝试（此时占用旧标题的章多已更新、冲突自然解除）。
+
+    matched: [(local_idx, plat_ch, ch_num, title, content), ...]
+    返回 (success, failed, skipped, fail_list)。
+    """
+    success = 0
+    failed = 0
+    skipped = 0
+    consec_fail = 0
+    fail_list: list[tuple[str, str]] = []  # (章节标签, 失败原因)
+    dup_pending: list[tuple] = []  # "重复标题"暂存，批末二次尝试
+    total = len(matched)
+    _progress = progress_cb or (lambda done, tot: None)
+
+    def _breaker_abort(i):
+        """连续失败熔断: 记账剩余章并推满进度，返回失败增量。
+
+        必须记入清单 —— 只累加 skipped 的话，这些章不会出现在 log_fail_list
+        末尾那行压缩章节号里，用户就拿不到可直接粘贴续跑的补传清单
+        （创建路径的五条中止分支都是这么做的）。
+        """
+        rest = total - (i + 1)
+        logger.error(
+            f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
+            f"中止任务，剩余 {rest} 章未处理")
+        n = record_unprocessed(
+            fail_list, ((m[2], m[3]) for m in matched[i + 1:]),
+            reason="流程异常中止，未处理")
+        _progress(total, total)
+        return n
+
+    for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched):
+        if cancel_check and cancel_check():
+            logger.info("用户取消，中止批次。")
+            break
+
+        logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
+
+        status = plat_ch.get("status", "")
+        if "审核中" in status:
+            logger.warning(f"  状态「{status}」审核中，不可编辑，跳过")
+            skipped += 1
+            _progress(i + 1, total)
+            continue
+
+        edit_url = plat_ch.get("editUrl")
+        if not edit_url:
+            logger.error("无法获取编辑链接，跳过（可能审核中或平台未提供编辑入口）")
+            skipped += 1
+            _progress(i + 1, total)
+            continue
+
+        if edit_url.startswith("/"):
+            edit_url = BASE_URL + edit_url
+
+        try:
+            ok, err = await edit_one_chapter(
+                page, edit_url, ch_num, title, content,
+                use_ai=use_ai, max_retries=max_retries)
+            if ok:
+                success += 1
+                consec_fail = 0
+            elif "重复" in err:
+                # 标题在章节间搬移的临时冲突（实测: 本地重新编号后，
+                # 新章先于旧章提交同名标题被拒；旧章稍后更新即释放）。
+                # 留待批末二次尝试；属已识别原因，不计熔断。
+                logger.info("  标题暂被其他章节占用，留待批末二次尝试")
+                dup_pending.append((ch_num, title, content, edit_url))
+                consec_fail = 0
+            else:
+                failed += 1
+                fail_list.append((f"第{ch_num}章 {title}",
+                                  err or "重试后仍失败(见日志/截图)"))
+                consec_fail += 1
+                if consec_fail >= 3:
+                    failed += _breaker_abort(i)
+                    break
+        except DailyLimitReached as e:
+            # 每日字数上限 = 平台当日额度已耗尽。继续提交后续章节只会重复
+            # 撞限或触发别的拦截（实测续发产生额外错误），故中止整批；
+            # 本章与所有剩余章节（含批末待二次尝试的）如实记入清单。
+            logger.warning(f"  达每日字数上限（{e}），中止整批")
+            fail_list.append((f"第{ch_num}章 {title}", str(e)))
+            failed += 1
+            # 剩余主循环章节 + 批末待二次尝试的章节都记为未处理。
+            failed += record_unprocessed(
+                fail_list, ((m[2], m[3]) for m in matched[i + 1:]))
+            failed += record_unprocessed(
+                fail_list, ((d[0], d[1]) for d in dup_pending))
+            dup_pending = []
+            rest = total - (i + 1)
+            if rest:
+                logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
+            _progress(total, total)
+            break
+        except Exception as e:
+            # edit_one_chapter 正常不会泄漏非上限异常（内部已含重试+吞错），
+            # 这里兜底浏览器崩溃/页面被关等意外，按原因不明失败计入熔断，
+            # 保证 save_auth/汇总仍能执行而不是整批裸抛中止。
+            logger.error(f"  本章发生未预期异常: {e}")
+            fail_list.append((f"第{ch_num}章 {title}", f"未预期异常: {e}"))
+            failed += 1
+            consec_fail += 1
+            if consec_fail >= 3:
+                failed += _breaker_abort(i)
+                break
+
+        _progress(i + 1, total)
+
+        if i < total - 1 and delay > 0:
+            try:
+                await page.wait_for_timeout(delay * 1000)
+            except Exception:
+                # 章节间等待时页面已死：停止循环，仍走收尾与汇总，保住失败
+                # 清单。剩余未改章节记入清单（dup_pending 由其专属循环计数）。
+                failed += record_unprocessed(
+                    fail_list, ((m[2], m[3]) for m in matched[i + 1:]),
+                    reason="页面已失效，未处理")
+                break
+
+    # 批末二次尝试: 主循环跑完后，占用旧标题的章节多已更新、标题已释放
+    if dup_pending:
+        if not (cancel_check and cancel_check()):
+            logger.info("")
+            logger.info(f"二次尝试 {len(dup_pending)} 个标题重复的章节"
+                        f"（标题搬移的临时冲突，此时多已解除）…")
+        dead = False
+        for k, (ch_num, title, content, edit_url) in enumerate(dup_pending):
+            if cancel_check and cancel_check():
+                # 中途/事前取消: 剩余章节如实计入失败清单
+                for ch_num2, title2, *_ in dup_pending[k:]:
+                    fail_list.append((f"第{ch_num2}章 {title2}",
+                                      "标题重复(用户取消，未二次尝试)"))
+                    failed += 1
+                break
+            if dead:
+                # 页面已死，剩余条目逐个 goto 只会重复快速失败+刷屏，
+                # 直接如实记失败，不再尝试
+                failed += 1
+                fail_list.append((f"第{ch_num}章 {title}", "页面已失效，未二次尝试"))
+                continue
+            logger.info(f"[二次] 修改第{ch_num}章 {title}")
+            try:
+                ok, err = await edit_one_chapter(
+                    page, edit_url, ch_num, title, content,
+                    use_ai=use_ai, max_retries=0)
+                if ok:
+                    success += 1
+                else:
+                    failed += 1
+                    fail_list.append((f"第{ch_num}章 {title}",
+                                      err or "标题重复，二次尝试仍失败"))
+            except DailyLimitReached as e:
+                # 二次尝试阶段撞每日上限：与主循环一致，中止整批，
+                # 本条与剩余二次条目如实记入清单。
+                logger.warning(f"  达每日字数上限（{e}），中止二次尝试")
+                fail_list.append((f"第{ch_num}章 {title}", str(e)))
+                failed += 1
+                failed += record_unprocessed(
+                    fail_list, ((d[0], d[1]) for d in dup_pending[k + 1:]))
+                break
+            except Exception as e:
+                logger.error(f"  二次尝试异常: {e}")
+                fail_list.append((f"第{ch_num}章 {title}", f"二次尝试异常: {e}"))
+                failed += 1
+                if page.is_closed():
+                    dead = True
+            if delay > 0:
+                try:
+                    await page.wait_for_timeout(delay * 1000)
+                except Exception:
+                    pass  # 页面已死也要走完计数与汇总
+
+    return success, failed, skipped, fail_list
+
+
+def apply_cli_filters(files, parsed, args):
+    """对 (files, parsed) 应用 --modified-after/before 与 --chapters。
+
+    返回 (files, parsed)；筛完为空或参数非法时打印原因并返回 None，调用方直接
+    return。**upload 和 edit 都必须调它**：这两个筛选参数挂在 upload 子命令上，
+    而 --edit 也走同一个子命令 —— 只在 cmd_upload 里做筛选的话，
+    `upload ... --edit --chapters 5-10` 会照单全收地把平台上**每一个**匹配到的
+    章节正文都覆盖掉（而正文覆盖是不可逆的），且一声不吭。
+    """
+    for flag, newer in (("modified_after", True), ("modified_before", False)):
+        spec = getattr(args, flag, None)
+        if not spec:
+            continue
+        ts = parse_time_spec(spec)
+        if ts is None:
+            logger.error(f"时间格式错误: {spec}（应为 YYYY-MM-DD 或 "
+                         f"YYYY-MM-DD HH:MM）")
+            return None
+
+        def mtime_ok(f, _ts=ts, _newer=newer):
+            # 云盘「仅在线」占位文件 stat 会抛 OSError，越界 mtime 会抛
+            # Overflow/ValueError —— GUI 的同一段一直有这个兜底，CLI 曾经没有，
+            # 一个占位文件就能让整条命令在上传前裸崩。
+            try:
+                return (f.stat().st_mtime >= _ts) == _newer
+            except (OSError, OverflowError, ValueError):
+                logger.warning(f"  跳过读不到修改时间的文件: {f.name}")
+                return False
+
+        before = len(parsed)
+        pairs = [(f, p) for f, p in zip(files, parsed) if mtime_ok(f)]
+        files = [f for f, _ in pairs]
+        parsed = [p for _, p in pairs]
+        logger.info(f"按修改日期筛选（{'晚于' if newer else '早于'} {spec}）: "
+                    f"{len(parsed)}/{before} 章")
+        if not parsed:
+            logger.warning("筛选后没有章节，退出。")
+            return None
+
+    if getattr(args, "chapters", None):
+        try:
+            pairs, active = filter_by_chapter_spec(
+                list(zip(files, parsed)), args.chapters, key=lambda pf: pf[1][0])
+        except ValueError as e:
+            logger.error(str(e))
+            return None
+        if active:
+            before = len(parsed)
+            files = [f for f, _ in pairs]
+            parsed = [p for _, p in pairs]
+            logger.info(f"按章节号筛选「{args.chapters}」: {len(parsed)}/{before} 章")
+            if not parsed:
+                logger.warning("筛选后没有章节，退出。")
+                return None
+    return files, parsed
+
+
+def require_login_cli():
+    """没登录就提示并返回 False。四个 CLI 命令原来各写一份这个判断。"""
+    if AUTH_FILE.exists():
+        return True
+    logger.warning("请先运行 login 命令登录。")
+    return False
+
+
+def load_local_chapters(directory, args):
+    """upload / edit 共同的开场：读配置 → 扫目录 → 解析文件。
+
+    返回 (cfg, headless, delay, files, parsed)；任一步走不下去返回 None，
+    提示已经打过了，调用方直接 return。两条命令曾各抄一份，加一种文件类型
+    或改一句提示就得改两处。
+    """
+    cfg = load_config()
+    headless = args.headless or cfg.get("headless", False)
+    delay = args.delay if args.delay is not None else cfg.get(
+        "delay_between_chapters", 3)
+    if not directory.is_dir():
+        logger.error(f"目录不存在: {directory}")
+        return None
+    files = get_md_files(directory)
+    if not files:
+        logger.warning(f"在 {directory} 及其子文件夹中没有找到 .md/.txt 文件")
+        return None
+    # 跳过扫描后变得无法读取的文件，保持 files/parsed 对齐
+    files, parsed = parse_md_files(files)
+    if not files:
+        logger.warning("目录中的文件均无法读取（可能是云端离线文件或权限不足）")
+        return None
+    return cfg, headless, delay, files, parsed
+
+
 # ---------------------------------------------------------------------------
 async def cmd_books():
-    if not AUTH_FILE.exists():
-        logger.warning("请先运行 login 命令登录。")
+    if not require_login_cli():
         return
 
     async with async_playwright() as p:
@@ -2276,10 +3601,7 @@ async def cmd_books():
             logger.error("登录状态已失效，请重新运行 login")
             await close_browser_safely(browser)
             return
-        try:
-            await page.wait_for_load_state("networkidle")
-        except PWTimeout:
-            pass
+        await settle_page(page)
         list_timed_out = False
         try:
             await page.wait_for_selector('a[href*="chapter-manage/"]', timeout=5000)
@@ -2312,13 +3634,13 @@ async def cmd_books():
 # 命令: upload
 # ---------------------------------------------------------------------------
 async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
-    if not AUTH_FILE.exists():
-        logger.warning("请先运行 login 命令登录。")
+    if not require_login_cli():
         return
 
-    cfg = load_config()
-    headless = args.headless or cfg.get("headless", False)
-    delay = args.delay if args.delay is not None else cfg.get("delay_between_chapters", 3)
+    got = load_local_chapters(directory, args)
+    if got is None:
+        return
+    cfg, headless, delay, files, parsed = got
 
     # 定时发布参数
     schedule_date = getattr(args, "schedule", None)
@@ -2326,21 +3648,6 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
     per_day = getattr(args, "per_day", 1) or 1
     unique_titles = getattr(args, "unique_titles", False)
     use_ai = getattr(args, "use_ai", False)
-
-    if not directory.is_dir():
-        logger.error(f"目录不存在: {directory}")
-        return
-
-    files = get_md_files(directory)
-    if not files:
-        logger.warning(f"在 {directory} 及其子文件夹中没有找到 .md/.txt 文件")
-        return
-
-    # 解析所有文件（跳过扫描后变得无法读取的文件，保持 files/parsed 对齐）
-    files, parsed = parse_md_files(files)
-    if not files:
-        logger.warning("目录中的文件均无法读取（可能是云端离线文件或权限不足）")
-        return
 
     # 检测重复标题
     title_counts = Counter(title for _, title, _ in parsed)
@@ -2360,6 +3667,20 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         else:
             logger.info("  提示: 使用 --unique-titles 可自动追加章节号去重")
 
+    got = apply_cli_filters(files, parsed, args)
+    if got is None:
+        return
+    files, parsed = got
+
+    # 自动接续队列: 起始日期和章号范围都由平台队列决定，不用手填。
+    # 与 GUI 的「自动接续队列」勾选框对等，共用 tools/keep_ahead 的纯函数。
+    if getattr(args, "auto_continue", False):
+        parsed, files, schedule_date = await _auto_continue_plan(
+            book_id, parsed, files, per_day, headless, args)
+        if not parsed:
+            logger.info("本地章节都已经在平台上了，没有可接续的。")
+            return
+
     # 计算排期
     schedule = None
     if schedule_date:
@@ -2372,7 +3693,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
     # 确定模式
     if schedule:
-        validated = _validate_times(schedule_time)
+        validated = validate_times(schedule_time)
         eff = max(per_day, len(validated)) if validated else per_day
         mode_str = f"定时发布 (从 {schedule_date} 起, 每天 {eff} 章, {schedule_time})"
     elif publish:
@@ -2430,150 +3751,122 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
             await close_browser_safely(browser)
             return
 
-        success = 0
-        failed = 0
-        consec_fail = 0
-        fail_list: list[tuple[str, str]] = []  # (章节标签, 失败原因)
-        draft_owner: dict[str, str] = {}  # 存草稿防覆盖漏账: draftId -> 章节标签
         max_retries = cfg.get("max_retries", 2)
         is_draft = not publish and not schedule
-
-        for i, file in enumerate(files):
-            chapter_num, title, content = parsed[i]
-            num_str = f"第{chapter_num}章 " if chapter_num else ""
-            sched_info = f" -> {schedule[i][0]} {schedule[i][1]}" if schedule else ""
-            logger.info(f"[{i+1}/{len(files)}] {num_str}{title}{sched_info}")
-
-            ok = False
-            daily_limit = False
-            this_draft_id = None
-            for attempt in range(1, max_retries + 2):
-                try:
-                    # 首章首次复用当前页面，其余情况导航到新建 URL
-                    if i > 0 or attempt > 1:
-                        await page.goto(new_chapter_url)
-                        await wait_for_editor_ready(page)
-
-                    await fill_chapter(page, chapter_num, title, content)
-
-                    if schedule:
-                        date_str, time_str = schedule[i]
-                        await publish_scheduled(page, date_str, time_str, use_ai=use_ai)
-                        logger.info(f"  -> 定时发布 {date_str} {time_str}")
-                    elif publish:
-                        await _navigate_to_publish_settings(page, use_ai=use_ai)
-                        confirm_btn = page.locator("button", has_text="确认发布")
-                        if await confirm_btn.count() == 0:
-                            raise RuntimeError("未找到确认发布按钮")
-                        await confirm_btn.first.click(no_wait_after=True, timeout=_browser_timeout)
-                        # 判定结果: 按钮消失=成功；toast 分类失败原因
-                        await _wait_publish_result(page, confirm_btn.first)
-                        logger.info(f"  -> 已发布")
-                    else:
-                        await save_draft(page)
-                        # 番茄把连续两次"新建章存草稿"并到同一草稿槽（第2次覆盖第1次
-                        # 后该槽才提交），只存1次会被下一章覆盖丢失。对同一章再存一次
-                        # 同内容：让"被覆盖的那次"就是本章自己，本章占满并提交自己的
-                        # 草稿槽，下一章自然拿到新槽——逐章独立、不再隔章丢章（实测有效）。
-                        await page.goto(new_chapter_url)
-                        await wait_for_editor_ready(page)
-                        await fill_chapter(page, chapter_num, title, content)
-                        await save_draft(page)
-                        this_draft_id = _extract_draft_id(page.url)
-                        logger.info(f"  -> 已存草稿")
-
-                    ok = True
-                    break
-
-                except DailyLimitReached as e:
-                    # 每日字数上限 = 平台当日发布额度已耗尽。继续提交后续章节
-                    # 只会重复撞限或触发别的拦截（实测续发会产生额外错误），
-                    # 故中止整批；本章与所有剩余章节如实记入清单，留待明天接着发。
-                    logger.warning(f"  达每日字数上限（{e}），中止整批")
-                    fail_list.append((f"{num_str}{title}", str(e)))
-                    daily_limit = True
-                    break
-
-                except Exception as e:
-                    if attempt <= max_retries:
-                        logger.warning(f"第{attempt}次失败: {e}，重试中...")
-                        await page.wait_for_timeout(2000)
-                    else:
-                        logger.error(f"失败: {e}")
-                        fail_list.append((f"{num_str}{title}", str(e)))
-                        try:
-                            err_path = SCRIPT_DIR / f"error_{i}_{file.stem}.png"
-                            await page.screenshot(path=str(err_path))
-                            logger.error(f"截图: {err_path}")
-                        except Exception:
-                            pass
-
-            if daily_limit:
-                failed += 1
-                # 中止整批：把所有剩余未处理章节如实记入清单（不是静默丢弃）。
-                rest = _record_unprocessed(
-                    fail_list, ((parsed[j][0], parsed[j][1]) for j in range(i + 1, len(files))))
-                failed += rest
-                if rest:
-                    logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
-                break
-            elif ok:
-                success += 1
-                consec_fail = 0
-                # 存草稿防覆盖漏账：番茄有时把"新建章"复用到同一个进行中的草稿上，
-                # 本章会覆盖上一章。若检测到 draftId 被复用，说明上一占用者其实已被
-                # 覆盖、未独立保存——把它移出成功、记入补传清单（第N章号会被
-                # _log_fail_list 压进补传号），避免"报存成功却实际丢章"。
-                if is_draft and this_draft_id:
-                    prev = draft_owner.get(this_draft_id)
-                    if prev is not None:
-                        logger.warning(
-                            f"  ⚠ 本章复用草稿ID {this_draft_id}，覆盖了上一章「{prev.strip()}」")
-                        fail_list.append(
-                            (prev, "草稿被后续章节覆盖（平台复用草稿ID），未独立保存"))
-                        success -= 1
-                        failed += 1
-                    draft_owner[this_draft_id] = f"{num_str}{title}"
-                elif is_draft and not this_draft_id:
-                    logger.warning("  ⚠ 未能读取草稿ID，无法确认是否独立保存，请到草稿箱核对")
-            else:
-                failed += 1
-                consec_fail += 1
-                if consec_fail >= 3:
-                    rest = len(files) - (i + 1)
-                    logger.error(
-                        f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
-                        f"中止任务，剩余 {rest} 章未处理")
-                    # 与每日上限路径一致：剩余章节记入清单并计数，
-                    # 否则汇总"成功+失败<总数"、且补传清单缺这些章节。
-                    failed += _record_unprocessed(
-                        fail_list,
-                        ((parsed[j][0], parsed[j][1]) for j in range(i + 1, len(files))),
-                        reason="流程异常中止，未处理")
-                    break
-
-            if i < len(files) - 1 and delay > 0:
-                try:
-                    await page.wait_for_timeout(delay * 1000)
-                except Exception:
-                    # 章节间等待时页面已死：停止循环，但仍走到下面的
-                    # save_auth/close，避免收尾被跳过导致 pw.stop 挂死。
-                    # 剩余未发章节记入清单，否则汇总漏账、补传清单缺这些章。
-                    failed += _record_unprocessed(
-                        fail_list,
-                        ((parsed[j][0], parsed[j][1]) for j in range(i + 1, len(files))),
-                        reason="页面已失效，未处理")
-                    break
+        # 批次循环与收尾对账都在共用执行器里（CLI/GUI 同一份实现）；
+        # 这里只保留 CLI 特有的 err_tag（失败截图按文件名命名）。
+        success, failed, fail_list = await run_creation_batch(
+            page, parsed, new_chapter_url, book_id=book_id,
+            schedule=schedule, is_draft=is_draft, use_ai=use_ai,
+            max_retries=max_retries, delay=delay,
+            err_tag_fn=lambda i: f"{i}_{files[i].stem}")
 
         await save_auth(context)
         await close_browser_safely(browser)
 
         logger.info("")
         logger.info("=" * 40)
-        logger.info(f"  上传完成!")
+        logger.info("  上传完成!")
         logger.info(f"  成功: {success}  失败: {failed}")
-        _log_fail_list(fail_list)
+        log_fail_list(fail_list)
         logger.info("=" * 40)
+
+
+# ---------------------------------------------------------------------------
+# 发布单章（CLI / GUI / tools 共用）
+# ---------------------------------------------------------------------------
+async def publish_one_chapter(page, new_chapter_url, chapter_num, title, content,
+                              *, schedule=None, use_ai=False, max_retries=2,
+                              skip_first_goto=False, err_tag=None):
+    """新建并发布单章（schedule=(日期,时间) 走定时发布，否则立即发布）。
+
+    与 edit_one_chapter 对称的原语: 一个负责"改已有章"，一个负责"发新章"，
+    CLI 上传、GUI 上传、tools/keep_ahead 续排都调这里，不各写一遍循环。
+
+    返回 (是否成功, 最后一次错误信息)。DailyLimitReached 直接向上抛——
+    本章重试无意义（字数不会变），该由上层中止整批并记录剩余章节。
+    """
+    last_err = ""
+    for attempt in range(1, max_retries + 2):
+        try:
+            # 首章首次可复用当前页面，其余情况都要导航到干净的新建页
+            if not (skip_first_goto and attempt == 1):
+                await page.goto(new_chapter_url)
+                await wait_for_editor_ready(page)
+            await fill_chapter(page, chapter_num, title, content)
+            if schedule:
+                date_str, time_str = schedule
+                await publish_scheduled(page, date_str, time_str, use_ai=use_ai)
+                logger.info(f"  -> 定时发布 {date_str} {time_str}")
+            else:
+                await _navigate_to_publish_settings(page, use_ai=use_ai)
+                await _submit_confirm_publish(page)
+                logger.info("  -> 已发布")
+            return True, ""
+        except DailyLimitReached:
+            raise
+        except Exception as e:
+            last_err = str(e)
+            if attempt <= max_retries:
+                logger.warning(f"第{attempt}次失败: {e}，重试中...")
+                await page.wait_for_timeout(2000)
+            else:
+                logger.error(f"失败: {e}")
+                if err_tag:
+                    try:
+                        err_path = SCRIPT_DIR / f"error_{err_tag}.png"
+                        await page.screenshot(path=str(err_path))
+                        logger.error(f"截图: {err_path}")
+                    except Exception:
+                        pass
+    return False, last_err
+
+
+async def draft_one_chapter(page, new_chapter_url, chapter_num, title, content,
+                            *, max_retries=2, skip_first_goto=False, err_tag=None):
+    """存草稿单章。返回 (是否成功, 草稿ID或None, 最后错误)。
+
+    **同一章要连存两次**: 番茄会把连续两次"新建章存草稿"并到同一个草稿槽
+    （第 2 次覆盖第 1 次后该槽才提交），只存 1 次会被下一章覆盖丢失。对同一章
+    再存一次同内容，让"被覆盖的那次"就是本章自己，本章占满并提交自己的槽，
+    下一章自然拿到新槽——逐章独立、不再隔章丢章（实测有效）。
+
+    返回的草稿ID 供调用方做"槽位复用"检测: 两章拿到同一个 draftId 说明先存的
+    那章已被覆盖，必须移出成功、记入补传清单，绝不"报存成功却实际丢章"。
+    """
+    last_err = ""
+    for attempt in range(1, max_retries + 2):
+        try:
+            if not (skip_first_goto and attempt == 1):
+                await page.goto(new_chapter_url)
+                await wait_for_editor_ready(page)
+            await fill_chapter(page, chapter_num, title, content)
+            await save_draft(page)
+            # 第二次: 占满本章自己的槽（见上）
+            await page.goto(new_chapter_url)
+            await wait_for_editor_ready(page)
+            await fill_chapter(page, chapter_num, title, content)
+            await save_draft(page)
+            draft_id = _extract_draft_id(page.url)
+            logger.info("  -> 已存草稿")
+            return True, draft_id, ""
+        except DailyLimitReached:
+            raise
+        except Exception as e:
+            last_err = str(e)
+            if attempt <= max_retries:
+                logger.warning(f"第{attempt}次失败: {e}，重试中...")
+                await page.wait_for_timeout(2000)
+            else:
+                logger.error(f"失败: {e}")
+                if err_tag:
+                    try:
+                        err_path = SCRIPT_DIR / f"error_{err_tag}.png"
+                        await page.screenshot(path=str(err_path))
+                        logger.error(f"截图: {err_path}")
+                    except Exception:
+                        pass
+    return False, None, last_err
 
 
 # ---------------------------------------------------------------------------
@@ -2581,12 +3874,16 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 # ---------------------------------------------------------------------------
 async def edit_one_chapter(
     page, edit_url: str, ch_num: int, title: str, content: str,
-    *, use_ai: bool = False, max_retries: int = 2,
+    *, use_ai: bool = False, max_retries: int = 2, set_num=None,
 ) -> tuple[bool, str]:
     """编辑单个已有章节（含重试）。返回 (是否成功, 最后一次错误信息)。
 
     错误信息供上层写入失败清单（真实原因优于"见日志"），并用于识别
     "重复标题"类可二次尝试的失败。
+
+    set_num: 同时改写编辑器里的「第 __ 章」章节号。默认 None=不动（按章节号
+    匹配的"修改内容"模式，号是现成的）。重排工具要把某个 item 改成另一章，
+    必须连号一起改——番茄的目录顺序按 item 在卷内的位置排，章号只是标题文本。
     DailyLimitReached 不在此处捕获（本章重试无意义，字数不会变），
     直接向上抛出，由上层中止整批并记录剩余章节。
     """
@@ -2597,10 +3894,10 @@ async def edit_one_chapter(
             # 打开时若有「上次遗留」的旧草稿 -> "放弃"，从已发布内容开始干净重填。
             await wait_for_editor_ready(page, draft_action="放弃")
             await dismiss_edit_hint(page)
-            # 只清/填标题+正文，章节号不动（已发布章节的号是现成的）。
-            # _prepare_body 已去 md+空行。
+            # 只清/填标题+正文，章节号默认不动（已发布章节的号是现成的）；
+            # set_num 非空时连章节号一起改写。_prepare_body 已去 md+空行。
             await clear_editor(page)
-            await fill_chapter(page, None, title, content)
+            await fill_chapter(page, set_num, title, content)
             await page.wait_for_timeout(800)
             # 关键修复：填入新内容后，番茄会把它自动存成草稿；点"下一步"时会弹
             # 「有刚刚更新的章节，是否继续编辑？」。这里必须点"继续编辑"保留我们刚填的
@@ -2608,12 +3905,7 @@ async def edit_one_chapter(
             # （这正是"标题/正文改不动"的根因，CDP 实测确认）。
             await _navigate_to_publish_settings(
                 page, use_ai=use_ai, draft_action="继续编辑")
-            await _check_daily_limit(page)
-            confirm_btn = page.locator("button", has_text="确认发布")
-            if await confirm_btn.count() == 0:
-                raise RuntimeError("未找到确认发布按钮")
-            await confirm_btn.first.click(no_wait_after=True, timeout=_browser_timeout)
-            await _wait_publish_result(page, confirm_btn.first)
+            await _submit_confirm_publish(page)
             logger.info("  -> 已保存修改")
             return True, ""
         except DailyLimitReached:
@@ -2632,6 +3924,54 @@ async def edit_one_chapter(
                 except Exception:
                     pass
     return False, last_err
+
+
+# 时钟图标在中间列，平台没给稳定 class，只能按候选链探。
+# 这条链探测和点击都要用: 分开写过两份，平台 DOM 一改就得同步改两处，
+# 漏一处的表现是「探测到了选择器但点不动」——错误还会被超时掩盖。
+_CLOCK_ICON_PICK_JS = (
+    "cell.querySelector('svg')"
+    " || cell.querySelector('i[class]')"
+    " || cell.querySelector('span[class*=\"icon\"]')"
+    " || cell.querySelector('button')"
+    " || cell.querySelector('[role=\"button\"]')"
+    " || cell.querySelector('[role=\"img\"]')")
+
+_DETECT_CLOCK_ICON_JS = r"""() => {
+        for (const row of document.querySelectorAll('tr')) {
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 3) continue;
+            for (let i = 1; i < cells.length - 1; i++) {
+                const cell = cells[i];
+                const el = ICON_PICK;
+                if (el) {
+                    const tag = el.tagName.toLowerCase();
+                    const cls = el.className || '';
+                    if (tag === 'svg') return 'svg';
+                    if (tag === 'i' && cls) return 'i.' + cls.split(' ')[0];
+                    if (cls) return tag + '.' + cls.split(' ')[0];
+                    return tag;
+                }
+            }
+        }
+        return null;
+    }""".replace("ICON_PICK", _CLOCK_ICON_PICK_JS)
+
+_CLICK_CLOCK_ICON_JS = r"""(targetTitle) => {
+                        for (const row of document.querySelectorAll('tr')) {
+                            const cells = row.querySelectorAll('td');
+                            if (cells.length < 3) continue;
+                            if (cells[0].textContent.trim() !== targetTitle)
+                                continue;
+                            for (let i = 1; i < cells.length - 1; i++) {
+                                const cell = cells[i];
+                                const el = ICON_PICK;
+                                if (el) { el.click(); return true; }
+                            }
+                            return false;
+                        }
+                        return false;
+                    }""".replace("ICON_PICK", _CLOCK_ICON_PICK_JS)
 
 
 async def reschedule_on_manage_page(
@@ -2662,10 +4002,7 @@ async def reschedule_on_manage_page(
 
     chapter_manage_url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
     await page.goto(chapter_manage_url)
-    try:
-        await page.wait_for_load_state("networkidle")
-    except PWTimeout:
-        pass  # 平台埋点/轮询会拖死 networkidle；真正的就绪由下面的表格等待保证
+    await settle_page(page)
 
     # 等待表格出现
     try:
@@ -2674,43 +4011,34 @@ async def reschedule_on_manage_page(
         logger.error("章节管理页表格未加载")
         return 0, total
 
-    # 多卷索引模式: 逐卷处理
+    # 单卷 = "只有一卷"的特例，走同一条循环。这两条路曾各写一份调用，
+    # 给 _reschedule_current_volume 加参数时漏改一处，单卷和多卷行为就会不一样。
     if volume_texts:
-        for vi, vt in enumerate(volume_texts):
-            if not remaining:
-                break
-            if cancel_check and cancel_check():
-                break
-            logger.info(f"切换到分卷 ({vi+1}/{len(volume_texts)}): {vt}")
+        targets = list(volume_texts)
+    else:
+        if volume_text:
+            await select_volume(page, volume_text)
+        targets = [None]
+
+    for vi, vt in enumerate(targets):
+        if not remaining:
+            break
+        if cancel_check and cancel_check():
+            break
+        if vt is not None:
+            logger.info(f"切换到分卷 ({vi+1}/{len(targets)}): {vt}")
             if not await select_volume(page, vt):
                 # 切换失败若不拦截，下一步会扫到当前(错误的)卷，把这一卷
                 # 的章节当"未处理"统计且诊断误导——跳过本卷，留待"未处理"汇报
                 logger.error(f"  切换到分卷失败，跳过本卷: {vt}")
                 continue
-            s, f = await _reschedule_current_volume(
-                page, remaining, total,
-                max_retries=max_retries, delay=delay,
-                cancel_check=cancel_check, progress_cb=progress_cb,
-                success_so_far=success, failed_so_far=failed)
-            success += s
-            failed += f
-        if remaining:
-            for title in remaining:
-                logger.error(f"未处理: {title}")
-            failed += len(remaining)
-        return success, failed
-
-    # 单卷模式
-    if volume_text:
-        await select_volume(page, volume_text)
-
-    s, f = await _reschedule_current_volume(
-        page, remaining, total,
-        max_retries=max_retries, delay=delay,
-        cancel_check=cancel_check, progress_cb=progress_cb,
-        success_so_far=success, failed_so_far=failed)
-    success += s
-    failed += f
+        s, f = await _reschedule_current_volume(
+            page, remaining, total,
+            max_retries=max_retries, delay=delay,
+            cancel_check=cancel_check, progress_cb=progress_cb,
+            success_so_far=success, failed_so_far=failed)
+        success += s
+        failed += f
 
     if remaining:
         for title in remaining:
@@ -2718,6 +4046,8 @@ async def reschedule_on_manage_page(
         failed += len(remaining)
 
     return success, failed
+
+
 
 
 async def _reschedule_current_volume(
@@ -2741,30 +4071,7 @@ async def _reschedule_current_volume(
     failed = 0
 
     # 诊断行结构，找出时钟图标的选择器
-    icon_selector = await page.evaluate(r"""() => {
-        for (const row of document.querySelectorAll('tr')) {
-            const cells = row.querySelectorAll('td');
-            if (cells.length < 3) continue;
-            for (let i = 1; i < cells.length - 1; i++) {
-                const cell = cells[i];
-                const el = cell.querySelector('svg')
-                    || cell.querySelector('i[class]')
-                    || cell.querySelector('span[class*="icon"]')
-                    || cell.querySelector('button')
-                    || cell.querySelector('[role="button"]')
-                    || cell.querySelector('[role="img"]');
-                if (el) {
-                    const tag = el.tagName.toLowerCase();
-                    const cls = el.className || '';
-                    if (tag === 'svg') return 'svg';
-                    if (tag === 'i' && cls) return 'i.' + cls.split(' ')[0];
-                    if (cls) return tag + '.' + cls.split(' ')[0];
-                    return tag;
-                }
-            }
-        }
-        return null;
-    }""")
+    icon_selector = await page.evaluate(_DETECT_CLOCK_ICON_JS)
     logger.debug(f"  时钟图标元素: {icon_selector or '未检测到'}")
 
     page_num = 0
@@ -2804,26 +4111,7 @@ async def _reschedule_current_volume(
             for attempt in range(1, max_retries + 2):
                 try:
                     # 点击时钟图标: 在匹配行的中间列中查找可点击元素
-                    clicked = await page.evaluate(r"""(targetTitle) => {
-                        for (const row of document.querySelectorAll('tr')) {
-                            const cells = row.querySelectorAll('td');
-                            if (cells.length < 3) continue;
-                            if (cells[0].textContent.trim() !== targetTitle)
-                                continue;
-                            for (let i = 1; i < cells.length - 1; i++) {
-                                const cell = cells[i];
-                                const el = cell.querySelector('svg')
-                                    || cell.querySelector('i[class]')
-                                    || cell.querySelector('span[class*="icon"]')
-                                    || cell.querySelector('button')
-                                    || cell.querySelector('[role="button"]')
-                                    || cell.querySelector('[role="img"]');
-                                if (el) { el.click(); return true; }
-                            }
-                            return false;
-                        }
-                        return false;
-                    }""", title)
+                    clicked = await page.evaluate(_CLICK_CLOCK_ICON_JS, title)
 
                     if not clicked:
                         raise RuntimeError("未找到时钟图标")
@@ -2946,29 +4234,21 @@ async def _reschedule_current_volume(
 # ---------------------------------------------------------------------------
 async def cmd_edit(directory: Path, book_id: str, args):
     """按章节号匹配并修改已有章节内容。"""
-    if not AUTH_FILE.exists():
-        logger.warning("请先运行 login 命令登录。")
+    if not require_login_cli():
         return
 
-    cfg = load_config()
-    headless = args.headless or cfg.get("headless", False)
-    delay = args.delay if args.delay is not None else cfg.get("delay_between_chapters", 3)
+    got = load_local_chapters(directory, args)
+    if got is None:
+        return
+    cfg, headless, delay, files, parsed = got
+    # 与 upload 同一套筛选: --edit 挂在 upload 子命令下，两条路必须都筛，
+    # 否则 `--edit --chapters 5-10` 会把平台上每一个匹配章的正文都覆盖掉。
+    got = apply_cli_filters(files, parsed, args)
+    if got is None:
+        return
+    files, parsed = got
     unique_titles = getattr(args, "unique_titles", False)
     use_ai = getattr(args, "use_ai", False)
-
-    if not directory.is_dir():
-        logger.error(f"目录不存在: {directory}")
-        return
-
-    files = get_md_files(directory)
-    if not files:
-        logger.warning(f"在 {directory} 及其子文件夹中没有找到 .md/.txt 文件")
-        return
-
-    files, parsed = parse_md_files(files)
-    if not files:
-        logger.warning("目录中的文件均无法读取（可能是云端离线文件或权限不足）")
-        return
     if unique_titles:
         parsed = deduplicate_titles(parsed)
 
@@ -2981,12 +4261,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
         page = await context.new_page()
 
         await page.goto(chapter_manage_url)
-        try:
-            await page.wait_for_load_state("networkidle")
-        except PWTimeout:
-            # 平台埋点/轮询会拖死 networkidle（cmd_books 同因已包）；
-            # 提取 JS 自带表格等待，不必因此整批崩掉
-            pass
+        await settle_page(page)
 
         platform_chapters, _ = await extract_chapters_from_page(page, book_id)
 
@@ -3029,147 +4304,10 @@ async def cmd_edit(directory: Path, book_id: str, args):
             await close_browser_safely(browser)
             return
 
-        # 执行修改
-        success = 0
-        failed = 0
-        skipped = 0
-        consec_fail = 0
-        fail_list: list[tuple[str, str]] = []  # (章节标签, 失败原因)
-        dup_pending: list[tuple] = []  # "重复标题"暂存，批末二次尝试
-        total = len(matched)
-
-        for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched):
-            logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
-
-            status = plat_ch.get("status", "")
-            if "审核中" in status:
-                logger.warning(f"  状态「{status}」审核中，不可编辑，跳过")
-                skipped += 1
-                continue
-
-            edit_url = plat_ch.get("editUrl")
-            if not edit_url:
-                logger.error("无法获取编辑链接，跳过（可能审核中或平台未提供编辑入口）")
-                skipped += 1
-                continue
-
-            if edit_url.startswith("/"):
-                edit_url = BASE_URL + edit_url
-
-            try:
-                ok, err = await edit_one_chapter(
-                    page, edit_url, ch_num, title, content,
-                    use_ai=use_ai, max_retries=cfg.get("max_retries", 2))
-                if ok:
-                    success += 1
-                    consec_fail = 0
-                elif "重复" in err:
-                    # 标题在章节间搬移的临时冲突（实测: 本地重新编号后，
-                    # 新章先于旧章提交同名标题被拒；旧章稍后更新即释放）。
-                    # 留待批末二次尝试；属已识别原因，不计熔断。
-                    logger.info("  标题暂被其他章节占用，留待批末二次尝试")
-                    dup_pending.append((ch_num, title, content, edit_url))
-                    consec_fail = 0
-                else:
-                    failed += 1
-                    fail_list.append((f"第{ch_num}章 {title}",
-                                      err or "重试后仍失败(见日志/截图)"))
-                    consec_fail += 1
-                    if consec_fail >= 3:
-                        rest = total - (i + 1)
-                        logger.error(
-                            f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
-                            f"中止任务，剩余 {rest} 章未处理")
-                        skipped += rest
-                        break
-            except DailyLimitReached as e:
-                # 每日字数上限 = 平台当日额度已耗尽。继续提交后续章节只会重复
-                # 撞限或触发别的拦截（实测续发产生额外错误），故中止整批；
-                # 本章与所有剩余章节（含批末待二次尝试的）如实记入清单。
-                logger.warning(f"  达每日字数上限（{e}），中止整批")
-                fail_list.append((f"第{ch_num}章 {title}", str(e)))
-                failed += 1
-                # 剩余主循环章节 + 批末待二次尝试的章节都记为未处理。
-                failed += _record_unprocessed(
-                    fail_list, ((m[2], m[3]) for m in matched[i + 1:]))
-                failed += _record_unprocessed(
-                    fail_list, ((d[0], d[1]) for d in dup_pending))
-                dup_pending = []
-                rest = total - (i + 1)
-                if rest:
-                    logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
-                break
-            except Exception as e:
-                # edit_one_chapter 正常不会泄漏非上限异常（内部已含重试+吞错），
-                # 这里兜底浏览器崩溃/页面被关等意外，按原因不明失败计入熔断，
-                # 保证 save_auth/汇总仍能执行而不是整批裸抛中止。
-                logger.error(f"  本章发生未预期异常: {e}")
-                fail_list.append((f"第{ch_num}章 {title}", f"未预期异常: {e}"))
-                failed += 1
-                consec_fail += 1
-                if consec_fail >= 3:
-                    rest = total - (i + 1)
-                    logger.error(
-                        f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
-                        f"中止任务，剩余 {rest} 章未处理")
-                    skipped += rest
-                    break
-
-            if i < total - 1 and delay > 0:
-                try:
-                    await page.wait_for_timeout(delay * 1000)
-                except Exception:
-                    # 页面已死：停止循环，仍走到 save_auth/close 收尾。
-                    # 剩余未改章节记入清单（dup_pending 由其专属循环另行计数）。
-                    failed += _record_unprocessed(
-                        fail_list, ((m[2], m[3]) for m in matched[i + 1:]),
-                        reason="页面已失效，未处理")
-                    break
-
-        # 批末二次尝试: 主循环跑完后，占用旧标题的章节多已更新、标题已释放
-        if dup_pending:
-            logger.info("")
-            logger.info(f"二次尝试 {len(dup_pending)} 个标题重复的章节"
-                        f"（标题搬移的临时冲突，此时多已解除）...")
-            dead = False
-            for k, (ch_num, title, content, edit_url) in enumerate(dup_pending):
-                if dead:
-                    # 页面已死，剩余条目逐个 goto 只会重复快速失败+刷屏，
-                    # 直接如实记失败，不再尝试
-                    failed += 1
-                    fail_list.append((f"第{ch_num}章 {title}", "页面已失效，未二次尝试"))
-                    continue
-                logger.info(f"[二次] 修改第{ch_num}章 {title}")
-                try:
-                    ok, err = await edit_one_chapter(
-                        page, edit_url, ch_num, title, content,
-                        use_ai=use_ai, max_retries=0)
-                    if ok:
-                        success += 1
-                    else:
-                        failed += 1
-                        fail_list.append((f"第{ch_num}章 {title}",
-                                          err or "标题重复，二次尝试仍失败"))
-                except DailyLimitReached as e:
-                    # 二次尝试阶段撞每日上限：与主循环一致，中止整批，
-                    # 本条与剩余二次条目如实记入清单。
-                    logger.warning(f"  达每日字数上限（{e}），中止二次尝试")
-                    fail_list.append((f"第{ch_num}章 {title}", str(e)))
-                    failed += 1
-                    failed += _record_unprocessed(
-                        fail_list, ((d[0], d[1]) for d in dup_pending[k + 1:]))
-                    break
-                except Exception as e:
-                    logger.error(f"  二次尝试异常: {e}")
-                    fail_list.append((f"第{ch_num}章 {title}", f"二次尝试异常: {e}"))
-                    failed += 1
-                    if page.is_closed():
-                        dead = True
-                if delay > 0:
-                    try:
-                        await page.wait_for_timeout(delay * 1000)
-                    except Exception:
-                        pass  # 页面已死也要走完计数与汇总
+        # 批次循环（含批末二次尝试）在共用执行器里——CLI/GUI 同一份实现。
+        success, failed, skipped, fail_list = await run_edit_batch(
+            page, matched, use_ai=use_ai,
+            max_retries=cfg.get("max_retries", 2), delay=delay)
 
         await save_auth(context)
         await close_browser_safely(browser)
@@ -3178,13 +4316,191 @@ async def cmd_edit(directory: Path, book_id: str, args):
         logger.info("=" * 40)
         skip_str = f"  跳过: {skipped}" if skipped else ""
         logger.info(f"  修改完成! 成功: {success}  失败: {failed}{skip_str}")
-        _log_fail_list(fail_list)
+        log_fail_list(fail_list)
         logger.info("=" * 40)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+async def _auto_continue_plan(book_id, parsed, files, per_day, headless,
+                              args=None):
+    """按平台队列自动决定"发哪几章、从哪天起"。返回 (parsed, files, 起始日期)。
+
+    只取平台最大章号之后的章——中段缺口靠"发上去"补不回原位（新建只能追加到
+    书尾），那是 remap 的活，这里只提醒不碰。
+    """
+    mod = _load_tool_module("keep_ahead")
+    num2path = {}
+    for (num, _t, _c) in parsed:
+        if num is None:
+            continue
+        try:
+            num2path[int(num)] = True
+        except (TypeError, ValueError):
+            pass
+    async with async_playwright() as p:
+        browser, context = await create_context(p, headless=headless)
+        page = await context.new_page()
+        try:
+            items, _sig, _vols = await fetch_chapter_items(page, book_id)
+        finally:
+            await close_browser_safely(browser)
+    days_ahead = getattr(args, "days_ahead", None)
+    nums, start, _days, tail, gaps = mod.plan_refill(
+        items, num2path, all_remaining=days_ahead is None,
+        days_ahead=days_ahead or 0, per_day=max(1, per_day))
+    mode = ("全部补齐" if days_ahead is None
+            else f"只排到 {days_ahead} 天后")
+    logger.info(f"自动接续（{mode}）: 平台队列排到 {tail}，从 {start} 起接着排")
+    if gaps:
+        logger.warning(
+            f"⚠ 平台中段还缺 {len(gaps)} 章（如 第"
+            + "、第".join(str(n) for n in gaps[:5])
+            + "章…）——这些不能靠发布补回原位，请用 remap 子命令处理")
+    keep = set(nums)
+    kept = [(p_, f_) for p_, f_ in zip(parsed, files)
+            if p_[0] is not None and str(p_[0]).isdigit() and int(p_[0]) in keep]
+    if not kept:
+        return [], [], None
+    logger.info(f"自动接续: 本次发 {len(kept)} 章，第{nums[0]}~{nums[-1]}章")
+    return [k[0] for k in kept], [k[1] for k in kept], start.strftime("%Y-%m-%d")
+
+
+_TOOL_CACHE: dict = {}
+
+
+def _load_tool_module(name):
+    """按路径加载 tools/<name>/<name>.py，同名只加载一次。
+
+    这些能力最初是救火脚本，后来转正；主 CLI 通过子命令统一暴露它们，
+    实现仍留在各自模块里（一份实现，两个入口）。
+
+    必须缓存: 每次 exec_module 都会重新跑一遍模块顶层，其中包含
+    sys.path.insert(0, ROOT) —— GUI 每次「自动接续」上传都会加载一次
+    keep_ahead，一场长会话下来 sys.path 里堆几十条重复项，拖慢之后所有 import。
+    """
+    if name in _TOOL_CACHE:
+        return _TOOL_CACHE[name]
+    import importlib.util
+    path = SCRIPT_DIR / "tools" / name / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"_tool_{name}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _TOOL_CACHE[name] = mod
+    return mod
+
+
+def _run_tool_cmd(name, args, *, force_readonly=False):
+    """把子命令的参数原样转交给对应工具模块，外壳走共用的 run_unattended。
+
+    force_readonly: 只读子命令（audit）用——不让 --daily 把 run 置成 True。
+    """
+    mod = _load_tool_module(name)
+    for field, default in (("run", False), ("only", None), ("range", None),
+                           ("limit", None), ("safety_minutes", 60),
+                           ("daily", False), ("headless", False),
+                           ("show_browser", False), ("use_ai", False),
+                           ("audit", False), ("force", False),
+                           ("book_id", None), ("content_dir", None)):
+        if not hasattr(args, field):
+            setattr(args, field, default)
+    run_unattended(mod.main_async, args, log_dir=mod.LOG_DIR, name=name,
+                   readonly=force_readonly)
+
+
+async def cmd_reschedule_cli(args):
+    """批量改排期（CLI）。GUI 一直有这功能，CLI 之前是缺的。"""
+    if not require_login_cli():
+        return
+    cfg = load_config()
+    headless = args.headless or cfg.get("headless", False)
+    validated = validate_times(args.time)
+    if not validated:
+        logger.error(f"发布时间格式错误: {args.time}")
+        return
+    try:
+        datetime.strptime(args.schedule, "%Y-%m-%d")
+    except ValueError:
+        logger.error(f"日期格式错误: {args.schedule}（应为 YYYY-MM-DD）")
+        return
+    per_day = max(1, args.per_day)
+    async with async_playwright() as p:
+        browser, context = await create_context(p, headless=headless)
+        page = await context.new_page()
+        try:
+            url = CHAPTER_MANAGE_URL_TPL.format(book_id=args.book_id)
+            if not await goto_with_login_retry(page, url):
+                logger.error("被重定向到登录页，登录状态可能已失效（请重新运行 login）")
+                return
+            await settle_page(page)
+
+            # 多卷: --all-volumes 逐卷合并，否则只排当前卷
+            vol_texts = None
+            if args.all_volumes:
+                vol_info = await detect_volumes(page)
+                if vol_info.get("hasVolumes"):
+                    vol_texts = [v["text"] if isinstance(v, dict) else v
+                                 for v in vol_info.get("volumes", [])] or None
+
+            all_chapters = []
+            if vol_texts:
+                for vt in vol_texts:
+                    await select_volume(page, vt)
+                    chs, _ = await extract_chapters_from_page(page, args.book_id)
+                    all_chapters.extend(chs)
+            else:
+                all_chapters, _ = await extract_chapters_from_page(
+                    page, args.book_id)
+
+            # 只有「待发布」能改排期；顺序与 GUI 一致（列表是倒序展示的）
+            pending = [ch for ch in reversed(all_chapters)
+                       if "待发布" in ch.get("status", "")]
+            if not pending:
+                logger.warning("这部作品里没有「待发布」状态的章节，"
+                               "已发布的章节不能再改排期。")
+                return
+
+            schedule = compute_schedule(
+                len(pending), args.schedule, args.time, per_day)
+            schedule_map = {}
+            dups = []
+            for i, ch in enumerate(pending):
+                t = ch.get("title", "")
+                if t in schedule_map:
+                    dups.append(t)
+                schedule_map[t] = schedule[i]
+            if dups:
+                # 排期按标题匹配行，同名会互相覆盖、排错章 —— 无人值守下直接中止
+                logger.error(
+                    "存在同名章节: " + "、".join(dict.fromkeys(dups))
+                    + " —— 排期按标题匹配，同名会错配，已中止。"
+                      "请先在平台修改章节标题后再试。")
+                return
+
+            logger.info(f"待发布章节 {len(pending)} 个，"
+                        f"排期 {schedule[0][0]} ~ {schedule[-1][0]}")
+            ok, bad = await reschedule_on_manage_page(
+                page, args.book_id, schedule_map,
+                max_retries=cfg.get("max_retries", 2),
+                delay=cfg.get("delay_between_chapters", 3),
+                volume_texts=vol_texts)
+            logger.info("=" * 40)
+            logger.info(f"  修改排期完成! 成功: {ok}  失败: {bad}")
+            logger.info("=" * 40)
+        finally:
+            await save_auth(context)
+            await close_browser_safely(browser)
+
+
+# 子命令间重复出现的参数说明。写成常量而不是各处手打: 原来有 12 个参数干脆
+# 没写 help（用户 -h 看到的是一片空白），写了的几处措辞还各不相同。
+_H_BOOK_ID = "目标作品 ID（默认取上次 GUI 选的）"
+_H_CONTENT_DIR = "本地章节目录（默认取 config.json 的 chapters_dir）"
+_H_HEADLESS = "无头模式（不显示浏览器窗口）"
+_H_SHOW_BROWSER = "强制显示浏览器窗口（覆盖 config.json 的 headless）"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="番茄作家 MD 批量上传工具",
@@ -3197,10 +4513,10 @@ def main():
   %(prog)s upload ./chapters --book-id 12345 --publish  上传并发布
 
 定时发布:
-  %(prog)s upload ./chapters --book-id 12345 --schedule 2026-03-14
+  %(prog)s upload ./chapters --book-id 12345 --schedule 2026-09-01
       从 3/14 起每天 1 章, 默认 08:00 发布
 
-  %(prog)s upload ./chapters --book-id 12345 --schedule 2026-03-14 --per-day 3
+  %(prog)s upload ./chapters --book-id 12345 --schedule 2026-09-01 --per-day 3
       从 3/14 起每天 3 章
 
 修改已有章节:
@@ -3227,7 +4543,7 @@ def main():
     )
     up.add_argument(
         "--schedule", metavar="DATE",
-        help="定时发布起始日期, 格式 YYYY-MM-DD (如 2026-03-14)",
+        help="定时发布起始日期, 格式 YYYY-MM-DD；排到过去的日期平台可能拒绝",
     )
     up.add_argument(
         "--time", default="08:00",
@@ -3236,6 +4552,31 @@ def main():
     up.add_argument(
         "--per-day", type=int, default=1,
         help="每天发布章数 (默认 1)",
+    )
+    up.add_argument(
+        "--modified-after", metavar="TIME",
+        help="只操作在此时间之后修改过的文件，"
+             "格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM（与 GUI「按修改日期筛选」一致）",
+    )
+    up.add_argument(
+        "--modified-before", metavar="TIME",
+        help="只操作在此时间之前修改过的文件",
+    )
+    up.add_argument(
+        "--chapters", metavar="SPEC",
+        help="按章节号筛选。30=只第30章（GUI 那边数字总跟着 ≤/≥ 下拉框，"
+             "要阈值请写 ≥30 / ≤30）；也支持 5-10 / 1,3,5-10 / <30 / >30。"
+             "批量失败后清单给的章节号（如 79-114）可原样粘到这里补传",
+    )
+    up.add_argument(
+        "--auto-continue", action="store_true",
+        help="自动接续队列: 起始日期和章号范围都按平台队列自动算"
+             "（只发平台最大章号之后的章，中段缺口交给 remap）",
+    )
+    up.add_argument(
+        "--days-ahead", type=int, metavar="N",
+        help="配合 --auto-continue: 只排到 N 天后（今天+N 天），"
+             "而不是把本地剩下的全排上去。排得近，想改剧情时好改；也留着断更保护",
     )
     up.add_argument(
         "--unique-titles", action="store_true",
@@ -3249,6 +4590,56 @@ def main():
         "--edit", action="store_true",
         help="修改已有章节 (按章节号匹配, 不可与 --publish/--schedule 同时使用)",
     )
+
+    # remap: 章节重排（把未公开段的错位内容整体前移，消掉中段缺口）
+    rm = sub.add_parser("remap", help="章节重排：修未公开段的位置错位")
+    rm.add_argument("--book-id", help=_H_BOOK_ID)
+    rm.add_argument("--content-dir", help=_H_CONTENT_DIR)
+    rm.add_argument("--run", action="store_true", help="真的写入（不加只预览）")
+    rm.add_argument("--only", type=int, help="只改指定位置（全书位置）")
+    rm.add_argument("--range", help="只改位置区间，如 709-800")
+    rm.add_argument("--limit", type=int, help="本次最多改多少个")
+    rm.add_argument("--safety-minutes", type=int, default=60,
+                    help="跳过多少分钟内就要发布的章（默认 60）")
+    rm.add_argument("--daily", action="store_true",
+                    help="无人值守日常跑：等于 --run --headless，写日志、需人工时弹窗")
+    rm.add_argument("--headless", action="store_true", help=_H_HEADLESS)
+    rm.add_argument("--show-browser", action="store_true", help=_H_SHOW_BROWSER)
+    rm.add_argument("--use-ai", action="store_true",
+                    help="改写内容时申报「使用 AI 创作」")
+
+    # audit: 缺口体检（remap 的只读模式，单独给个名字更好找）
+    ad = sub.add_parser("audit", help="缺口体检：按「谁能修」分段报告，只读")
+    ad.add_argument("--book-id", help=_H_BOOK_ID)
+    ad.add_argument("--content-dir", help=_H_CONTENT_DIR)
+    ad.add_argument("--headless", action="store_true", help=_H_HEADLESS)
+    ad.add_argument("--show-browser", action="store_true", help=_H_SHOW_BROWSER)
+    ad.add_argument("--daily", action="store_true",
+                    help="无人值守日常体检：写日志，发现错位或余量告急时弹窗"
+                         "（只读，不改任何东西——适合挂计划任务当烟雾报警器）")
+
+    # clean-drafts: 清空草稿箱
+    cd = sub.add_parser("clean-drafts", help="清空草稿箱（带本地源文件安全检查）")
+    cd.add_argument("--book-id", help=_H_BOOK_ID)
+    cd.add_argument("--content-dir", help=_H_CONTENT_DIR + "，用于安全检查")
+    cd.add_argument("--run", action="store_true", help="真的删除（不加只预览）")
+    cd.add_argument("--limit", type=int, help="本次最多删多少条")
+    cd.add_argument("--force", action="store_true",
+                    help="安全检查不通过也照删（会丢内容，慎用）")
+    cd.add_argument("--headless", action="store_true", help=_H_HEADLESS)
+    cd.add_argument("--show-browser", action="store_true", help=_H_SHOW_BROWSER)
+
+    # reschedule: 批量改排期（GUI 一直有，CLI 之前缺）
+    rs = sub.add_parser("reschedule", help="批量修改待发布章节的排期")
+    rs.add_argument("--book-id", required=True, help="目标作品 ID")
+    rs.add_argument("--schedule", metavar="DATE", required=True,
+                    help="起始日期 YYYY-MM-DD")
+    rs.add_argument("--time", default="08:00",
+                    help="发布时间，多个逗号分隔，如 08:00,12:00,20:00")
+    rs.add_argument("--per-day", type=int, default=1, help="每天章数")
+    rs.add_argument("--headless", action="store_true", help=_H_HEADLESS)
+    rs.add_argument("--all-volumes", action="store_true",
+                    help="合并所有卷一起排（不加则只排当前卷）")
 
     args = parser.parse_args()
     setup_logging(LOG_FILE)
@@ -3266,6 +4657,18 @@ def main():
             asyncio.run(
                 cmd_upload(args.directory, args.book_id, args.publish, args)
             )
+    elif args.command == "remap":
+        _run_tool_cmd("remap", args)
+    elif args.command == "audit":
+        # audit 是只读的：--daily 只要日志+告警，绝不能像别的工具那样被置成
+        # run=True（那会变成真改写）。所以这里显式钉死 run=False。
+        args.audit = True
+        args.run = False
+        _run_tool_cmd("remap", args, force_readonly=True)
+    elif args.command == "clean-drafts":
+        _run_tool_cmd("clean_drafts", args)
+    elif args.command == "reschedule":
+        asyncio.run(cmd_reschedule_cli(args))
     else:
         parser.print_help()
 

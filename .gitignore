@@ -22,6 +22,8 @@ chapters/
 error_*.png
 fanqie_error.log
 fanqie_error.log.*
+# 重排工具的运行日志（含书名/章节标题，不入库）
+tools/remap/logs/
 
 # IDE
 .idea/

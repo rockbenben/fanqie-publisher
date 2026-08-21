@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """100 轮对抗战役：攻击此前从未被测试覆盖的核心纯函数。
 
-目标: compute_schedule / _validate_times / _extract_chapter_num /
+目标: compute_schedule / validate_times / _extract_chapter_num /
       _strip_chapter_prefix / _cn_to_int / parse_md_file /
       strip_md_formatting / deduplicate_titles / match_chapters /
       _classify_toasts(新词库) / _parse_chapter_spec(极端)
@@ -13,7 +13,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -231,7 +231,7 @@ def rounds_match():
         round_pass(f"match_chapters 随机批次 #{r+1}")
 
 
-# ------------------------------------------------ R81-90 _validate_times
+# ------------------------------------------------ R81-90 validate_times
 def rounds_validate_times():
     cases = {
         "24:00": [], "23:60": [], "8:30": ["08:30"], "": [],
@@ -242,8 +242,8 @@ def rounds_validate_times():
         "08:00；12:00，20:00": ["08:00", "12:00", "20:00"],
     }
     for k, v in cases.items():
-        got = fu._validate_times(k)
-        assert got == v, f"_validate_times({k!r}) = {got}, 期望 {v}"
+        got = fu.validate_times(k)
+        assert got == v, f"validate_times({k!r}) = {got}, 期望 {v}"
     round_pass("validate_times 定向 10 组")
 
     rng = random.Random(41)
@@ -251,7 +251,7 @@ def rounds_validate_times():
     for r in range(9):
         for _ in range(300):
             s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 30)))
-            out = fu._validate_times(s)
+            out = fu.validate_times(s)
             assert out == sorted(set(out)), f"未排序去重 {out}"
             for t in out:
                 assert TIME_RE.match(t), f"非法时间 {t!r} from {s!r}"
@@ -344,7 +344,7 @@ if __name__ == "__main__":
     rounds_dedup()
     print("[R71-80 match_chapters]")
     rounds_match()
-    print("[R81-90 _validate_times]")
+    print("[R81-90 validate_times]")
     rounds_validate_times()
     print("[R91-95 筛选极端]")
     rounds_filter_extreme()

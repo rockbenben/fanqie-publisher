@@ -181,7 +181,7 @@ def compress_roundtrip():
     print("[R9 失败章节号压缩与往返]")
     import fanqie_upload as fu
 
-    C = fu._compress_chapter_nums
+    C = fu.compress_chapter_nums
     check("R9 连续段压缩", C([79, 80, 81, 83, 84, 114]) == "79-81,83-84,114")
     check("R9 单元素", C([7]) == "7")
     check("R9 乱序去重", C([3, 1, 2, 2, 10]) == "1-3,10")

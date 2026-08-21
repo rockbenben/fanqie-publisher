@@ -25,17 +25,22 @@ from pathlib import Path
 try:
     from fanqie_upload import (
         load_config,
-        parse_md_file, parse_md_files, get_md_files, strip_md_formatting,
-        deduplicate_titles, compute_schedule, compute_gap_schedule,
-        overdue_gap_nums, _validate_times,
-        DailyLimitReached, _check_daily_limit, _wait_publish_result,
-        _log_fail_list, _record_unprocessed,
+        parse_md_files, get_md_files, strip_md_formatting,
+        deduplicate_titles, compute_schedule, validate_times,
+        parse_chapter_spec, filter_by_chapter_spec, parse_time_spec,
+        parse_datetime, TIMER_INPUT_FORMATS,
+        fetch_chapter_items, audit_chapter_positions, MOVE_WINDOW_H,
+        DISPLAY_PENDING as MOVE_PENDING, DISPLAY_PUBLISHED as MOVE_PUBLISHED,
+        fetch_draft_list, compress_chapter_nums,
+        volume_count,
+        log_fail_list, _load_tool_module,
         create_context, save_auth, close_browser_safely, goto_with_login_retry,
-        wait_for_editor_ready, fill_chapter,
-        save_draft, _extract_draft_id, publish_scheduled, _navigate_to_publish_settings,
-        extract_chapters_from_page, match_chapters, edit_one_chapter,
+        wait_for_editor_ready,
+        run_creation_batch, run_edit_batch,
+        extract_chapters_from_page, match_chapters,
         reschedule_on_manage_page, detect_volumes, select_volume,
-        AUTH_FILE, BASE_URL, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
+        settle_page,
+        AUTH_FILE, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
         CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL, CONFIG_FILE, GUI_STATE_FILE,
         BOOKS_JS, LAST_PUBLISH_JS,
         logger, setup_logging, LOG_FILE as UPLOAD_LOG_FILE, get_browser_timeout,
@@ -54,7 +59,6 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-CHAPTER_MANAGE_URL = CHAPTER_MANAGE_URL_TPL
 DEFAULT_CHAPTERS_DIR = SCRIPT_DIR / "chapters"
 
 # --- 新手引导 ---
@@ -63,27 +67,36 @@ ONBOARD_STEP_NAMES = ["登录", "选作品", "选章节文件夹", "上传/修�
 _CIRCLED = ["①", "②", "③", "④"]
 STEP_HINTS = {
     1: "下一步：点「登录/新建」，在弹出的浏览器里登录番茄账号",
-    2: "下一步：点作品栏的「↻」刷新按钮，选择一部作品",
+    2: "下一步：点作品行右侧的「↻」刷新列表，选择一部作品",
     3: "下一步：选择章节文件夹（默认 chapters/），确认下方「章节预览」里出现章节",
     4: "下一步：选好「操作模式」后点「开始上传」（修改模式为「开始修改」）",
 }
+BOOK_PLACEHOLDER = "点右侧 ↻ 刷新作品列表"
+LOGIN_FIRST_MSG = "还没有登录番茄账号。点顶部「登录 / 新建」，在弹出的浏览器里完成登录。"
+PICK_BOOK_MSG = "点作品行右侧的「↻」刷新列表，再选择要操作的作品。"
+PICK_DIR_MSG = "点「选择文件夹」指定存放章节的目录，每个 .md / .txt 文件就是一章。"
+BOOK_EMPTY_HINT = "还没有作品 · 先去番茄建一本书"
 SECTION_HELP = {
     "账号": "给每个番茄账号起一个本地名称用于区分。点「登录/新建」会打开浏览器，"
             "请在其中登录番茄账号——本地名称只是标签，不是番茄笔名。"
             "登录多个账号后用下拉框切换。",
-    "作品选择": "登录后点作品栏的「↻」刷新按钮拉取你的作品，选中一部后会自动获取最新发布信息。"
-                "旁边的「📖」可在浏览器里打开该作品的章节管理页。",
-    "章节文件夹": "选择存放章节的文件夹（含子文件夹）。每个 .md 或 .txt（纯文本）"
+    "作品与章节": "上面选作品：登录后点「↻」拉取你的作品，选中一部后会自动获取最新发布信息，"
+                  "「📖」可在浏览器里打开该作品的章节管理页。\n"
+                  "下面选章节：指定存放章节的文件夹（含子文件夹），每个 .md 或 .txt（纯文本）"
                   "文件就是一章，按文件名顺序排列（chapter-1 在 chapter-10 之前）。"
-                  "「自动处理重名」避免番茄的同名章节限制；可按修改日期只挑近期改过的章节。",
+                  "「自动处理重名」避免番茄的同名章节限制；"
+                  "「按修改日期筛选」只挑近期改过的章节。",
     "操作模式": "五种操作，按需选一：\n"
                 "· 定时发布：排好日期时间，到点自动发布\n"
                 "· 立即发布：上传后马上发布\n"
                 "· 存草稿：只上传存草稿，稍后自己手动发\n"
                 "· 修改内容：用本地文件替换已发布章节的正文\n"
                 "· 修改排期：只改已有章节的发布时间，不动正文\n"
-                "所有模式都能「按章节号筛选」，只操作指定范围（如 1,3,5-10）的章节。",
-    "定时执行": "设定一个未来时刻，到点自动执行当前所选操作（仅一次），"
+                "所有模式都能「按章节号筛选」，只操作指定范围（如 1,3,5-10）的章节。\n"
+                "定时发布还可勾「自动接续」：不用自己填起始日期，工具读平台队列排到哪天、"
+                "从次日接着往后排；旁边「排到」填 N 表示只补到「今天+N 天」，"
+                "留空就把本地剩下的全排上去。",
+    "定时执行": "设定一个未来时刻（格式 YYYY-MM-DD HH:MM），到点自动执行当前所选操作（仅一次），"
                 "适合无人值守（比如半夜自动上传）。到点若有任务在跑会等它结束再执行，"
                 "触发前会重新读取一次章节目录。",
 }
@@ -102,22 +115,17 @@ CLR_TOMATO   = "#D8402B"   # 番茄红：品牌带 + 主按钮 + 当前步骤
 CLR_TOMATO_D = "#B02E1D"   # 番茄红按下 / 链接
 CLR_SCHED    = "#E5822A"   # 排期橙：排期 / 定时 / 进度（连载节奏）
 CLR_SCHED_D  = "#C0691A"
+# 排期橙的正文变体：CLR_SCHED 在暖白底上只有 2.69:1，当正文用读不清。
+# 这个值同色相同饱和、只压低明度，实测 4.58:1 过 WCAG AA(4.5)。
+# 平台状态/倒计时这类小字状态用它，别直接用 CLR_SCHED。
+CLR_SCHED_TX = "#C44E00"
+CLR_BTN_BG   = "#F0ECE4"   # 普通按钮底
+CLR_TAB_BG   = "#EDE8DF"   # 未选中的标签页底
+CLR_TIP_BG   = "#2A2622"   # tooltip 深色底
 CLR_OK       = "#2E7D46"   # 已登录 / 完成
 CLR_WARN     = "#C0392B"   # 未登录 / 错误
 CLR_BRAND_TX = "#FFFFFF"   # 品牌带主文字
 CLR_BRAND_SUB = "#F7CDC2"  # 品牌带次要文字 / 链接
-
-
-def _as_int(n):
-    """把章节号安全转 int；None/非数字返回 None（视为不匹配，不抛异常）。
-
-    筛选的 key 可能来自平台章节(理论上 int)或本地解析(数字字符串)；万一
-    DOM 漂移给出 "番外" 等非数字，旧代码 int(n) 会让整个预览/筛选崩掉。
-    """
-    try:
-        return int(n)
-    except (TypeError, ValueError):
-        return None
 
 
 # 高 DPI 支持 (Windows)
@@ -248,15 +256,22 @@ class FanqieGUI:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("番茄小说 · 章节批量上传工具（MD/TXT）")
-        # 高度含顶部新手引导栏（~96px）：1010 让两个文本面板在 1080p 上仍约 8 行；
-        # 小屏可拖动，或「✕ 收起」引导栏拿回空间（minsize 保持不变以兼容小屏）
-        _w, _h = 1280, 980
+        self.root.title("番茄作家 · 连载发布工作台")
+        # 首次尺寸按屏幕来算：写死 1280x980 时，1366×768 的笔记本会得到一个比屏幕
+        # 还高的窗口，标题栏被顶出屏幕外、底部按钮压在任务栏下面，两头都够不着。
         self.root.update_idletasks()
-        _sx = (self.root.winfo_screenwidth() - _w) // 2
-        _sy = (self.root.winfo_screenheight() - _h) // 2
+        _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        _w = max(900, min(1280, _sw - 80))
+        # 下限 680 与 minsize 一致；预留 100 给任务栏+标题栏。
+        # 原来是 max(560, _sh-120)，1366x768 的笔记本上算出 648 —— 开箱即「看不到任何章节预览」。
+        _h = max(680, min(980, _sh - 100))
+        _sx = max(0, (_sw - _w) // 2)
+        _sy = max(0, (_sh - _h) // 3)
         self.root.geometry(f"{_w}x{_h}+{_sx}+{_sy}")
-        self.root.minsize(1060, 760)
+        # 高度下限按「预览至少看得见」定，不是随手写的：固定区域(品牌栏+账号栏+
+        # 引导栏+双栏卡片+行动条)约占 574px，窗口高 ≤660 时章节预览一行都不剩，
+        # 而「上传前确认要发哪些章」是不可逆操作前唯一的复核环节。
+        self.root.minsize(1000, 680)
 
         self.worker = AsyncWorker()
         self.worker.start()
@@ -294,7 +309,6 @@ class FanqieGUI:
         self._timer_prerefresh_done = False  # 触发前 60 秒目录刷新是否已执行
         self._auto_run = False            # 守护同步弹窗阶段（定时触发时为 True）
         self._auto_run_pending = False    # 跨异步任务，供 _upload_done 抑制完成弹窗
-        self._backfill_pending = False    # 补漏点击时平台章节未加载 → 加载完自动续跑
 
         self._setup_style()
         self._build_ui()
@@ -303,6 +317,53 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     # 视觉主题
     # -----------------------------------------------------------------------
+    def _install_check_indicator(self, style):
+        """把勾选框的指示器换成对勾。
+
+        clam 主题自带的指示器在选中态画的是一个 **✗**（叉），语义上像"否定/
+        删除"，勾上反而像被划掉。这里用三张自绘小图替换 indicator 元素：
+        未选=空框、选中=番茄红对勾、禁用=灰框。
+        图必须挂在实例上保持引用，否则会被 GC 回收、控件变空白。
+        """
+        box, pad = 16, 2          # 16px 见方，留 2px 描边余量
+        def mk(checked, disabled=False):
+            img = tk.PhotoImage(width=box, height=box)
+            edge = CLR_HAIRLINE if not disabled else "#EFEAE1"
+            fill = "#FFFFFF" if not disabled else "#F5F1EA"
+            img.put(fill, to=(0, 0, box, box))
+            # 描边
+            for i in range(box):
+                img.put(edge, to=(i, 0, i + 1, 1))
+                img.put(edge, to=(i, box - 1, i + 1, box))
+                img.put(edge, to=(0, i, 1, i + 1))
+                img.put(edge, to=(box - 1, i, box, i + 1))
+            if checked:
+                c = CLR_TOMATO if not disabled else "#B9B2A6"
+                # 对勾：左下短笔下行 + 右上长笔上行，笔宽 3px 才看得清
+                for k in range(4):          # 左下短笔
+                    x, y = 3 + k, 6 + k
+                    img.put(c, to=(x, y, x + 3, y + 3))
+                for k in range(6):          # 右上长笔
+                    x, y = 6 + k, 9 - k
+                    img.put(c, to=(x, y, x + 3, y + 3))
+            return img
+
+        self._chk_imgs = (mk(False), mk(True), mk(False, True), mk(True, True))
+        try:
+            style.element_create("Tick.indicator", "image", self._chk_imgs[0],
+                                 ("disabled", "selected", self._chk_imgs[3]),
+                                 ("disabled", self._chk_imgs[2]),
+                                 ("selected", self._chk_imgs[1]),
+                                 sticky="", padding=pad)
+            style.layout("TCheckbutton", [
+                ("Checkbutton.padding", {"sticky": "nswe", "children": [
+                    ("Tick.indicator", {"side": "left", "sticky": ""}),
+                    ("Checkbutton.focus", {"side": "left", "sticky": "w",
+                                           "children": [
+                        ("Checkbutton.label", {"sticky": "nswe"})]})]})])
+        except tk.TclError:
+            pass      # 元素已存在或主题不支持：保持默认外观，不影响功能
+
     def _setup_style(self):
         """套用 clam 主题 + 稿纸与番茄配色体系。所有控件底色统一为 CLR_BASE，
         卡片靠发丝描边分区，避免 ttk 标签在不同底色上出现色块错配。"""
@@ -330,6 +391,7 @@ class FanqieGUI:
         style.map("TCheckbutton",
                   background=[("active", CLR_BASE)],
                   foreground=[("selected", CLR_INK)])
+        self._install_check_indicator(style)
         style.configure("TRadiobutton", background=CLR_BASE, foreground=CLR_INK,
                         font=(ff, base_sz))
         style.map("TRadiobutton",
@@ -352,7 +414,7 @@ class FanqieGUI:
         self.root.option_add("*TCombobox*Listbox.font", (ff, base_sz))
 
         # 普通按钮：扁平 + 发丝描边
-        style.configure("TButton", background="#F0ECE4", foreground=CLR_INK,
+        style.configure("TButton", background=CLR_BTN_BG, foreground=CLR_INK,
                         bordercolor=CLR_HAIRLINE, relief="flat",
                         padding=(11, 6), font=(ff, base_sz))
         style.map("TButton",
@@ -361,7 +423,7 @@ class FanqieGUI:
                   foreground=[("disabled", "#B8B2A8")])
         # 主行动按钮：唯一的番茄红实心
         style.configure("Primary.TButton", background=CLR_TOMATO,
-                        foreground="#FFFFFF", bordercolor=CLR_TOMATO,
+                        foreground=CLR_BRAND_TX, bordercolor=CLR_TOMATO,
                         relief="flat", padding=(20, 8), font=(ff, 11, "bold"))
         style.map("Primary.TButton",
                   background=[("active", CLR_TOMATO_D), ("pressed", CLR_TOMATO_D),
@@ -377,6 +439,11 @@ class FanqieGUI:
         style.map("EmojiIcon.TButton",
                   background=[("active", "#E7E1D7"), ("pressed", "#DCD5C9")])
 
+        # 选项卡条右端的次要动作（导出日志）：比普通按钮矮一档，塞得进标签行
+        style.configure("TabAction.TButton", font=(ff, 9), padding=(9, 3))
+        style.map("TabAction.TButton",
+                  background=[("active", "#E7E1D7"), ("pressed", "#DCD5C9")])
+
         # 卡片 / 标题
         style.configure("Card.TFrame", background=CLR_BASE,
                         bordercolor=CLR_HAIRLINE, relief="solid", borderwidth=1)
@@ -390,7 +457,7 @@ class FanqieGUI:
         # 选项卡（章节预览 / 运行日志）
         style.configure("TNotebook", background=CLR_BASE, borderwidth=0,
                         tabmargins=(2, 4, 2, 0))
-        style.configure("TNotebook.Tab", background="#EDE8DF",
+        style.configure("TNotebook.Tab", background=CLR_TAB_BG,
                         foreground=CLR_INK_SOFT, padding=(16, 7), font=(ff, 10))
         style.map("TNotebook.Tab",
                   background=[("selected", CLR_BASE)],
@@ -408,7 +475,7 @@ class FanqieGUI:
         """带发丝描边的分区卡片。返回 (卡片外框, 内容区)；把控件塞进内容区。"""
         card = ttk.Frame(parent, style="Card.TFrame")
         head = ttk.Frame(card)
-        head.pack(fill="x", padx=12, pady=(10, 2))
+        head.pack(fill="x", padx=12, pady=(8, 2))
         # 标题前的细色条：统一各卡片的结构感；橙=计时（与进度条同色），红=主流程
         tk.Frame(head, width=3, background=CLR_SCHED if sched else CLR_TOMATO
                  ).pack(side="left", fill="y", padx=(0, 8))
@@ -418,15 +485,31 @@ class FanqieGUI:
         if help_key:
             self._add_help(head, help_key)
         body = ttk.Frame(card)
-        body.pack(fill="both", expand=True, padx=12, pady=(2, 11))
+        body.pack(fill="both", expand=True, padx=12, pady=(2, 9))
         return card, body
 
+    def _popup_tools(self):
+        """在「工具」按钮正下方弹出菜单。"""
+        b = self.btn_tools
+        try:
+            self.menu_tools.tk_popup(b.winfo_rootx(),
+                                     b.winfo_rooty() + b.winfo_height())
+        finally:
+            self.menu_tools.grab_release()
+
     def _attach_tooltip(self, widget, text):
-        """给控件加悬停提示（图标按钮无文字时用来说明用途）。"""
+        """给控件加悬停提示（图标按钮无文字时用来说明用途）。
+
+        text 可传字符串，或传一个返回字符串的函数——内容随状态变化时（如路径框
+        显示当前完整路径）用后者，悬停那一刻才取值。
+        """
         state = {"tip": None}
 
         def show(_):
             if state["tip"] is not None or self._closing:
+                return
+            msg = text() if callable(text) else text
+            if not msg:
                 return
             x = widget.winfo_rootx() + 6
             y = widget.winfo_rooty() + widget.winfo_height() + 4
@@ -437,7 +520,7 @@ class FanqieGUI:
                 tw.attributes("-topmost", True)
             except tk.TclError:
                 pass
-            tk.Label(tw, text=text, background="#2A2622", foreground="#FFFFFF",
+            tk.Label(tw, text=msg, background=CLR_TIP_BG, foreground=CLR_BRAND_TX,
                      font=(self._ff, 9), padx=7, pady=3).pack()
             state["tip"] = tw
 
@@ -455,13 +538,13 @@ class FanqieGUI:
         底部一条发丝线与内容分隔。"""
         ff = self._ff
         header = ttk.Frame(self.root)
-        header.pack(fill="x", padx=12, pady=(10, 0))
+        header.pack(fill="x", padx=12, pady=(8, 0))
 
         row = ttk.Frame(header)
         row.pack(fill="x")
         brand = ttk.Frame(row)
         brand.pack(side="left")
-        ttk.Label(brand, text="小说章节批量上传 · 连载发布工作台",
+        ttk.Label(brand, text="番茄作家 · 连载发布工作台",
                   foreground=CLR_INK, font=(ff, 14, "bold")).pack(side="left")
         links = ttk.Frame(row)
         links.pack(side="right")
@@ -475,7 +558,7 @@ class FanqieGUI:
         hlp.bind("<Button-1>", lambda _: self._show_welcome())
 
         bar = ttk.Frame(header)
-        bar.pack(fill="x", pady=(8, 8))
+        bar.pack(fill="x", pady=(6, 6))
         ttk.Label(bar, text="账号").pack(side="left")
         self.account_var = tk.StringVar()
         self.cmb_account = ttk.Combobox(
@@ -495,13 +578,65 @@ class FanqieGUI:
             fill="x", padx=12)
 
     def _build_ui(self):
+        # --- 0. 主行动条：最先 pack，永远占住底部一条 ---
+        # pack 按调用顺序分配空间。先 pack 底栏（side="bottom"），窗口再矮也先
+        # 分到它那一条；之后的页眉/卡片/选项卡只能瓜分剩余空间。此前底栏排在
+        # cols 之后，窗口高度 < ~700px（如 1366×768 笔记本开 125% 缩放）时
+        # 「开始上传」会被整条挤出可视区，用户无路可点。
+        frm = ttk.Frame(self.root)
+        frm.pack(side="bottom", fill="x", padx=12, pady=(8, 10))
+        self.btn_upload = ttk.Button(
+            frm, text="开始上传", style="Primary.TButton", command=self._on_upload)
+        self.btn_upload.pack(side="left")
+        # 检查缺口：体检章节位置，按「谁能修」分段（详见 _on_audit_gaps）
+        self.btn_audit = ttk.Button(
+            frm, text="检查缺口", command=self._on_audit_gaps)
+        self.btn_audit.pack(side="left", padx=(8, 0))
+        self._attach_tooltip(
+            self.btn_audit,
+            "体检章节位置：未公开段可自动重排，已公开段只能在手机 App 里"
+            "申请移动（限发布 3 天内），超期则永久错位")
+        # 工具菜单：低频但常用的维护操作收在这里，不往行动条上堆按钮。
+        # 只有两项：续排(keep_ahead)不在这里——它已经是「定时发布」模式下的
+        # 「自动接续」勾选框，再开一个菜单入口就是同一功能的第二条路径。
+        # 用普通 Button 而不是 Menubutton: 后者自带下拉箭头（文字里再写 ▾ 就成了
+        # 两个箭头），默认样式还会把它画成下拉框、与旁边的「检查缺口」不是一路货。
+        # 手动 popup 菜单外观统一。（Menubutton 并不影响 tooltip——实测它照常
+        # 收到 <Enter>，别把这两件事混为一谈。）
+        self.btn_tools = ttk.Button(frm, text="工具 ▾", command=self._popup_tools)
+        # Tk 的菜单项挂不了 tooltip，所以把说明直接做成灰色不可点的副标题行——
+        # 展开就能看懂每个工具干什么，不用去猜。
+        self.menu_tools = tk.Menu(self.btn_tools, tearoff=0)
+        for label, hint, cmd in (
+            ("章节重排…", "把未公开的待发布章按位置重装内容，消掉中段缺口",
+             self._on_tool_remap),
+            ("清空草稿箱…", "删掉草稿箱里的草稿（先查本地有没有源文件）",
+             self._on_tool_clean_drafts),
+        ):
+            if self.menu_tools.index("end") is not None:
+                self.menu_tools.add_separator()
+            self.menu_tools.add_command(label=label, command=cmd)
+            self.menu_tools.add_command(label="      " + hint, state="disabled")
+        self.btn_tools.pack(side="left", padx=(8, 0))
+        self._attach_tooltip(
+            self.btn_tools,
+            "维护类操作：重排未公开章的内容、清空草稿箱。"
+            "每项都会先预览、确认后才动手")
+        self.progress = ttk.Progressbar(frm, mode="determinate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=12)
+        self.lbl_progress = ttk.Label(frm, text="")
+        self.lbl_progress.pack(side="left")
+
         # --- 页眉：番茄红字标 + 账号工具行 ---
         self._build_header()
 
         # --- 新手引导：步骤轨 ---
         self._build_guidance_bar()
 
-        # --- 上部两栏：左=作品 / 章节，右=模式 / 定时 ---
+        # --- 上部两栏：左=「发什么」（作品与章节 + 定时执行），右=「怎么发」（操作模式）---
+        # 两栏高度要尽量持平：整块 cols 是固定高度、不可滚动，它多占一像素，
+        # 下方章节预览/日志就少一像素。此前定时执行挂在右栏，定时发布模式下
+        # 右栏 485px、左栏 326px，白白抬高了 160px 的窗口下限。
         cols = ttk.Frame(self.root)
         cols.pack(fill="x", padx=12, pady=(2, 0))
         cols.columnconfigure(0, weight=1, uniform="c")
@@ -512,33 +647,37 @@ class FanqieGUI:
         right = ttk.Frame(cols)
         right.grid(row=0, column=1, sticky="new", padx=(6, 0))
 
-        # --- 作品选择 ---
-        card, frm = self._card(left, "作品选择", "作品选择")
+        # --- 作品与章节（两者都在回答「发哪部作品的哪些文件」，合成一张卡）---
+        card, frm = self._card(left, "作品与章节", "作品与章节")
         card.pack(fill="x")
-        self.btn_books = ttk.Button(
-            frm, text="↻", width=2, style="Icon.TButton",
-            command=self._on_refresh_books)
-        self.btn_books.pack(side="left")
-        self._attach_tooltip(self.btn_books, "刷新作品列表")
-        # 先在右侧预留图标按钮，再让下拉填充中间，避免下拉展开挤掉按钮
+        frm_dir = frm  # 章节文件夹各行与作品行同卡
+
+        # 作品行
+        row_book = ttk.Frame(frm)
+        row_book.pack(fill="x")
+        # 图标按钮先靠右占位，输入控件再填充中间；两行的动作按钮因此都在右侧
+        # 同一条竖线上（作品行 ↻📖 / 目录行 选择文件夹 ↻📂），不再一左一右各摆一个
         self.btn_open_manage = ttk.Button(
-            frm, text="📖", width=2, style="EmojiIcon.TButton",
+            row_book, text="📖", width=2, style="EmojiIcon.TButton",
             command=self._open_chapter_manage)
         self.btn_open_manage.pack(side="right")
         self._attach_tooltip(self.btn_open_manage, "章节管理（在浏览器打开）")
+        self.btn_books = ttk.Button(
+            row_book, text="↻", width=2, style="Icon.TButton",
+            command=self._on_refresh_books)
+        self.btn_books.pack(side="right", padx=(6, 6))
+        self._attach_tooltip(self.btn_books, "刷新作品列表")
         self.book_var = tk.StringVar()
         self.cmb_book = ttk.Combobox(
-            frm, textvariable=self.book_var, state="readonly", width=24)
-        self.cmb_book.pack(side="left", padx=6, fill="x", expand=True)
+            row_book, textvariable=self.book_var, state="readonly", width=24)
+        self.cmb_book.pack(side="left", fill="x", expand=True)
         self.cmb_book.bind("<<ComboboxSelected>>", lambda _: self._on_book_changed())
+        # 空下拉框看不出该做什么——先摆一句行动指引，刷新出列表后被真数据顶掉
+        self.cmb_book.set(BOOK_PLACEHOLDER)
 
-        # --- 章节文件夹 ---
-        card, frm_dir = self._card(left, "章节文件夹", "章节文件夹")
-        card.pack(fill="x", pady=(8, 0))
-
-        # 路径 + 浏览
+        # 章节文件夹：路径 + 浏览
         row1 = ttk.Frame(frm_dir)
-        row1.pack(fill="x")
+        row1.pack(fill="x", pady=(8, 0))
         self.dir_var = tk.StringVar()
         # 优先使用 config 中保存的路径，否则使用默认 chapters/
         DEFAULT_CHAPTERS_DIR.mkdir(exist_ok=True)
@@ -549,24 +688,27 @@ class FanqieGUI:
             self.dir_var.set(str(DEFAULT_CHAPTERS_DIR))
             if saved_dir:  # 保存的路径已失效，更新内存配置
                 self._cfg["chapters_dir"] = str(DEFAULT_CHAPTERS_DIR)
-        ttk.Entry(row1, textvariable=self.dir_var, state="readonly").pack(
-            side="left", fill="x", expand=True)
-        ttk.Button(row1, text="选择文件夹", command=self._on_browse_dir).pack(
-            side="left", padx=(6, 0))
-
-        # 动作（图标，自成一行、留出间距，不与路径挤在一起）
-        row_act = ttk.Frame(frm_dir)
-        row_act.pack(fill="x", pady=(8, 0))
-        btn_reload = ttk.Button(
-            row_act, text="↻", width=2, style="Icon.TButton",
-            command=self._reload_chapters)
-        btn_reload.pack(side="left")
-        self._attach_tooltip(btn_reload, "刷新（重新扫描章节文件夹）")
+        # 图标按钮先靠右占位，路径框再填充中间——否则长路径会把按钮挤出卡片
         btn_opendir = ttk.Button(
-            row_act, text="📂", width=2, style="EmojiIcon.TButton",
+            row1, text="📂", width=2, style="EmojiIcon.TButton",
             command=self._open_chapters_dir)
-        btn_opendir.pack(side="left", padx=(10, 0))
+        btn_opendir.pack(side="right")
         self._attach_tooltip(btn_opendir, "在文件管理器中打开目录")
+        btn_reload = ttk.Button(
+            row1, text="↻", width=2, style="Icon.TButton",
+            command=self._reload_chapters)
+        btn_reload.pack(side="right", padx=(6, 6))
+        self._attach_tooltip(btn_reload, "刷新（重新扫描章节文件夹）")
+        ttk.Button(row1, text="选择文件夹", command=self._on_browse_dir).pack(
+            side="right", padx=(6, 0))
+        self.ent_dir = ttk.Entry(row1, textvariable=self.dir_var, state="readonly")
+        self.ent_dir.pack(side="left", fill="x", expand=True)
+        # 路径过长时默认只看得到盘符，作品名恰好在末尾——滚到尾部并挂全路径提示
+        self.dir_var.trace_add("write", lambda *_: self._show_dir_tail())
+        # 窗口变窄后可见区变小，重新滚到尾部，否则又只剩盘符
+        self.ent_dir.bind("<Configure>", lambda _: self._show_dir_tail())
+        self._attach_tooltip(self.ent_dir, lambda: self.dir_var.get())
+        self._show_dir_tail()
 
         # 选项
         row_opt = ttk.Frame(frm_dir)
@@ -600,8 +742,9 @@ class FanqieGUI:
             "<FocusOut>", lambda _: self._apply_date_filter())
         self.ent_filter_date.bind(
             "<Return>", lambda _: self._apply_date_filter())
-        ttk.Label(row_filter, text="格式 YYYY-MM-DD [HH:MM]",
-                  foreground=CLR_INK_SOFT).pack(side="left", padx=2)
+        # 命中数量比格式说明更该占这行剩余的宽度：格式已经写在输入框的默认值里，
+        # 填错时 lbl_filter_info 会直接说明正确格式。此前那句常驻说明把命中数
+        # 挤成一条几像素的色块。
         self.lbl_filter_info = ttk.Label(row_filter, text="", foreground=CLR_INK_SOFT)
         self.lbl_filter_info.pack(side="left", padx=6)
         self._filter_row = row_filter
@@ -636,17 +779,40 @@ class FanqieGUI:
             self._mode_radios.append(rb)
 
         # 发布选项（所有非草稿模式可见）
-        row_opts = ttk.Frame(frm_mode)
-        row_opts.pack(fill="x", padx=6, pady=(0, 4))
+        self._row_opts = row_opts = ttk.Frame(frm_mode)
         self.use_ai_var = tk.BooleanVar(value=bool(self._cfg.get("use_ai", False)))
         self.chk_use_ai = ttk.Checkbutton(
-            row_opts, text="稿件使用了AI创作", variable=self.use_ai_var)
+            row_opts, text="稿件使用了 AI 创作", variable=self.use_ai_var)
         self.chk_use_ai.pack(side="left", padx=6)
         self.use_ai_var.trace_add("write", lambda *_: self._schedule_config_save())
 
+        # 无头模式：不弹浏览器窗口，后台静默跑。与 CLI 的 --headless / config
+        # 的 headless 同一个开关（写回 config.json，两边一致）。
+        self.headless_var = tk.BooleanVar(value=bool(self._cfg.get("headless", False)))
+        self.chk_headless = ttk.Checkbutton(
+            row_opts, text="后台静默运行", variable=self.headless_var)
+        self.chk_headless.pack(side="left", padx=6)
+        self.headless_var.trace_add("write", lambda *_: self._schedule_config_save())
+
+        # 自动接续队列：起始日期和章号范围都不用自己算——从平台队列末尾的次日
+        # 开始排，只发平台最大章号之后的章。勾上后起始日期输入框置灰。
+        # （这就是原来独立的"续排发布"工具在 GUI 里该有的样子，不必另开入口）
+        self.autocont_var = tk.BooleanVar(
+            value=bool(self._cfg.get("auto_continue", False)))
+        self.chk_autocont = ttk.Checkbutton(
+            row_opts, text="自动接续队列",
+            variable=self.autocont_var, command=self._on_autocont_toggle)
+        self.chk_autocont.pack(side="left", padx=6)
+        self.autocont_var.trace_add("write", lambda *_: self._schedule_config_save())
+        # 「排到 N 天后」的控件放在下面的排期参数行（r1）里，不放这一行：
+        # 它本来就和「每天章数」同类，而这一行在 1280 宽以下已经装不下第 6 个控件
+        # （实测「后台静默运行」被压到只剩勾选框、文字全裁掉）。
+        self.days_ahead_var = tk.StringVar(
+            value=str(self._cfg.get("days_ahead") or ""))
+
         # 上次发布信息（所有模式可见）
         self.lbl_last_publish = ttk.Label(
-            frm_mode, text="选择作品后自动获取", foreground=CLR_INK_SOFT)
+            frm_mode, text="上次发布：选好作品后自动获取", foreground=CLR_INK_SOFT)
         self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
 
         # 卷选择器 + 合并所有卷（同一行，仅 edit/reschedule 模式 + 多卷时显示）
@@ -687,6 +853,18 @@ class FanqieGUI:
         ttk.Spinbox(
             r1, from_=1, to=20, textvariable=self.perday_var,
             width=4).pack(side="left", padx=4)
+        # 「排到」：留空=把本地剩下的全排上去；填 N=只排到「今天+N 天」。
+        # 只排近几天便于改稿（排到几个月后的章想改剧情就得去平台一章章改），
+        # 同时仍留着断更保护。与 CLI 的 --days-ahead 对应。仅定时发布模式显示。
+        self.lbl_days_ahead = ttk.Label(r1, text="排到:")
+        self.ent_days_ahead = ttk.Entry(r1, textvariable=self.days_ahead_var,
+                                        width=3)
+        self.lbl_days_ahead.pack(side="left", padx=(14, 0))
+        self.ent_days_ahead.pack(side="left", padx=4)
+        self.lbl_days_ahead_unit = ttk.Label(r1, text="天后")
+        self.lbl_days_ahead_unit.pack(side="left")
+        self.days_ahead_var.trace_add("write",
+                                      lambda *_: self._schedule_config_save())
 
         # Row 2: 时间（支持多个时间，逗号分隔）
         r2 = ttk.Frame(self.sched_frame)
@@ -695,7 +873,7 @@ class FanqieGUI:
         self.time_var = tk.StringVar(value=self._cfg.get("default_time", "08:00"))
         ttk.Entry(r2, textvariable=self.time_var, width=22).pack(
             side="left", padx=4)
-        ttk.Label(r2, text="多个时间用逗号分隔",
+        ttk.Label(r2, text="逗号分隔",
                   style="Cap.TLabel").pack(side="left")
 
         # 初始模式的面板可见性由 _on_mode_change 统一处理（在所有组件创建后调用）
@@ -748,7 +926,7 @@ class FanqieGUI:
         self.lbl_resched_filter_info.pack(side="left", padx=6)
 
         # --- 4.5 定时执行 ---
-        card, frm_timer = self._card(right, "定时执行", "定时执行", sched=True)
+        card, frm_timer = self._card(left, "定时执行", "定时执行", sched=True)
         card.pack(fill="x", pady=(8, 0))
         row_timer = ttk.Frame(frm_timer)
         row_timer.pack(fill="x")
@@ -767,37 +945,20 @@ class FanqieGUI:
         self.btn_timer = ttk.Button(
             row_timer, text="启动定时", command=self._toggle_timer)
         self.btn_timer.pack(side="left", padx=(0, 8))
+        # 状态与说明同挂第二行：窄窗口下第一行放不下「输入框+按钮+状态」，
+        # 状态会被裁成半截（此前 1060px 宽时只剩「定」字）。
+        row_timer2 = ttk.Frame(frm_timer)
+        row_timer2.pack(fill="x", pady=(4, 0))
         self.lbl_timer_status = ttk.Label(
-            row_timer, text="定时未启动", foreground=CLR_INK_SOFT)
+            row_timer2, text="未启动", foreground=CLR_INK_SOFT)
         self.lbl_timer_status.pack(side="left")
-        ttk.Label(frm_timer, style="Cap.TLabel",
-                  text="格式 YYYY-MM-DD HH:MM · 到点自动执行所选操作（单次）").pack(
-                      anchor="w", pady=(4, 0))
+        ttk.Label(row_timer2, style="Cap.TLabel",
+                  text="· 到点自动执行一次当前操作").pack(
+                      side="left", padx=(6, 0))
 
-        # --- 5. 主行动条（先占底部，永不被挤出可视区）---
-        # 关键：side="bottom" 且先于选项卡 pack。pack 按顺序分配空间，底栏先占住
-        # 底部一条，剩余空间才给可伸缩的选项卡；这样无论窗口多矮、新手引导是否展开，
-        # 被裁掉的都只会是选项卡，主按钮「开始上传」始终可见。
-        frm = ttk.Frame(self.root)
-        frm.pack(side="bottom", fill="x", padx=12, pady=(10, 12))
-        self.btn_upload = ttk.Button(
-            frm, text="开始上传", style="Primary.TButton", command=self._on_upload)
-        self.btn_upload.pack(side="left")
-        # 补漏章：把定时发布中段漏掉的章节按原排期插回正确位置（详见 _on_backfill）
-        self.btn_backfill = ttk.Button(
-            frm, text="补漏章", command=self._on_backfill)
-        self.btn_backfill.pack(side="left", padx=(8, 0))
-        self._attach_tooltip(
-            self.btn_backfill,
-            "检测平台缺章并按原排期补回（先刷新平台章节，再点此）")
-        self.progress = ttk.Progressbar(frm, mode="determinate")
-        self.progress.pack(side="left", fill="x", expand=True, padx=12)
-        self.lbl_progress = ttk.Label(frm, text="")
-        self.lbl_progress.pack(side="left")
-
-        # --- 6. 章节预览 / 运行日志（选项卡） ---
+        # --- 5. 章节预览 / 运行日志（选项卡） ---
         self._nb = ttk.Notebook(self.root)
-        self._nb.pack(side="top", fill="both", expand=True, padx=12, pady=(10, 0))
+        self._nb.pack(side="top", fill="both", expand=True, padx=12, pady=(8, 0))
         tab_prev = ttk.Frame(self._nb)
         self._nb.add(tab_prev, text="章节预览")
         self.txt_preview = scrolledtext.ScrolledText(
@@ -812,15 +973,14 @@ class FanqieGUI:
             tab_log, height=10, state="disabled",
             font=("Consolas", 10), background=CLR_FIELD, foreground=CLR_INK,
             insertbackground=CLR_INK, relief="flat", borderwidth=0)
-        self.txt_log.pack(fill="both", expand=True, pady=(6, 0))
-        # 导出按钮浮在右上角，不再单占一行（此前那条只放一个按钮的空行）；
-        # 与「章节预览」页保持一致的整洁。x 负偏移让开右侧滚动条。
-        btn_export = ttk.Button(
-            tab_log, text="💾", width=2, style="EmojiIcon.TButton",
+        self.txt_log.pack(fill="both", expand=True, padx=1, pady=(6, 0))
+        # 导出按钮放在选项卡条右端的空白处：此前浮在日志正文右上角，长日志行会被
+        # 它盖住一截。选项卡条那一行本来就是空的，白拿一个不遮挡的位置。
+        self.btn_export = ttk.Button(
+            self._nb, text="导出日志", style="TabAction.TButton",
             command=self._export_log)
-        btn_export.place(relx=1.0, rely=0.0, x=-26, y=8, anchor="ne")
-        btn_export.lift()
-        self._attach_tooltip(btn_export, "导出运行日志到文件")
+        self._nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self._on_tab_changed()
 
         # 所有组件创建完毕，统一设置初始模式的面板可见性
         self._on_mode_change()
@@ -860,8 +1020,12 @@ class FanqieGUI:
         link.pack(side="left", padx=4)
         link.bind("<Button-1>", lambda _: self._set_guidance_collapsed(False))
 
-        # 按记忆决定初始展开/收起（首次默认展开）
-        if self._gui_state.get("guidance_collapsed"):
+        # 按记忆决定初始展开/收起；从未表态过时按屏幕高度定默认——引导栏占 79px，
+        # 矮屏上展开它，下方章节预览就只剩两三行。
+        _collapsed = self._gui_state.get("guidance_collapsed")
+        if _collapsed is None:
+            _collapsed = self.root.winfo_screenheight() < 900
+        if _collapsed:
             self._guide_stub.pack(fill="x", padx=12, pady=(6, 0))
         else:
             self._guide_frame.pack(fill="x", padx=12, pady=(6, 0))
@@ -895,6 +1059,18 @@ class FanqieGUI:
             # main loop") 而非 TclError——_closing 只是快速路径，真正兜底靠这里
             pass
 
+    def _on_tab_changed(self, event=None):
+        """「导出日志」只在运行日志页出现——在章节预览页它无事可做。"""
+        if self._nb.index("current") == 1:
+            self.btn_export.place(relx=1.0, y=3, x=-4, anchor="ne")
+            self.btn_export.lift()
+        else:
+            self.btn_export.place_forget()
+
+    def _show_dir_tail(self):
+        """路径框滚到末尾：长路径里有辨识度的是尾部的作品名，头部盘符没有信息量。"""
+        self._after(0, lambda: self.ent_dir.xview_moveto(1.0))
+
     def _refresh_auth_status(self):
         acct = self._gui_state.get("current_account", "")
         # L1: 命名文件已被删除 → 清除残留记录
@@ -905,14 +1081,12 @@ class FanqieGUI:
         if AUTH_FILE.exists():
             if acct:
                 self.lbl_auth.configure(
-                    text=f"● 当前：{acct}", foreground=CLR_OK)
+                    text="● 已登录", foreground=CLR_OK)
             else:
                 self.lbl_auth.configure(
                     text="● 已登录", foreground=CLR_OK)
         else:
-            # 新用户第一步就是登录——把空标签变成明确的行动指引
-            self.lbl_auth.configure(
-                text="○ 未登录 ← 请先点「登录 / 新建」", foreground=CLR_WARN)
+            self.lbl_auth.configure(text="○ 未登录", foreground=CLR_WARN)
         self._update_guidance()
 
     # -----------------------------------------------------------------------
@@ -993,8 +1167,8 @@ class FanqieGUI:
         win.transient(self.root)
         frm = ttk.Frame(win, padding=12)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text=key, font=("", 10, "bold")).pack(anchor="w")
-        ttk.Label(frm, text=SECTION_HELP.get(key, ""), wraplength=380,
+        ttk.Label(frm, text=key, font=(self._ff, 10, "bold")).pack(anchor="w")
+        ttk.Label(frm, text=SECTION_HELP.get(key, ""), wraplength=480,
                   justify="left").pack(anchor="w", pady=(4, 8))
         ttk.Button(frm, text="知道了", command=win.destroy).pack(anchor="e")
         win.bind("<Escape>", lambda _: win.destroy())
@@ -1035,27 +1209,27 @@ class FanqieGUI:
             pass
         body = ttk.Frame(win, padding=16)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="欢迎使用番茄小说章节批量上传工具 👋",
-                  font=("", 13, "bold")).pack(anchor="w", pady=(0, 8))
+        ttk.Label(body, text="欢迎使用番茄作家连载发布工作台",
+                  font=(self._ff, 13, "bold")).pack(anchor="w", pady=(0, 8))
         steps = [
             "① 登录：点「登录 / 新建」，在弹出的浏览器里登录番茄账号。",
-            "② 选作品：点作品栏的「↻」刷新按钮，选择一部作品。",
+            "② 选作品：点作品行右侧的「↻」刷新列表，选择一部作品。",
             "③ 选章节文件夹：默认 chapters/，每个 .md 或 .txt（纯文本）文件是一章。",
             "④ 上传/修改：选好「操作模式」后点「开始上传」。",
         ]
         for s in steps:
-            ttk.Label(body, text=s, font=("", 10)).pack(anchor="w", pady=1)
+            ttk.Label(body, text=s, font=(self._ff, 10)).pack(anchor="w", pady=1)
         ttk.Label(
             body,
             text="提示：登录框里填的是「本地账号名称」（用于区分多个账号），"
                  "不是番茄笔名；真正的登录在浏览器里完成。",
-            font=("", 9), foreground="#856404", wraplength=420,
+            font=(self._ff, 9), foreground=CLR_SCHED_D, wraplength=420,
             justify="left").pack(anchor="w", pady=(10, 12))
         btn_row = ttk.Frame(body)
         btn_row.pack(fill="x")
         lbl_doc = ttk.Label(btn_row, text="查看完整说明 (GitHub)",
-                            foreground="royalblue", cursor="hand2",
-                            font=("", 9, "underline"))
+                            foreground=CLR_TOMATO_D, cursor="hand2",
+                            font=(self._ff, 9, "underline"))
         lbl_doc.pack(side="left")
         lbl_doc.bind("<Button-1>", lambda _: webbrowser.open(GH_URL))
         ttk.Button(btn_row, text="开始使用", command=win.destroy).pack(
@@ -1133,17 +1307,23 @@ class FanqieGUI:
         if self._login_in_progress:
             # 登录期间切换账号会 copy2 覆盖 AUTH_FILE，与登录保存的会话争用，
             # 可能把错账号 cookie 写进命名文件。回退下拉到当前账号、待登录结束。
-            messagebox.showinfo("提示", "正在登录，请先完成或取消当前登录再切换账号。")
+            messagebox.showinfo("登录进行中", "先完成或取消当前登录，再切换账号。")
             self.cmb_account.set(self._gui_state.get("current_account", ""))
             return
         src = SCRIPT_DIR / f".auth_{name}.json"
         if not src.exists():
-            messagebox.showerror("错误", f"账号文件不存在: {src.name}")
+            messagebox.showerror("账号文件丢失",
+                                 f"找不到 {src.name}，它可能已被删除或改名。\n"
+                                 "请点「登录 / 新建」重新登录这个账号。")
             return
         try:
             shutil.copy2(str(src), str(AUTH_FILE))
         except Exception as e:
-            messagebox.showerror("错误", f"切换账号失败: {e}")
+            messagebox.showerror(
+                "切换账号失败",
+                f"无法写入登录状态文件：{e}\n\n"
+                f"多为文件被占用或磁盘只读。关掉其他正在运行的本工具后重试，"
+                f"仍不行就重新登录这个账号。")
             return
 
         self._gui_state["current_account"] = name
@@ -1168,6 +1348,11 @@ class FanqieGUI:
         self.lbl_last_publish.pack_forget()
         self._volume_frame.pack_forget()
         self.chk_use_ai.pack_forget()
+        self.chk_headless.pack_forget()
+        self.chk_autocont.pack_forget()
+        for _w in ("lbl_days_ahead", "ent_days_ahead", "lbl_days_ahead_unit"):
+            getattr(self, _w).pack_forget()
+        self._row_opts.pack_forget()
 
         # --- 2. 按模式显示组件（注意 pack 顺序决定布局顺序） ---
         #   lbl_last_publish:   all modes
@@ -1175,22 +1360,30 @@ class FanqieGUI:
         #   sched_frame:        schedule, reschedule
         #   _resched_filter_row: all modes
         #   chk_use_ai:         schedule, publish, edit
+        #   chk_headless:       all modes（无头对每种操作都生效，所以常驻；
+        #                       与 chk_use_ai 一起 forget/repack 才能保住左右顺序）
         has_vols = bool(self.cmb_volume["values"])
         self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
         if mode in ("edit", "reschedule") and has_vols:
             # 勾选"合并所有卷"时隐藏分卷下拉，只保留复选框
-            if self.all_volumes_var.get():
-                self._lbl_volume_sep.pack_forget()
-                self.cmb_volume.pack_forget()
-            else:
-                self._lbl_volume_sep.pack(side="left", padx=(12, 0))
-                self.cmb_volume.pack(side="left", padx=2, pady=4)
+            self._pack_volume_picker()
             self._volume_frame.pack(fill="x", padx=6, pady=(0, 4))
         if mode in ("schedule", "reschedule"):
             self.sched_frame.pack(fill="x", padx=6, pady=4)
         self._resched_filter_row.pack(fill="x", padx=6, pady=(0, 4))
+        self._row_opts.pack(fill="x", padx=6, pady=(0, 4), before=self.lbl_last_publish)
         if mode in ("schedule", "publish", "edit"):
             self.chk_use_ai.pack(side="left", padx=6)
+        if mode == "schedule":
+            self.chk_autocont.pack(side="left", padx=6)
+            # 同步一次起始日期的置灰: _on_autocont_toggle 只在「点击」时触发，
+            # config 里存着 auto_continue:true 时启动后勾是勾上的、输入框却still
+            # 可编辑 —— 用户改了日期、看着被接受，实际用的是平台队列算出来的。
+            self._sync_autocont_state()
+            self.lbl_days_ahead.pack(side="left", padx=(14, 0))
+            self.ent_days_ahead.pack(side="left", padx=4)
+            self.lbl_days_ahead_unit.pack(side="left")
+        self.chk_headless.pack(side="left", padx=6)
 
         # --- 3. 上传按钮文字和状态 ---
         btn_text = {"edit": "开始修改", "reschedule": "开始修改"}.get(
@@ -1216,6 +1409,9 @@ class FanqieGUI:
             return
 
         self._on_book_changed()
+        # 预览头部要立刻反映新模式：_on_book_changed 在未选作品时提前 return，
+        # 不刷新的话「模式: 修改内容」会一直挂在切走之后的预览上
+        self._refresh_preview()
         self._schedule_config_save()
 
     def _install_log_handler(self):
@@ -1251,7 +1447,7 @@ class FanqieGUI:
         """导出运行日志到文件。"""
         content = self.txt_log.get("1.0", tk.END).strip()
         if not content:
-            messagebox.showinfo("提示", "暂无日志内容")
+            messagebox.showinfo("日志为空", "运行日志还没有内容，执行一次操作后再导出。")
             return
         fp = filedialog.asksaveasfilename(
             title="导出日志",
@@ -1268,7 +1464,7 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     def _sync_perday_from_times(self):
         """时间点数量 > 每天章数时，自动上调 per_day。"""
-        validated = _validate_times(self.time_var.get())
+        validated = validate_times(self.time_var.get())
         n_times = len(validated)
         if n_times < 1:
             return
@@ -1318,6 +1514,13 @@ class FanqieGUI:
             self._cfg["auto_unique"] = self.unique_var.get()
         if hasattr(self, "use_ai_var"):
             self._cfg["use_ai"] = self.use_ai_var.get()
+        if hasattr(self, "headless_var"):
+            self._cfg["headless"] = self.headless_var.get()
+        if hasattr(self, "autocont_var"):
+            self._cfg["auto_continue"] = self.autocont_var.get()
+        if hasattr(self, "days_ahead_var"):
+            raw = self.days_ahead_var.get().strip()
+            self._cfg["days_ahead"] = int(raw) if raw.isdigit() else None
         if hasattr(self, "resched_filter_var"):
             self._cfg["resched_filter_on"] = self.resched_filter_var.get()
             self._cfg["resched_filter_op"] = self.resched_filter_op_var.get()
@@ -1350,16 +1553,27 @@ class FanqieGUI:
         except Exception as e:
             logger.debug(f"保存 .gui_state.json 失败: {e}")
 
-    def _set_uploading(self, active):
+    def _set_uploading(self, active, *, cancellable=True, show_log=True):
+        """锁定/解锁 UI。
+
+        cancellable=False: 工具与体检类任务不读 _cancel_requested，点「停止」
+            只会把按钮变灰、任务照跑（用户看到永久「正在停止…」）。这类任务
+            按钮直接置灰、不写「停止」，不给做不到的承诺。
+        show_log=False: 结果写在「章节预览」页的任务（体检/重排预览/清草稿箱
+            安全检查）——强切到「运行日志」会让用户对着空日志，而弹窗还说
+            「详见预览面板」。
+        """
         self.uploading = active
         self._cancel_requested = False
         if active:
-            self.btn_upload.configure(state="normal", text="停止")
-            # 运行开始 → 切到「运行日志」，让进度实时可见
+            if cancellable:
+                self.btn_upload.configure(state="normal", text="停止")
+            else:
+                self.btn_upload.configure(state="disabled", text="进行中…")
             nb = getattr(self, "_nb", None)
             if nb is not None:
                 try:
-                    nb.select(1)
+                    nb.select(1 if show_log else 0)
                 except tk.TclError:
                     pass
         else:
@@ -1381,9 +1595,11 @@ class FanqieGUI:
         self.cmb_book.configure(state="disabled" if active else "readonly")
         self.cmb_account.configure(state="disabled" if active else "readonly")
         self.btn_open_manage.configure(state=ctrl_state)
-        # 补漏章按钮：上传/补漏期间禁用（避免同开第二个浏览器、并发写 AUTH_FILE）
-        if hasattr(self, "btn_backfill"):
-            self.btn_backfill.configure(state=ctrl_state)
+        # 检查缺口按钮：任务进行中禁用（避免同开第二个浏览器、并发写 AUTH_FILE）
+        if hasattr(self, "btn_audit"):
+            self.btn_audit.configure(state=ctrl_state)
+        if hasattr(self, "btn_tools"):
+            self.btn_tools.configure(state=ctrl_state)
         for rb in self._mode_radios:
             rb.configure(state=ctrl_state)
 
@@ -1393,10 +1609,12 @@ class FanqieGUI:
     def _open_chapter_manage(self):
         idx = self.cmb_book.current()
         if idx < 0 or not self.books:
-            messagebox.showwarning("提示", "请先选择作品")
+            messagebox.showwarning("未选择作品",
+                                   "先在「作品与章节」里选择一部作品，"
+                                   "才能打开它的章节管理页。")
             return
         book_id = self.books[idx]["bookId"]
-        url = CHAPTER_MANAGE_URL.format(book_id=book_id)
+        url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
         webbrowser.open(url)
 
     # -----------------------------------------------------------------------
@@ -1404,8 +1622,6 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     def _on_book_changed(self):
         self._fetch_gen += 1
-        # 切换作品即放弃"待补漏"意图，避免新作品加载完后意外自动补漏
-        self._backfill_pending = False
         self._update_guidance()
 
         idx = self.cmb_book.current()
@@ -1444,7 +1660,7 @@ class FanqieGUI:
         elif AUTH_FILE.exists():
             # 后台获取（仅默认页，一般最新发布在首页即可看到）
             self.lbl_last_publish.configure(
-                text="正在获取发布信息...", foreground=CLR_INK_SOFT)
+                text="正在获取发布信息…", foreground=CLR_INK_SOFT)  # noqa
 
             gen = self._fetch_gen
             volumes_known = book_id in self._volumes_cache
@@ -1456,14 +1672,9 @@ class FanqieGUI:
                     page = await ctx.new_page()
                     if self._fetch_gen != gen:
                         return
-                    url = CHAPTER_MANAGE_URL.format(book_id=book_id)
+                    url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
                     await page.goto(url)
-                    try:
-                        await page.wait_for_load_state("networkidle")
-                    except PWTimeout:
-                        # 平台埋点/轮询会拖死 networkidle；超时若任其抛出，
-                        # 会被外层 except 误报成"暂无发布记录"且漏检分卷
-                        pass
+                    await settle_page(page)
                     try:
                         await page.wait_for_selector(
                             "tr td", timeout=get_browser_timeout())
@@ -1525,7 +1736,7 @@ class FanqieGUI:
         label = f"上次发布: {date_str} {time_str}"
         if chapter:
             label += f" ({chapter})"
-        self.lbl_last_publish.configure(text=label, foreground="#d35400")
+        self.lbl_last_publish.configure(text=label, foreground=CLR_SCHED_TX)
 
         # 自动建议: 起始日期 = 上次日期 + 1 天
         try:
@@ -1572,12 +1783,7 @@ class FanqieGUI:
         # 仅 edit/reschedule 模式显示，用 after 保证位于 lbl_last_publish 之后
         if self.mode_var.get() in ("edit", "reschedule"):
             self._volume_frame.pack_forget()
-            if self.all_volumes_var.get():
-                self._lbl_volume_sep.pack_forget()
-                self.cmb_volume.pack_forget()
-            else:
-                self._lbl_volume_sep.pack(side="left", padx=(12, 0))
-                self.cmb_volume.pack(side="left", padx=2, pady=4)
+            self._pack_volume_picker()
             self._volume_frame.pack(
                 fill="x", padx=6, pady=(0, 4), after=self.lbl_last_publish)
 
@@ -1594,9 +1800,6 @@ class FanqieGUI:
             return
 
         self._fetch_gen += 1  # 使正在进行的后台任务过期
-        # 切卷即放弃"待补漏"意图，避免旧卷加载结果作废后标志悬挂、
-        # 新卷键不存在时补漏按钮被 pending 守卫永久挡住
-        self._backfill_pending = False
 
         mode = self.mode_var.get()
         if mode in ("edit", "reschedule"):
@@ -1654,19 +1857,28 @@ class FanqieGUI:
         if not AUTH_FILE.exists():
             # 未登录：不会发起抓取，恢复按钮可用，否则修改/排期模式按钮永久禁用
             self.lbl_last_publish.configure(
-                text="请先登录后再获取章节列表", foreground="#d35400")
+                text="请先登录后再获取章节列表", foreground=CLR_SCHED_TX)
             if not self.uploading:
                 self.btn_upload.configure(state="normal")
             return
 
-        self.lbl_last_publish.configure(
-            text="正在获取章节列表...", foreground=CLR_INK_SOFT)
+        self._start_elapsed(self.lbl_last_publish, "正在获取章节列表…")
 
         gen = self._fetch_gen
         selected_vol = self._get_selected_volume()
         volumes_known = book_id in self._volumes_cache
         known_vols = self._volumes_cache.get(book_id)  # 主线程快照，供工作线程使用
         fetch_all_vols = self.all_volumes_var.get()
+
+        def on_page_progress(done, total, n):
+            # 从 Playwright 线程回调，必须经 _after 回主线程改 UI。
+            # 一旦有真实进度就不再显示秒表——「第3/12页 · 已240章」比「已18秒」
+            # 有用得多：它说明还剩多少，而不只是过去了多久。
+            if self._fetch_gen != gen:
+                return
+            tot = f"/{total}" if total else ""
+            self._after(0, self._show_fetch_progress,
+                        f"正在获取章节列表… 第 {done}{tot} 页 · 已 {n} 章")
 
         async def task():
             page = None
@@ -1675,16 +1887,11 @@ class FanqieGUI:
                 page = await ctx.new_page()
                 if self._fetch_gen != gen:
                     return
-                url = CHAPTER_MANAGE_URL.format(book_id=book_id)
+                url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
                 if not await goto_with_login_retry(page, url):
                     raise RuntimeError(
                         "被重定向到登录页，登录状态可能已失效（请重新登录）")
-                try:
-                    await page.wait_for_load_state("networkidle")
-                except PWTimeout:
-                    # 平台埋点/轮询会拖死 networkidle，不该让修改模式
-                    # 在负载尖峰期整个不可用；表格就绪由下面的等待保证
-                    pass
+                await settle_page(page)
                 try:
                     await page.wait_for_selector(
                         "tr td", timeout=get_browser_timeout())
@@ -1700,8 +1907,12 @@ class FanqieGUI:
                     has_vols = vol_info.get("hasVolumes")
                     vol_list = vol_info.get("volumes", [])
                 else:
-                    has_vols = bool(self._volumes_cache.get(book_id))
-                    vol_list = self._volumes_cache.get(book_id) or []
+                    # 必须用主线程那份快照，不能在这里重读 _volumes_cache：
+                    # 它随时可能被 _invalidate_caches() 清空（用户切作品/切卷），于是
+                    # volumes_known 是 True、vol_list 却成了空 —— 多卷分支静默退化成
+                    # 单卷，只抓当前卷却按「合并所有卷」的键缓存。
+                    has_vols = bool(known_vols)
+                    vol_list = known_vols or []
 
                 # "合并所有卷" 模式: 遍历每个卷并合并章节
                 if fetch_all_vols and has_vols and vol_list:
@@ -1715,7 +1926,8 @@ class FanqieGUI:
                         self._after(0, lambda m=msg: self.lbl_last_publish.configure(
                             text=m, foreground=CLR_INK_SOFT))
                         await select_volume(page, vol_name)
-                        chs, lp = await extract_chapters_from_page(page, book_id)
+                        chs, lp = await extract_chapters_from_page(
+                            page, book_id, on_progress=on_page_progress)
                         all_chapters.extend(chs)
                         if lp and not last_pub:
                             last_pub = lp
@@ -1725,7 +1937,7 @@ class FanqieGUI:
                     if selected_vol and has_vols:
                         await select_volume(page, selected_vol)
                     chapters, last_pub = await extract_chapters_from_page(
-                        page, book_id)
+                        page, book_id, on_progress=on_page_progress)
 
                 if self._fetch_gen != gen:
                     return
@@ -1744,11 +1956,61 @@ class FanqieGUI:
 
         self.worker.submit(task())
 
+    def _show_fetch_progress(self, text):
+        """有真实进度就停掉秒表，改显示页码/章数。"""
+        stop = getattr(self, "_elapsed_stop", None)
+        if stop:
+            stop()
+        try:
+            self.lbl_last_publish.configure(text=text, foreground=CLR_INK_SOFT)
+        except tk.TclError:
+            pass
+
+    def _start_elapsed(self, widget, base_text, color=CLR_INK_SOFT):
+        """给长任务的状态标签挂个秒表，返回停止函数。
+
+        为什么需要: 抓一次平台章节要开浏览器、导航、翻页提取，正常也要十几秒。
+        一行静止不动的「正在获取章节列表…」在用户眼里和卡死没有区别——加上
+        「（已 N 秒）」才看得出它在动。同一时刻只允许一个秒表，启动时先停掉上一个。
+        """
+        stop_prev = getattr(self, "_elapsed_stop", None)
+        if stop_prev:
+            stop_prev()
+        state = {"n": 0, "on": True}
+
+        def tick():
+            if not state["on"]:
+                return
+            state["n"] += 1
+            try:
+                widget.configure(text=f"{base_text}（已 {state['n']} 秒）",
+                                 foreground=color)
+            except tk.TclError:
+                return          # 控件已销毁（关窗），静默收手
+            try:
+                self.root.after(1000, tick)
+            except tk.TclError:
+                pass            # 主窗已销毁，不必再排下一拍
+
+        try:
+            widget.configure(text=base_text, foreground=color)
+        except tk.TclError:
+            return lambda: None
+        self.root.after(1000, tick)
+
+        def stop():
+            state["on"] = False
+        self._elapsed_stop = stop
+        return stop
+
     def _on_platform_chapters_fetched(self, book_id, chapters, error,
                                       last_pub=None, gen=None):
         # gen 过期 = 期间切了作品或卷（_fetch_gen 已自增）。必须在这里(应用时)
         # 再判一次：仅判 book_id 不够——切卷时 book_id 不变，但缓存键
         # _chapter_cache_key 读实时 volume_var，会把旧卷章节写到新卷键下
+        stop_tick = getattr(self, "_elapsed_stop", None)
+        if stop_tick:
+            stop_tick()   # 先停秒表，否则它下一秒会把结果文案盖掉
         if gen is not None and gen != self._fetch_gen:
             return
         # 检查当前选中的作品是否仍匹配
@@ -1758,8 +2020,6 @@ class FanqieGUI:
             return  # 用户已切换作品，丢弃过期结果
 
         if error:
-            # 抓取失败：清掉待补漏标志，避免补漏按钮永远等一个不会来的加载
-            self._backfill_pending = False
             self.lbl_last_publish.configure(
                 text=f"获取章节列表失败: {error}（重新选择作品可重试）",
                 foreground="red")
@@ -1771,15 +2031,10 @@ class FanqieGUI:
         if last_pub and book_id not in self._last_publish_cache:
             self._last_publish_cache[book_id] = last_pub
         self.lbl_last_publish.configure(
-            text=f"已索引 {len(chapters)} 个章节", foreground="#d35400")
+            text=f"已索引 {len(chapters)} 个章节", foreground=CLR_SCHED_TX)
         # 载入完成，恢复上传按钮
         if not self.uploading and self.mode_var.get() in ("edit", "reschedule"):
             self.btn_upload.configure(state="normal")
-        # 补漏点击时平台章节尚未加载 → 加载完成后自动续跑补漏（省去二次点击）
-        if self._backfill_pending and not self.uploading:
-            self._backfill_pending = False
-            self._on_backfill()
-            return
         self._refresh_preview()
 
     # -----------------------------------------------------------------------
@@ -1815,7 +2070,7 @@ class FanqieGUI:
     def _on_login(self):
         # 防止并发登录
         if self._login_in_progress:
-            messagebox.showinfo("提示", "登录正在进行中，请先完成或取消当前登录。")
+            messagebox.showinfo("登录进行中", "先完成或取消当前登录，再开始新的登录。")
             return
         # 必须在弹"账号名称"对话框【之前】就占住登录态：simpledialog 的 wait_window
         # 会继续泵 Tk after 事件，定时器 _timer_tick 会在对话框开着时触发——若此刻
@@ -1845,6 +2100,8 @@ class FanqieGUI:
         async def task():
             try:
                 async with async_playwright() as p:
+                    # 登录必须有头：要你在浏览器里手动扫码/输密码，
+                    # 无头开关对这里不生效（否则登录永远等不到人操作）。
                     browser, context = await create_context(p, headless=False)
                     page = await context.new_page()
                     # domcontentloaded 而非 networkidle：番茄的埋点/轮询会拖死
@@ -1894,28 +2151,27 @@ class FanqieGUI:
         # 最小化主窗口，避免遮挡浏览器
         self.root.iconify()
 
-        # 创建醒目的浮动窗口（非模态），放在屏幕右下角
+        # 醒目的浮动窗口（非模态），钉在屏幕右下角、始终置顶：主窗口已最小化，
+        # 它是用户在浏览器前面唯一能看到的入口
         win = tk.Toplevel(self.root)
         win.title("等待登录")
         win.resizable(False, False)
         win.attributes("-topmost", True)
-        win.configure(bg="#FFF3CD")  # 醒目的暖黄色背景
+        win.configure(bg=CLR_SCHED)   # 外框即排期橙描边，靠 padx/pady 露出 3px
 
-        body = tk.Frame(win, bg="#FFF3CD")
-        body.pack(padx=16, pady=12)
+        body = ttk.Frame(win, padding=16)
+        body.pack(padx=3, pady=3, fill="both", expand=True)
 
-        tk.Label(
-            body, text="⏳ 请在浏览器中登录",
-            font=("", 12, "bold"), bg="#FFF3CD", fg="#856404",
-        ).pack(pady=(0, 6))
-        tk.Label(
-            body, text="在浏览器里登录番茄账号（没有账号请先注册并开通作家），\n"
-                       "完成后点下方按钮保存会话",
-            font=("", 9), bg="#FFF3CD", fg="#856404", justify="left",
-        ).pack(pady=(0, 10))
+        ttk.Label(body, text="⏳ 请在浏览器中登录",
+                  font=(self._ff, 12, "bold"),
+                  foreground=CLR_SCHED_D).pack(anchor="w", pady=(0, 6))
+        ttk.Label(body, justify="left", font=(self._ff, 9),
+                  foreground=CLR_INK_SOFT,
+                  text="在浏览器里登录番茄账号（没有账号请先注册并开通作家），\n"
+                       "完成后回到这里点「登录完成」").pack(anchor="w", pady=(0, 12))
 
-        btn_frame = tk.Frame(body, bg="#FFF3CD")
-        btn_frame.pack()
+        btn_frame = ttk.Frame(body)
+        btn_frame.pack(fill="x")
 
         def on_confirm():
             win.destroy()
@@ -1930,20 +2186,10 @@ class FanqieGUI:
             self.root.lift()
             self._login_event.set()
 
-        tk.Button(
-            btn_frame, text="✔ 登录完成，保存会话",
-            font=("", 10, "bold"), fg="white", bg="#28A745",
-            activebackground="#218838", activeforeground="white",
-            padx=12, pady=4, cursor="hand2",
-            command=on_confirm,
-        ).pack(side="left", padx=(0, 8))
-
-        tk.Button(
-            btn_frame, text="取消",
-            font=("", 10), fg="#856404", bg="#FFEEBA",
-            activebackground="#FFE083", padx=12, pady=4,
-            cursor="hand2", command=on_cancel,
-        ).pack(side="left")
+        ttk.Button(btn_frame, text="登录完成，保存会话",
+                   style="Primary.TButton", command=on_confirm).pack(side="left")
+        ttk.Button(btn_frame, text="取消登录", command=on_cancel).pack(
+            side="left", padx=(8, 0))
 
         # 关闭按钮 = 取消
         win.protocol("WM_DELETE_WINDOW", on_cancel)
@@ -1972,7 +2218,11 @@ class FanqieGUI:
             if self._looks_like_missing_browser(error):
                 self._prompt_install_browser()
             else:
-                messagebox.showerror("登录失败", f"登录未能完成：\n\n{error}")
+                messagebox.showerror(
+                    "登录失败",
+                    f"登录未能完成：\n\n{error}\n\n"
+                    f"重新点「登录 / 新建」再试一次。若浏览器根本没弹出来，"
+                    f"多半是浏览器内核缺失，登录时会给出一键安装。")
         else:
             if name:
                 self._gui_state["current_account"] = name
@@ -2047,13 +2297,12 @@ class FanqieGUI:
     # 刷新作品列表
     # -----------------------------------------------------------------------
     def _on_refresh_books(self):
-        if not AUTH_FILE.exists():
-            messagebox.showwarning("提示", "请先登录")
+        if not self._require_login():
             return
         if self._login_in_progress:
             # 登录期间刷新会 save_auth 写 AUTH_FILE，与登录保存的会话争用，
             # 可能让命名 auth 文件存入错账号。等登录结束再刷新。
-            messagebox.showinfo("提示", "正在登录，请先完成或取消当前登录再刷新。")
+            messagebox.showinfo("登录进行中", "先完成或取消当前登录，再刷新作品列表。")
             return
         # 防重入：多个入口可能近乎同时调度刷新（切账号 + 登录完成），
         # 避免并发任务竞争 self.books / 共享浏览器上下文
@@ -2061,7 +2310,7 @@ class FanqieGUI:
             return
         self._books_loading = True
         self.btn_books.configure(state="disabled")
-        self._log("正在获取作品列表...")
+        self._log("正在获取作品列表…")
 
         async def task():
             page = None
@@ -2127,7 +2376,20 @@ class FanqieGUI:
         self._invalidate_caches("all")
         self._hide_volumes()
         if not books:
-            self._log("未找到作品，请检查登录状态。")
+            # 页面正常打开、接口也返回了，只是一本书都没有（超时/失效已在上面提前
+            # return）。本工具只能往**已存在的作品**里传章节，建书必须在网页端完成——
+            # 所以这里不是报错，是把人送到建书页，否则新作者到这一步就卡死了。
+            self.cmb_book["values"] = []
+            self.cmb_book.set(BOOK_EMPTY_HINT)
+            self._log("当前账号名下还没有作品。本工具只负责往已有的书里传章节，"
+                      "建书要在番茄网页端完成：先去新建一本书，回来点「↻」刷新即可。")
+            if messagebox.askyesno(
+                    "还没有作品",
+                    "当前账号名下还没有作品。\n\n"
+                    "本工具只能往已有的书里传章节，新建作品要在番茄网页端做。\n\n"
+                    "现在打开番茄的作品管理页去新建吗？\n"
+                    "（建好后回到本窗口点「↻」刷新）"):
+                webbrowser.open(BOOK_MANAGE_URL)
             return
         display = [
             f"{b['name']}  ({b['chapters']}章, {b['words']}字)"
@@ -2165,11 +2427,13 @@ class FanqieGUI:
         """在系统文件管理器中打开当前章节文件夹。"""
         dir_path = self.dir_var.get()
         if not dir_path:
-            messagebox.showwarning("提示", "尚未选择章节文件夹")
+            messagebox.showwarning("未选择章节文件夹", PICK_DIR_MSG)
             return
         p = Path(dir_path)
         if not p.is_dir():
-            messagebox.showwarning("提示", f"目录不存在：{dir_path}")
+            messagebox.showwarning("目录不存在",
+                                   f"这个文件夹已经不在了：\n{dir_path}\n\n"
+                                   "请点「选择文件夹」重新指定。")
             return
         try:
             if sys.platform.startswith("win"):
@@ -2179,7 +2443,9 @@ class FanqieGUI:
             else:
                 subprocess.run(["xdg-open", str(p)], check=False)
         except Exception as e:
-            messagebox.showerror("打开目录失败", f"{e}")
+            messagebox.showerror(
+                "打开目录失败",
+                f"{e}\n\n目录可能已被移动或删除。点「选择文件夹」重新指定。")
 
     def _on_filter_toggle(self):
         if self.filter_var.get():
@@ -2200,7 +2466,7 @@ class FanqieGUI:
         p = Path(dir_path)
         if not p.is_dir():
             self.files, self.parsed_chapters, self._word_counts = [], [], []
-            self._set_preview("目录不存在")
+            self._set_preview("这个文件夹不在了。点「选择文件夹」重新指定。")
             return
 
         try:
@@ -2211,7 +2477,8 @@ class FanqieGUI:
             return
         if not self._all_files:
             self.files, self.parsed_chapters, self._word_counts = [], [], []
-            self._set_preview("目录及子文件夹中没有 .md/.txt 文件")
+            self._set_preview("目录及子文件夹里没有 .md / .txt 文件。\n"
+                              "把章节文件放进来后点 ↻ 重新扫描，或换一个文件夹。")
             return
 
         # 跳过扫描后变得无法读取的文件（云端离线占位/被删/无权限），并保持
@@ -2220,7 +2487,8 @@ class FanqieGUI:
         self._all_files, self._all_parsed = parse_md_files(self._all_files)
         if not self._all_files:
             self.files, self.parsed_chapters, self._word_counts = [], [], []
-            self._set_preview("目录中的文件均无法读取（可能是云端离线文件或权限不足）")
+            self._set_preview("目录里的文件都读不出来。\n"
+                              "常见原因：云盘文件还没下载到本地，或没有读取权限。")
             return
         self._apply_date_filter()
 
@@ -2231,19 +2499,16 @@ class FanqieGUI:
 
         if self.filter_var.get():
             raw = self.filter_date_var.get().strip()
-            cutoff = None
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                try:
-                    cutoff = datetime.strptime(raw, fmt)
-                    break
-                except ValueError:
-                    continue
-            if cutoff is None:
+            # 解析与边界语义都跟 CLI --modified-after/before 共用一份:
+            # 同一串日期在两个入口必须筛出同一批文件，否则同一份补传清单
+            # 换个入口跑就会差一章。晚于=含边界(>=)，早于=不含(<)。
+            cutoff_ts = parse_time_spec(raw)
+            if cutoff_ts is None:
                 self.lbl_filter_info.configure(
                     text="格式错误，应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM",
                     foreground="red")
                 self.files, self.parsed_chapters, self._word_counts = [], [], []
-                self._set_preview("日期筛选格式错误，请修正后重试")
+                self._set_preview("日期筛选的格式不对，改成 YYYY-MM-DD 或 YYYY-MM-DD HH:MM。")
                 return
             op = self.filter_op_var.get()
             total = len(self._all_files)
@@ -2254,7 +2519,7 @@ class FanqieGUI:
                 except (OSError, OverflowError, ValueError):
                     continue  # 损坏/越界 mtime 会抛 Overflow/ValueError，非仅 OSError
                 mtimes.append(mt)
-                if (op == "早于" and mt < cutoff) or (op != "早于" and mt >= cutoff):
+                if (mt.timestamp() >= cutoff_ts) == (op != "早于"):
                     kept.append(i)
             self.files = [self._all_files[i] for i in kept]
             self.parsed_chapters = [self._all_parsed[i] for i in kept]
@@ -2267,9 +2532,16 @@ class FanqieGUI:
                     hi = max(mtimes).strftime("%Y-%m-%d %H:%M")
                     self._set_preview(
                         f"没有符合筛选条件的文件\n"
-                        f"条件: {op} {raw} | 文件日期: {lo} ~ {hi}")
+                        f"条件: {op} {raw} | 文件日期: {lo} ~ {hi}\n"
+                        f"把时间调到这个区间内，或切换「早于 / 晚于」。")
                 else:
-                    self._set_preview("没有符合筛选条件的文件")
+                    self._set_preview(
+                        "没有符合筛选条件的文件\n"
+                        "调整日期，或取消勾选「按修改日期筛选」。")
+                # 底部计数还停在筛选前的数字，与预览里的"没有文件"自相矛盾
+                self.progress["maximum"] = 1
+                self.progress["value"] = 0
+                self.lbl_progress.configure(text="0/0")
                 return
             self.lbl_filter_info.configure(
                 text=f"筛选: {len(self.files)}/{total} 个文件",
@@ -2288,6 +2560,12 @@ class FanqieGUI:
     def _refresh_preview(self):
         """仅重新计算排期和刷新预览文本，不重新读取文件。"""
         self._update_guidance()
+        if self.uploading:
+            # 任务运行期间不许重算预览: 这个方法挂在 date/per_day/time 的
+            # trace 上，而那几个输入框在任务期间并没有被禁用。工具与体检的
+            # 结果(安全检查明细、缺口报告)正是写在预览面板里的 —— 用户此时
+            # 碰一下任何一个输入框，结果就被章节列表盖掉了。
+            return
         mode = self.mode_var.get()
 
         # 修改排期模式: 不依赖本地文件，使用平台章节
@@ -2438,50 +2716,37 @@ class FanqieGUI:
                 total_words += wc
                 num_str = f"第{num}章" if num else "  ?  "
                 lines.append(
-                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)  [待获取章节列表]")
+                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)")
 
         summary = f"总计: {len(self.files)} 章, {total_words} 字 | 模式: 修改内容"
         if platform_chapters:
             summary += f" | 匹配: {matched_count}/{len(self.files)}"
+        else:
+            # 状态说一次就够；此前每行都挂一个 [待获取章节列表]，几千行全是同一句
+            summary += " | 正在获取平台章节列表，匹配结果稍后显示"
 
         self._set_preview(summary + "\n" + "-" * 60 + "\n" + "\n".join(lines))
         self.progress["maximum"] = max(matched_count, 1)
         self.progress["value"] = 0
         self.lbl_progress.configure(text=f"0/{matched_count}")
 
-    @staticmethod
-    def _parse_chapter_spec(raw):
-        """解析章节筛选表达式 → 区间列表 [(lo, hi), ...]；非法返回 None。
-
-        支持逗号分隔的单号与范围混用: "1,3,5-10"（范围亦可用 ~，
-        分隔符兼容 , ; 、以及 NFKC 归一后的全角逗号/分号）。
-        """
-        intervals = []
-        for token in re.split(r'[,;、]', raw):
-            token = token.strip()
-            if not token:
-                continue
-            m = re.match(r'^(\d+)\s*[-~]\s*(\d+)$', token)
-            if m:
-                lo, hi = int(m.group(1)), int(m.group(2))
-                if lo > hi:
-                    lo, hi = hi, lo
-                intervals.append((lo, hi))
-                continue
-            if token.isdigit():
-                n = int(token)
-                intervals.append((n, n))
-                continue
-            return None  # 含非法 token
-        return intervals
+    # 章节号表达式解析用 fanqie_upload 的共用实现（CLI 的 --chapters 同一套）。
+    # 保留这个别名不是历史包袱: test_chapter_filter / test_adversarial_campaign
+    # 都拿 FanqieGUI._parse_chapter_spec 当入口攻击解析器（极端表达式、
+    # 全角、悬空区间），删掉会让那三个套件直接崩。
+    _parse_chapter_spec = staticmethod(parse_chapter_spec)
 
     def _filter_by_chapter_num(self, items, key):
         """按章节序号筛选列表。
 
         key(item) 提取章节序号 (int 或 None, None 视为不匹配)。
-        - 纯数字单值: 按 ≤ / ≥ 运算符做阈值筛选（原有行为）
+        - 纯数字单值: 按 ≤ / ≥ 运算符做阈值筛选
         - 含逗号或范围: 集合命中模式，支持 "1,3,5-10" 混用，运算符不适用
         返回 (filtered_items, is_active)。同时更新筛选信息标签。
+
+        命中判定全部交给 fanqie_upload.filter_by_chapter_spec —— CLI 的
+        --chapters 走的是同一个函数。这里只把 UI 状态(运算符下拉、提示标签)
+        套在外面。两侧对同一表达式筛出不同的章集 = 补传漏章，判定只能有一份。
         """
         # 默认恢复运算符下拉框（组合/范围格式时会覆盖为 disabled）
         self.cmb_resched_filter_op.configure(state="readonly")
@@ -2490,7 +2755,8 @@ class FanqieGUI:
             self.lbl_resched_filter_info.configure(text="", foreground=CLR_INK_SOFT)
             return items, False
         try:
-            raw = unicodedata.normalize("NFKC", self.resched_filter_num_var.get()).strip()
+            raw = unicodedata.normalize(
+                "NFKC", self.resched_filter_num_var.get()).strip()
         except tk.TclError:
             return items, False
         if not raw:
@@ -2498,39 +2764,23 @@ class FanqieGUI:
             return items, False
 
         total = len(items)
-
-        # 组合/范围格式: "5-10"、"1,3,5-10"、"3、7~9" → 集合命中，运算符不适用
-        if not raw.isdigit():
-            intervals = self._parse_chapter_spec(raw)
-            if not intervals:  # None=含非法 token；[]=只有分隔符
-                self.lbl_resched_filter_info.configure(
-                    text="请输入数字、范围或组合(如 1,3,5-10)", foreground="red")
-                return items, False
-            self.cmb_resched_filter_op.configure(state="disabled")
-            kept = [x for x in items
-                    if (v := _as_int(key(x))) is not None
-                    and any(lo <= v <= hi for lo, hi in intervals)]
-            self.lbl_resched_filter_info.configure(
-                text=f"筛选: {len(kept)}/{total} 章", foreground=CLR_INK_SOFT)
-            return kept, True
-
-        # 单值格式: ≤ / ≥
+        if raw.isdigit():
+            # 单值走下拉框选的运算符；下拉框只可能是 ≤/≥（构造时已兜底）
+            spec = ("≤" if self.resched_filter_op_var.get() == "≤" else "≥") + raw
+        else:
+            spec = raw
         try:
-            threshold = int(raw)
+            kept, active = filter_by_chapter_spec(items, spec, key=key)
         except ValueError:
             self.lbl_resched_filter_info.configure(
                 text="请输入数字、范围或组合(如 1,3,5-10)", foreground="red")
             return items, False
-        op = self.resched_filter_op_var.get()
-        if op == "≤":
-            kept = [x for x in items
-                    if (v := _as_int(key(x))) is not None and v <= threshold]
-        else:
-            kept = [x for x in items
-                    if (v := _as_int(key(x))) is not None and v >= threshold]
+        if not raw.isdigit():
+            # 组合/范围合法后才禁用运算符下拉（原逻辑如此；非法输入时保持可用）
+            self.cmb_resched_filter_op.configure(state="disabled")
         self.lbl_resched_filter_info.configure(
             text=f"筛选: {len(kept)}/{total} 章", foreground=CLR_INK_SOFT)
-        return kept, True
+        return kept, active
 
     def _refresh_reschedule_preview(self):
         """修改排期模式预览: 显示平台章节 + 计算的新排期。"""
@@ -2546,17 +2796,17 @@ class FanqieGUI:
             self.lbl_progress.configure(text="")
 
         if not book_id:
-            _early_return("请先选择作品")
+            _early_return("先在上方选择一部作品，这里会列出它可改排期的章节。")
             return
 
         cache_key = self._chapter_cache_key(book_id)
         if cache_key not in self._platform_chapters_cache:
-            _early_return("正在获取章节列表...")
+            _early_return("正在获取平台章节列表…")
             return
 
         all_chapters = self._platform_chapters_cache[cache_key]
         if not all_chapters:
-            _early_return("平台无章节")
+            _early_return("这部作品在平台上还没有章节。")
             return
 
         # 反转顺序（章节管理页最新在前）+ 只保留"待发布"章节
@@ -2565,14 +2815,14 @@ class FanqieGUI:
             if "待发布" in ch.get("status", "")
         ]
         if not platform_chapters:
-            _early_return("无待发布章节（仅「待发布」状态可修改排期）")
+            _early_return("没有可改排期的章节：只有「待发布」状态的章节能改时间，已发布的不能。")
             return
 
         # 按章节序号筛选
         platform_chapters, _ = self._filter_by_chapter_num(
             platform_chapters, key=lambda ch: ch.get("chapterNum"))
         if not platform_chapters:
-            _early_return("筛选后无待发布章节")
+            _early_return("当前章节号筛选把待发布章节都排除了，放宽筛选条件再看。")
             return
 
         # 计算排期
@@ -2622,6 +2872,38 @@ class FanqieGUI:
             return True
         return messagebox.askyesno(title, msg)
 
+    def _begin_task(self, count):
+        """任务开始前的统一开场：锁 UI、重置进度条、接日志，返回章节间延时。
+
+        三条上传/修改路径原来各写一份。漏掉其中一步不会报错，只会表现成
+        "任务在跑但日志框一直空白"这种难查的怪相。
+        """
+        self._set_uploading(True)
+        self.progress["value"] = 0
+        self.progress["maximum"] = max(count, 1)
+        self._install_log_handler()
+        return self._cfg.get("delay_between_chapters", 3)
+
+    def _require_login(self):
+        """没登录就提示并返回 False。四个入口原来各写一份这个判断。
+
+        提示统一走 _notify：其中一处原来直接用 messagebox，定时模式下会弹出
+        没人点的模态框，把无人值守的整批任务堵死在那儿。
+        """
+        if AUTH_FILE.exists():
+            return True
+        self._notify("warning", "需要先登录", LOGIN_FIRST_MSG)
+        return False
+
+    def _pack_volume_picker(self):
+        """按「合并所有卷」勾选状态显示/隐藏分卷下拉。两处布局刷新共用。"""
+        if self.all_volumes_var.get():
+            self._lbl_volume_sep.pack_forget()
+            self.cmb_volume.pack_forget()
+        else:
+            self._lbl_volume_sep.pack(side="left", padx=(12, 0))
+            self.cmb_volume.pack(side="left", padx=2, pady=4)
+
     def _notify(self, level, title, msg):
         """提示对话框。定时模式下用日志替代弹窗。level: info/warning/error。"""
         if self._auto_run:
@@ -2642,14 +2924,12 @@ class FanqieGUI:
 
     @staticmethod
     def _parse_timer_input(raw):
-        """解析定时时间字符串，成功返回 datetime，失败返回 None。"""
-        raw = (raw or "").strip()
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-            try:
-                return datetime.strptime(raw, fmt)
-            except ValueError:
-                continue
-        return None
+        """解析定时时间字符串，成功返回 datetime，失败返回 None。
+
+        格式集与「按修改日期筛选」不同（定时必须带时分，见
+        fanqie_upload.TIMER_INPUT_FORMATS 处的说明），但解析共用一份。
+        """
+        return parse_datetime(raw, TIMER_INPUT_FORMATS)
 
     def _timer_preflight_issues(self):
         """返回启动定时前发现的潜在问题列表（用于无人值守前的即时提醒）。"""
@@ -2730,7 +3010,7 @@ class FanqieGUI:
         if triggered:
             self.lbl_timer_status.configure(text="✅ 已触发执行", foreground="green")
         else:
-            self.lbl_timer_status.configure(text="定时未启动", foreground=CLR_INK_SOFT)
+            self.lbl_timer_status.configure(text="未启动", foreground=CLR_INK_SOFT)
 
     def _timer_tick(self):
         if self._closing:
@@ -2750,7 +3030,7 @@ class FanqieGUI:
                     self._timer_waiting_busy = True
                     logger.info(f"[定时] 已到执行时间，但{busy_reason}，等待其完成后再执行。")
                 self.lbl_timer_status.configure(
-                    text=f"⏰ 已到时间，等待（{busy_reason}）…", foreground="#d35400")
+                    text=f"⏰ 已到时间，等待（{busy_reason}）…", foreground=CLR_SCHED_TX)
                 self._timer_after_id = self.root.after(1000, self._timer_tick)
                 return
             self._stop_timer(triggered=True)
@@ -2768,11 +3048,12 @@ class FanqieGUI:
                 logger.info("[定时] 目录刷新完成。")
             except Exception as e:
                 logger.warning(f"[定时] 目录刷新失败: {e}")
+        # 目标时刻就在上方输入框里，状态行只报倒计时——重复写一遍日期会把这行
+        # 撑到装不下、末尾被裁
         prefix = "🔄 已刷新目录 ｜ " if self._timer_prerefresh_done else ""
         self.lbl_timer_status.configure(
-            text=(f"⏰ {prefix}将于 {self._timer_target:%Y-%m-%d %H:%M} 执行"
-                  f" ｜ 倒计时 {self._fmt_hms(remaining)}"),
-            foreground="#d35400")
+            text=f"⏰ {prefix}倒计时 {self._fmt_hms(remaining)}",
+            foreground=CLR_SCHED_TX)
         self._timer_after_id = self.root.after(1000, self._timer_tick)
 
     def _trigger_scheduled_run(self):
@@ -2804,21 +3085,20 @@ class FanqieGUI:
         if self.uploading:
             # 正在上传中 -> 请求取消
             self._cancel_requested = True
-            self.btn_upload.configure(state="disabled", text="正在停止...")
+            self.btn_upload.configure(state="disabled", text="正在停止…")
             return
         if self._login_in_progress:
             # 登录期间另起上传会同开第二个浏览器、并发写 AUTH_FILE，
             # 可能把登录正在保存的会话与上传账号互相覆盖（错配账号）。
-            self._notify("warning", "提示", "正在登录，请先完成或取消当前登录再上传。")
+            self._notify("warning", "登录进行中", "先完成或取消当前登录，再开始上传。")
             return
 
         # 验证
-        if not AUTH_FILE.exists():
-            self._notify("warning", "提示", "请先登录")
+        if not self._require_login():
             return
         idx = self.cmb_book.current()
         if idx < 0 or not self.books:
-            self._notify("warning", "提示", "请先刷新并选择作品")
+            self._notify("warning", "未选择作品", PICK_BOOK_MSG)
             return
         mode = self.mode_var.get()
         book_id = self.books[idx]["bookId"]
@@ -2830,7 +3110,7 @@ class FanqieGUI:
             return
 
         if not self.files or not self.parsed_chapters:
-            self._notify("warning", "提示", "请先选择章节文件夹")
+            self._notify("warning", "未选择章节文件夹", PICK_DIR_MSG)
             return
 
         # 修改内容模式
@@ -2841,10 +3121,55 @@ class FanqieGUI:
         use_ai = self.use_ai_var.get()
 
         # 复制数据避免主线程修改
-        parsed = list(self.parsed_chapters)
-        files = list(self.files)
+        # 自动接续队列（仅定时发布）：范围和起始日期都由平台队列决定，
+        # 不用手填。需要平台章节数据——用「修改内容/修改排期」那套缓存，
+        # 没有就提示先刷新，避免在这里再开一次浏览器。
+        autocont = (mode == "schedule" and getattr(self, "autocont_var", None)
+                    and self.autocont_var.get())
+        autocont_start = None
+        # 自动接续筛出的子集只放局部变量，**绝不写回 self.***：用户在下面的确认框
+        # 点「否」（或在「起始日期已过去」提醒里取消）时，若 self.parsed_chapters
+        # 已被裁剪，预览就永久只剩那几章 —— 下次哪怕没勾自动接续也只发这几章，
+        # 而 total_before_filter 也跟着变小，界面上看不出任何异常。
+        autocont_subset = None
+        if autocont:
+            cached = self._platform_chapters_cache.get(
+                self._chapter_cache_key(book_id))
+            if not cached:
+                self._notify(
+                    "warning", "需要先获取平台章节",
+                    "「自动接续队列」要先知道平台已经排到哪。\n"
+                    "请切到「修改内容」或「修改排期」模式等它加载完，再切回来。")
+                return
+            keep, autocont_start, gaps = self._autocont_plan(
+                cached, self.parsed_chapters)
+            if not keep:
+                self._notify("info", "没有可接续的章节",
+                             "本地章节都已经在平台上了。\n\n"
+                             "写好新章节放进章节文件夹，点目录旁的「↻」重新扫描后再试。")
+                return
+            parsed_new, files_new = [], []
+            for p_, f_ in zip(self.parsed_chapters, self.files):
+                try:
+                    n = int(p_[0]) if p_[0] is not None else None
+                except (TypeError, ValueError):
+                    n = None
+                if n in keep:
+                    parsed_new.append(p_)
+                    files_new.append(f_)
+            autocont_subset = (parsed_new, files_new)
+            if gaps:
+                logger.warning(
+                    f"平台中段还缺 {len(gaps)} 章（如 第"
+                    + "、第".join(str(n) for n in gaps[:5])
+                    + "章…）——这些不能靠发布补回原位，请用「工具 ▾ → 章节重排」")
 
         # 按章节序号筛选
+        if autocont_subset is not None:
+            parsed, files = list(autocont_subset[0]), list(autocont_subset[1])
+        else:
+            parsed = list(self.parsed_chapters)
+            files = list(self.files)
         total_before_filter = len(parsed)
         all_indices = list(range(len(parsed)))
         kept_indices, filter_active = self._filter_by_chapter_num(
@@ -2852,36 +3177,18 @@ class FanqieGUI:
         parsed = [parsed[i] for i in kept_indices]
         files = [files[i] for i in kept_indices]
         if not parsed:
-            self._notify("warning", "提示", "筛选后无可上传章节")
+            self._notify("warning", "筛选后没有章节",
+                         "当前筛选条件把所有章节都排除了。\n"
+                         "放宽「按章节号筛选」或「按修改日期筛选」后再试。")
             return
 
         # 定时发布参数
         schedule = None
         if mode == "schedule":
-            try:
-                date_str = self.date_var.get()
-                start_dt = datetime.strptime(date_str, "%Y-%m-%d")
-            except ValueError:
-                self._notify("error", "日期错误", "请输入正确的日期: YYYY-MM-DD")
+            params = self._read_schedule_params(start=autocont_start)
+            if params is None:
                 return
-            if start_dt.date() < datetime.now().date():
-                if not self._ask_yes_no(
-                        "日期提醒",
-                        f"起始日期 {date_str} 已过去，"
-                        f"平台可能拒绝定时发布到过去的日期。\n是否继续？"):
-                    return
-            try:
-                per_day = max(1, self.perday_var.get())
-            except tk.TclError:
-                self._notify("error", "参数错误", "请输入有效的每天章数")
-                return
-            time_str = self.time_var.get().strip() or "08:00"
-            if not _validate_times(time_str):
-                self._notify(
-                    "error", "时间格式错误",
-                    "请输入有效的发布时间 (HH:MM)\n"
-                    "多个时间用逗号分隔, 如: 08:00,12:00,20:00")
-                return
+            date_str, per_day, time_str = params
             schedule = compute_schedule(
                 len(parsed), date_str, time_str, per_day)
 
@@ -2898,20 +3205,16 @@ class FanqieGUI:
             return
 
         # 开始
-        self._set_uploading(True)
-        self.progress["maximum"] = max(count, 1)
-        self.progress["value"] = 0
+        delay = self._begin_task(count)
 
-        self._install_log_handler()
-
-        delay = self._cfg.get("delay_between_chapters", 3)
-
+        # 无头开关在主线程读取（Tk 变量不能在事件循环线程里取）
+        hl = self.headless_var.get()
         async def task():
             try:
                 url = NEW_CHAPTER_URL_TPL.format(book_id=book_id)
 
                 async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=False)
+                    browser, context = await create_context(p, headless=hl)
                     page = await context.new_page()
 
                     await page.goto(url)
@@ -2926,153 +3229,18 @@ class FanqieGUI:
                         self._after(0, self._upload_done, 0, 0)
                         return
 
-                    success = 0
-                    failed = 0
-                    consec_fail = 0
-                    fail_list = []  # (章节标签, 失败原因)
-                    draft_owner = {}  # 存草稿防覆盖漏账: draftId -> 章节标签
-                    is_draft = mode == "draft"
-                    total = len(files)
-                    max_retries = self._cfg.get("max_retries", 2)
-
-                    for i in range(total):
-                        if self._cancel_requested:
-                            logger.info("用户取消上传。")
-                            break
-
-                        chapter_num, title, content = parsed[i]
-                        num_str = f"第{chapter_num}章 " if chapter_num else ""
-                        sched_info = ""
-                        if schedule:
-                            sched_info = f" -> {schedule[i][0]} {schedule[i][1]}"
-                        logger.info(f"[{i+1}/{total}] {num_str}{title}{sched_info}")
-
-                        ok = False
-                        daily_limit = False
-                        this_draft_id = None
-                        for attempt in range(1, max_retries + 2):
-                            try:
-                                if i > 0 or attempt > 1:
-                                    await page.goto(url)
-                                    await wait_for_editor_ready(page)
-
-                                await fill_chapter(page, chapter_num, title, content)
-
-                                if schedule:
-                                    d, t = schedule[i]
-                                    await publish_scheduled(page, d, t, use_ai=use_ai)
-                                    logger.info(f"  -> 定时发布 {d} {t}")
-                                elif mode == "publish":
-                                    await _navigate_to_publish_settings(page, use_ai=use_ai)
-                                    btn = page.locator("button", has_text="确认发布")
-                                    if await btn.count() == 0:
-                                        raise RuntimeError("未找到确认发布按钮")
-                                    await btn.first.click(
-                                        no_wait_after=True, timeout=get_browser_timeout())
-                                    await _wait_publish_result(page, btn.first)
-                                    logger.info("  -> 已发布")
-                                else:
-                                    await save_draft(page)
-                                    # 番茄把连续两次"新建章存草稿"并到同一草稿槽（第2次
-                                    # 覆盖第1次后该槽才提交），只存1次会被下一章覆盖丢失。
-                                    # 对同一章再存一次同内容：让"被覆盖的那次"就是本章自己，
-                                    # 本章占满并提交自己的草稿槽，下一章自然拿到新槽——逐章
-                                    # 独立、不再隔章丢章（实测有效）。
-                                    await page.goto(url)
-                                    await wait_for_editor_ready(page)
-                                    await fill_chapter(page, chapter_num, title, content)
-                                    await save_draft(page)
-                                    this_draft_id = _extract_draft_id(page.url)
-                                    logger.info("  -> 已存草稿")
-
-                                ok = True
-                                break
-
-                            except DailyLimitReached as e:
-                                # 每日字数上限 = 平台当日额度已耗尽。继续提交后续
-                                # 章节只会重复撞限或触发别的拦截（实测续发产生额外
-                                # 错误），故中止整批；本章与剩余章节如实记入清单。
-                                logger.warning(f"  达每日字数上限（{e}），中止整批")
-                                fail_list.append((f"{num_str}{title}", str(e)))
-                                daily_limit = True
-                                break
-
-                            except Exception as e:
-                                if attempt <= max_retries:
-                                    logger.warning(f"第{attempt}次失败: {e}，重试中...")
-                                    await page.wait_for_timeout(2000)
-                                else:
-                                    logger.error(f"失败: {e}")
-                                    fail_list.append((f"{num_str}{title}", str(e)))
-                                    try:
-                                        err = SCRIPT_DIR / f"error_{i}_{files[i].stem}.png"
-                                        await page.screenshot(path=str(err))
-                                        logger.error(f"  截图: {err}")
-                                    except Exception:
-                                        pass
-
-                        if daily_limit:
-                            failed += 1
-                            # 中止整批：把剩余未处理章节如实记入清单（不静默丢弃）。
-                            rest = _record_unprocessed(
-                                fail_list, ((parsed[j][0], parsed[j][1]) for j in range(i + 1, total)))
-                            failed += rest
-                            if rest:
-                                logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
-                            self._after(0, self._update_progress, total, total)
-                            break
-                        elif ok:
-                            success += 1
-                            consec_fail = 0
-                            # 存草稿防覆盖漏账：番茄有时把"新建章"复用到同一进行中
-                            # 草稿上，本章会覆盖上一章。检测到 draftId 复用即说明上一
-                            # 占用者已被覆盖、未独立保存——移出成功、记入补传清单，
-                            # 避免"报存成功却实际丢章"（第N章号会被压进补传号）。
-                            if is_draft and this_draft_id:
-                                prev = draft_owner.get(this_draft_id)
-                                if prev is not None:
-                                    logger.warning(
-                                        f"  ⚠ 本章复用草稿ID {this_draft_id}，"
-                                        f"覆盖了上一章「{prev.strip()}」")
-                                    fail_list.append(
-                                        (prev, "草稿被后续章节覆盖（平台复用草稿ID），未独立保存"))
-                                    success -= 1
-                                    failed += 1
-                                draft_owner[this_draft_id] = f"{num_str}{title}"
-                            elif is_draft and not this_draft_id:
-                                logger.warning(
-                                    "  ⚠ 未能读取草稿ID，无法确认是否独立保存，请到草稿箱核对")
-                        else:
-                            failed += 1
-                            consec_fail += 1
-                            if consec_fail >= 3:
-                                rest = total - (i + 1)
-                                logger.error(
-                                    f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
-                                    f"中止任务，剩余 {rest} 章未处理")
-                                # 与每日上限路径一致：剩余章节记入清单并计数，
-                                # 否则汇总"成功+失败<总数"、且补传清单缺这些章节。
-                                failed += _record_unprocessed(
-                                    fail_list,
-                                    ((parsed[j][0], parsed[j][1]) for j in range(i + 1, total)),
-                                    reason="流程异常中止，未处理")
-                                self._after(0, self._update_progress, total, total)
-                                break
-
-                        self._after(0, self._update_progress, i + 1, total)
-
-                        if i < total - 1 and delay > 0:
-                            try:
-                                await page.wait_for_timeout(delay * 1000)
-                            except Exception:
-                                # 章节间等待时页面已死（如用户关掉浏览器窗口）：
-                                # 停止循环，但仍走收尾与汇总，保住失败清单。
-                                # 剩余未发章节记入清单，否则汇总漏账、补传清单缺这些章。
-                                failed += _record_unprocessed(
-                                    fail_list,
-                                    ((parsed[j][0], parsed[j][1]) for j in range(i + 1, total)),
-                                    reason="页面已失效，未处理")
-                                break
+                    # 批次循环与收尾对账在共用执行器里（CLI 同一份实现），
+                    # GUI 只注入取消检查与进度回调。
+                    success, failed, fail_list = await run_creation_batch(
+                        page, parsed, url, book_id=book_id,
+                        schedule=schedule, is_draft=(mode == "draft"),
+                        use_ai=use_ai,
+                        max_retries=self._cfg.get("max_retries", 2),
+                        delay=delay,
+                        cancel_check=lambda: self._cancel_requested,
+                        progress_cb=lambda done, tot: self._after(
+                            0, self._update_progress, done, tot),
+                        err_tag_fn=lambda i: f"gui_{i}")
 
                     await save_auth(context)
                     await close_browser_safely(browser)
@@ -3082,7 +3250,7 @@ class FanqieGUI:
                     # 挡住结果汇报（实测曾让 GUI"卡死"41 分钟）
                     logger.info(f"{'='*40}")
                     logger.info(f"  上传完成! 成功: {success}  失败: {failed}")
-                    _log_fail_list(fail_list)
+                    log_fail_list(fail_list)
                     logger.info(f"{'='*40}")
 
                     self._after(0, self._upload_done, success, failed)
@@ -3123,10 +3291,13 @@ class FanqieGUI:
             if auto:
                 logger.info(f"[定时] 操作完成：成功 {success} 章，失败 {failed} 章")
                 self.lbl_timer_status.configure(
-                    text=f"✅ 定时执行完成：成功 {success} 失败 {failed}",
+                    text=f"✅ 定时执行完成 · 成功 {success} 失败 {failed}",
                     foreground="green")
             else:
-                messagebox.showinfo("操作完成", f"成功 {success} 章，失败 {failed} 章")
+                messagebox.showinfo(
+                    {"edit": "修改完成", "reschedule": "排期修改完成"}.get(
+                        self.mode_var.get(), "上传完成"),
+                    f"成功 {success} 章，失败 {failed} 章")
         elif auto:
             # success < 0 表示运行期异常
             self.lbl_timer_status.configure(
@@ -3143,185 +3314,34 @@ class FanqieGUI:
         matched = self._matched_edit
         count = len(matched)
 
-        msg = f"即将修改「{book_name}」的 {count} 个章节内容"
+        nums = sorted(m[2] for m in matched if isinstance(m[2], int))
+        rng = f"（第 {nums[0]}–{nums[-1]} 章）" if nums else ""
+        msg = (f"即将用本地文件替换「{book_name}」中 {count} 章的正文{rng}。\n"
+               f"章节的发布时间不受影响。")
         if not self._ask_yes_no("确认修改", msg):
             return
 
-        self._set_uploading(True)
-        self.progress["value"] = 0
-        self.progress["maximum"] = max(count, 1)
-
-        self._install_log_handler()
-
-        delay = self._cfg.get("delay_between_chapters", 3)
+        delay = self._begin_task(count)
         use_ai = self.use_ai_var.get()
         matched_copy = list(matched)
 
+        # 无头开关在主线程读取（Tk 变量不能在事件循环线程里取）
+        hl = self.headless_var.get()
         async def task():
             try:
                 async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=False)
+                    browser, context = await create_context(p, headless=hl)
                     page = await context.new_page()
 
-                    success = 0
-                    failed = 0
-                    skipped = 0
-                    consec_fail = 0
-                    fail_list = []  # (章节标签, 失败原因)
-                    dup_pending = []  # "重复标题"暂存，批末二次尝试
-                    total = len(matched_copy)
-
-                    for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched_copy):
-                        if self._cancel_requested:
-                            logger.info("用户取消修改。")
-                            break
-
-                        logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
-
-                        status = plat_ch.get("status", "")
-                        if "审核中" in status:
-                            logger.warning(f"  状态「{status}」审核中，不可编辑，跳过")
-                            skipped += 1
-                            self._after(0, self._update_progress, i + 1, total)
-                            continue
-
-                        edit_url = plat_ch.get("editUrl")
-                        if not edit_url:
-                            logger.error("无法获取编辑链接，跳过（可能审核中或平台未提供编辑入口）")
-                            skipped += 1
-                            self._after(0, self._update_progress, i + 1, total)
-                            continue
-
-                        if edit_url.startswith("/"):
-                            edit_url = BASE_URL + edit_url
-
-                        try:
-                            ok, err = await edit_one_chapter(
-                                page, edit_url, ch_num, title, content,
-                                use_ai=use_ai,
-                                max_retries=self._cfg.get("max_retries", 2))
-                            if ok:
-                                success += 1
-                                consec_fail = 0
-                            elif "重复" in err:
-                                # 标题搬移的临时冲突（本地重新编号后新章先于
-                                # 旧章提交同名标题被拒），留待批末二次尝试
-                                logger.info("  标题暂被其他章节占用，留待批末二次尝试")
-                                dup_pending.append((ch_num, title, content, edit_url))
-                                consec_fail = 0
-                            else:
-                                failed += 1
-                                fail_list.append(
-                                    (f"第{ch_num}章 {title}",
-                                     err or "重试后仍失败(见日志/截图)"))
-                                consec_fail += 1
-                                if consec_fail >= 3:
-                                    rest = total - (i + 1)
-                                    logger.error(
-                                        f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
-                                        f"中止任务，剩余 {rest} 章未处理")
-                                    skipped += rest
-                                    self._after(0, self._update_progress, i + 1, total)
-                                    break
-                        except DailyLimitReached as e:
-                            # 每日字数上限 = 平台当日额度已耗尽。继续提交后续章节
-                            # 只会重复撞限或触发别的拦截（实测续发产生额外错误），
-                            # 故中止整批；本章与剩余章节（含批末待二次尝试的）如实
-                            # 记入清单。
-                            logger.warning(f"  达每日字数上限（{e}），中止整批")
-                            fail_list.append((f"第{ch_num}章 {title}", str(e)))
-                            failed += 1
-                            # 剩余主循环章节 + 批末待二次尝试的章节都记为未处理。
-                            failed += _record_unprocessed(
-                                fail_list, ((m[2], m[3]) for m in matched_copy[i + 1:]))
-                            failed += _record_unprocessed(
-                                fail_list, ((d[0], d[1]) for d in dup_pending))
-                            dup_pending = []
-                            rest = total - (i + 1)
-                            if rest:
-                                logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
-                            self._after(0, self._update_progress, total, total)
-                            break
-                        except Exception as e:
-                            # 兜底浏览器崩溃/页面被关等意外，按原因不明失败计入
-                            # 熔断，保证 save_auth/汇总仍能执行而不是整批裸抛中止。
-                            logger.error(f"  本章发生未预期异常: {e}")
-                            fail_list.append(
-                                (f"第{ch_num}章 {title}", f"未预期异常: {e}"))
-                            failed += 1
-                            consec_fail += 1
-                            if consec_fail >= 3:
-                                rest = total - (i + 1)
-                                logger.error(
-                                    f"连续 {consec_fail} 章原因不明失败，疑似流程异常，"
-                                    f"中止任务，剩余 {rest} 章未处理")
-                                skipped += rest
-                                self._after(0, self._update_progress, i + 1, total)
-                                break
-
-                        self._after(0, self._update_progress, i + 1, total)
-
-                        if i < total - 1 and delay > 0:
-                            try:
-                                await page.wait_for_timeout(delay * 1000)
-                            except Exception:
-                                # 章节间等待时页面已死（如用户关掉浏览器窗口）：
-                                # 停止循环，但仍走收尾与汇总，保住失败清单。
-                                # 剩余未改章节记入清单（dup_pending 由其专属循环另行计数）。
-                                failed += _record_unprocessed(
-                                    fail_list,
-                                    ((m[2], m[3]) for m in matched_copy[i + 1:]),
-                                    reason="页面已失效，未处理")
-                                break
-
-                    # 批末二次尝试: 主循环跑完后，占用旧标题的章节多已更新
-                    if dup_pending:
-                        if not self._cancel_requested:
-                            logger.info("")
-                            logger.info(
-                                f"二次尝试 {len(dup_pending)} 个标题重复的章节"
-                                f"（标题搬移的临时冲突，此时多已解除）...")
-                        for idx2, (ch_num, title, content, edit_url) in \
-                                enumerate(dup_pending):
-                            if self._cancel_requested:
-                                # 中途/事前取消: 剩余章节如实计入失败清单
-                                for ch_num2, title2, *_ in dup_pending[idx2:]:
-                                    fail_list.append(
-                                        (f"第{ch_num2}章 {title2}",
-                                         "标题重复(用户取消，未二次尝试)"))
-                                    failed += 1
-                                break
-                            logger.info(f"[二次] 修改第{ch_num}章 {title}")
-                            try:
-                                ok, err = await edit_one_chapter(
-                                    page, edit_url, ch_num, title, content,
-                                    use_ai=use_ai, max_retries=0)
-                                if ok:
-                                    success += 1
-                                else:
-                                    failed += 1
-                                    fail_list.append(
-                                        (f"第{ch_num}章 {title}",
-                                         err or "标题重复，二次尝试仍失败"))
-                            except DailyLimitReached as e:
-                                # 二次尝试阶段撞每日上限：与主循环一致中止整批，
-                                # 本条与剩余二次条目如实记入清单。
-                                logger.warning(f"  达每日字数上限（{e}），中止二次尝试")
-                                fail_list.append((f"第{ch_num}章 {title}", str(e)))
-                                failed += 1
-                                failed += _record_unprocessed(
-                                    fail_list, ((d[0], d[1]) for d in dup_pending[idx2 + 1:]))
-                                break
-                            except Exception as e:
-                                logger.error(f"  二次尝试异常: {e}")
-                                fail_list.append(
-                                    (f"第{ch_num}章 {title}", f"二次尝试异常: {e}"))
-                                failed += 1
-                            if delay > 0:
-                                try:
-                                    await page.wait_for_timeout(delay * 1000)
-                                except Exception:
-                                    pass  # 页面已死也要走完计数与汇总
+                    # 批次循环（含批末二次尝试）在共用执行器里（CLI 同一份实现），
+                    # GUI 只注入取消检查与进度回调。合并后两边同时获得对方原有的防护:
+                    # 取消记账（原 GUI 独有）与二次尝试的页面死亡短路（原 CLI 独有）。
+                    success, failed, skipped, fail_list = await run_edit_batch(
+                        page, matched_copy, use_ai=use_ai,
+                        max_retries=self._cfg.get("max_retries", 2), delay=delay,
+                        cancel_check=lambda: self._cancel_requested,
+                        progress_cb=lambda done, tot: self._after(
+                            0, self._update_progress, done, tot))
 
                     await save_auth(context)
                     await close_browser_safely(browser)
@@ -3333,7 +3353,7 @@ class FanqieGUI:
                     skip_str = f"  跳过: {skipped}" if skipped else ""
                     logger.info(
                         f"  修改完成! 成功: {success}  失败: {failed}{skip_str}")
-                    _log_fail_list(fail_list)
+                    log_fail_list(fail_list)
                     logger.info(f"{'='*40}")
 
                     self._after(0, self._upload_done, success, failed)
@@ -3346,34 +3366,54 @@ class FanqieGUI:
 
     # -----------------------------------------------------------------------
     # 修改排期
-    # -----------------------------------------------------------------------
-    def _on_upload_reschedule(self, book_id, book_name):
-        """修改排期: 在章节管理页批量修改待发布章节的排期设置。"""
-        # 验证排期参数
-        try:
-            date_str = self.date_var.get()
-            start_dt = datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            self._notify("error", "日期错误", "请输入正确的日期: YYYY-MM-DD")
-            return
+    def _read_schedule_params(self, *, start=None):
+        """读取并校验排期三参数，返回 (date_str, per_day, time_str)。
+
+        任一项不合法、或用户在"日期已过去"的确认框里选了取消，弹窗后返回
+        None，调用方直接 return。start 给定时跳过日期输入框（自动接续已经
+        按平台队列末尾算好了起始日）。
+
+        定时发布和修改排期两条路曾各抄一份这 20 多行，改一句提示语就得记得
+        改两处，漏一处两边行为就不一样。
+        """
+        if start is not None:
+            date_str = start.strftime("%Y-%m-%d")
+            start_dt = datetime.combine(start, datetime.min.time())
+            logger.info(f"自动接续：从 {date_str} 起（平台队列末尾的次日）")
+        else:
+            try:
+                date_str = self.date_var.get()
+                start_dt = datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                self._notify("error", "日期错误", "请输入正确的日期: YYYY-MM-DD")
+                return None
         if start_dt.date() < datetime.now().date():
             if not self._ask_yes_no(
                     "日期提醒",
                     f"起始日期 {date_str} 已过去，"
                     f"平台可能拒绝定时发布到过去的日期。\n是否继续？"):
-                return
+                return None
         try:
             per_day = max(1, self.perday_var.get())
         except tk.TclError:
             self._notify("error", "参数错误", "请输入有效的每天章数")
-            return
+            return None
         time_str = self.time_var.get().strip() or "08:00"
-        if not _validate_times(time_str):
+        if not validate_times(time_str):
             self._notify(
                 "error", "时间格式错误",
                 "请输入有效的发布时间 (HH:MM)\n"
                 "多个时间用逗号分隔, 如: 08:00,12:00,20:00")
+            return None
+        return date_str, per_day, time_str
+
+    # -----------------------------------------------------------------------
+    def _on_upload_reschedule(self, book_id, book_name):
+        """修改排期: 在章节管理页批量修改待发布章节的排期设置。"""
+        params = self._read_schedule_params()
+        if params is None:
             return
+        date_str, per_day, time_str = params
 
         # 获取平台章节，反转顺序 + 只保留"待发布"
         cache_key = self._chapter_cache_key(book_id)
@@ -3386,14 +3426,17 @@ class FanqieGUI:
             if "待发布" in ch.get("status", "")
         ]
         if not platform_chapters:
-            self._notify("info", "提示", "没有「待发布」状态的章节可修改排期。")
+            self._notify("info", "没有可改排期的章节",
+                         "这部作品里没有「待发布」状态的章节。\n"
+                         "已发布的章节不能再改排期。")
             return
 
         # 按章节序号筛选
         platform_chapters, _ = self._filter_by_chapter_num(
             platform_chapters, key=lambda ch: ch.get("chapterNum"))
         if not platform_chapters:
-            self._notify("info", "提示", "筛选后无待发布章节可修改排期。")
+            self._notify("info", "筛选后没有章节",
+                         "当前的章节号筛选把待发布章节都排除了，放宽后再试。")
             return
 
         # 计算排期并构建 schedule_map
@@ -3426,13 +3469,7 @@ class FanqieGUI:
             return
 
         # 开始
-        self._set_uploading(True)
-        self.progress["value"] = 0
-        self.progress["maximum"] = max(count, 1)
-
-        self._install_log_handler()
-
-        delay = self._cfg.get("delay_between_chapters", 3)
+        delay = self._begin_task(count)
         smap = dict(schedule_map)
         vol = self._get_selected_volume()
         # "合并所有卷"模式: 传入所有卷名列表
@@ -3443,10 +3480,12 @@ class FanqieGUI:
                 v["text"] if isinstance(v, dict) else v for v in vols
             ] or None
 
+        # 无头开关在主线程读取（Tk 变量不能在事件循环线程里取）
+        hl = self.headless_var.get()
         async def task():
             try:
                 async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=False)
+                    browser, context = await create_context(p, headless=hl)
                     page = await context.new_page()
 
                     success, failed = await reschedule_on_manage_page(
@@ -3479,243 +3518,383 @@ class FanqieGUI:
         self.worker.submit(task())
 
     # -----------------------------------------------------------------------
-    # 补漏章：把定时发布中段漏掉的章节，按番茄原排期插回正确位置
+    # 检查缺口：体检章节位置，按「谁能修」分段（缺章补不回原位，见下方说明）
     # -----------------------------------------------------------------------
-    def _on_backfill(self):
-        """检测平台缺章并按原排期节奏补回。
+    # -----------------------------------------------------------------------
+    # 工具菜单：核心逻辑一律复用 tools/ 下已有实现，这里只负责取参数/确认/展示
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _load_tool(name):
+        """加载 tools/<name>/<name>.py —— 直接用 fanqie_upload 的带缓存实现。
 
-        缺章根因是定时发布"假成功"（已修）：日志记成功但平台无此章、正文只留
-        草稿。本按钮抓平台真实章节 → 算出每个缺口应插入的槽位（compute_gap_
-        schedule，与 CLI 工具 tools/republish 共用核心）→ 用本地正文补发。
-        每次都按平台真实状态算，已补的自动跳过，重复点不会产生重复章。
+        原来这里和 fanqie_upload._load_tool_module 是逐字相同的两份，且都不
+        缓存：每次自动接续上传都重新 exec 一遍 keep_ahead，模块顶层的
+        sys.path.insert 也跟着累积。
         """
+        return _load_tool_module(name)
+
+    def _tool_precheck(self):
+        """工具类操作的共同前置：没在跑任务、已登录、选了作品。返回 book_id 或 None。"""
         if self.uploading or self._login_in_progress:
-            self._notify("warning", "提示", "有任务正在进行，请先完成或停止。")
-            return
-        if not AUTH_FILE.exists():
-            self._notify("warning", "提示", "请先登录")
-            return
+            self._notify("warning", "任务进行中",
+                         "先等当前任务结束再用工具。\n"
+                         "上传/修改可以点「停止」中断；工具与体检不支持中途取消。")
+            return None
+        if not self._require_login():
+            return None
         idx = self.cmb_book.current()
         if idx < 0 or not self.books:
-            self._notify("warning", "提示", "请先刷新并选择作品")
-            return
-        if not self.parsed_chapters:
-            self._notify("warning", "提示",
-                         "请先选择章节文件夹（补漏需要本地正文）")
-            return
-        book_id = self.books[idx]["bookId"]
-        book_name = self.books[idx]["name"]
+            self._notify("warning", "未选择作品", PICK_BOOK_MSG)
+            return None
+        return self.books[idx]["bookId"]
 
-        # 需要平台章节（含日期）。用与修改模式相同的缓存；未加载就触发抓取，
-        # 并置 _backfill_pending，让加载完成的回调自动续跑补漏（省去二次点击）。
-        # 关键：以「键是否存在」判定是否已加载，而非值真假——平台 0 章会缓存成
-        # 空列表 []，若按 `not rows` 会再次触发抓取，而抓取命中缓存又同步回调、
-        # 回调再自动续跑，形成死循环。键存在即视为已加载（空列表交给下方按
-        # "无缺口"正常处理）。
-        cache_key = self._chapter_cache_key(book_id)
-        if cache_key not in self._platform_chapters_cache:
-            if self._backfill_pending:
-                return  # 已在加载中，忽略重复点击（不禁用按钮，避免卡死在禁用态）
-            self._backfill_pending = True
-            self._set_preview("正在获取平台章节列表…加载完成后将自动开始补漏章。")
-            self._fetch_platform_chapters_for_edit()
-            return
-        # 走到这里说明缓存已就绪：清掉可能残留的待补漏标志
-        self._backfill_pending = False
-        rows = self._platform_chapters_cache[cache_key]
-
-        # 计算缺口排期（纯函数，主线程）
-        assign, warnings = compute_gap_schedule(rows)
-        for w in warnings:
-            logger.warning(f"补漏: {w}")
-        if not assign:
-            self._notify("info", "无缺口",
-                         "平台未检测到中段缺章（或未抓到带章节号的章节）。")
-            return
-
-        # 映射本地文件: 章号 -> (num, title, content)
-        local = {}
-        for num, title, content in self.parsed_chapters:
-            if num is None:
-                continue
-            try:
-                local[int(num)] = (num, title, content)
-            except (TypeError, ValueError):
-                pass
-        entries = []          # (num, date, time, (num,title,content))
-        no_file = []
-        for num in sorted(assign):
-            d, t = assign[num]
-            if num in local:
-                entries.append((num, d, t, local[num]))
-            else:
-                no_file.append(num)
-        if not entries:
-            self._notify(
-                "warning", "无法补",
-                f"检测到 {len(assign)} 个缺口，但本地都没有对应章节文件。\n"
-                f"请确认选对了内容目录。")
-            return
-
-        # 可选：限制本次补发数量（分月控量，避免一次撞每月字数上限）
-        default_limit = min(len(entries), 300)
-        limit = simpledialog.askinteger(
-            "补漏章",
-            f"平台缺 {len(assign)} 章，本地有文件可补 {len(entries)} 章。\n"
-            f"本次最多补多少章？（分月控量用；留默认即可）",
-            initialvalue=default_limit, minvalue=1,
-            maxvalue=len(entries), parent=self.root)
-        if limit is None:
-            return  # 用户取消
-        entries = entries[:limit]
-
-        # 过期缺口检测：原定排期时刻已过 → 番茄可能拒绝定时到过去，且该缺口
-        # 大概率已是读者可见的断档，应改用立即发布尽快补（此处仅醒目告警）。
-        now = datetime.now()
-        overdue = overdue_gap_nums(
-            assign, (now.strftime("%Y-%m-%d"), now.strftime("%H:%M")))
-        overdue_in_batch = [n for n, _, _, _ in entries if n in set(overdue)]
-
-        # 预览写入面板
-        preview = [f"补漏章：本次将补 {len(entries)} 章（平台共缺 {len(assign)} 章）"]
-        if no_file:
-            preview.append(f"⚠ 本地缺文件、跳过 {len(no_file)} 章: "
-                           f"{self._compress_nums(no_file)}")
-        if overdue_in_batch:
-            preview.append(
-                f"⚠ 排期已过期 {len(overdue_in_batch)} 章: "
-                f"{self._compress_nums(overdue_in_batch)}"
-                f"（番茄可能拒绝定时到过去，建议这些改用立即发布尽快补）")
-        preview.append("-" * 60)
-        for num, d, t, _ in entries[:200]:
-            preview.append(f"  第{num}章 -> {d} {t}")
-        if len(entries) > 200:
-            preview.append(f"  ... 共 {len(entries)} 章")
-        self._set_preview("\n".join(preview))
-
-        msg = (f"即将向「{book_name}」补发 {len(entries)} 章（按原排期插回缺口）。\n"
-               f"时间范围: {entries[0][1]} {entries[0][2]} ~ "
-               f"{entries[-1][1]} {entries[-1][2]}\n"
-               f"撞每月/每日字数上限会自动中止，下月可再点补漏续补。\n")
-        if overdue_in_batch:
-            msg += (f"\n⚠ 其中 {len(overdue_in_batch)} 章原定排期已过期"
-                    f"（番茄可能拒绝，建议先在平台或用「立即发布」补这些）。\n")
-        msg += "是否开始？"
-        if not self._ask_yes_no("确认补漏章", msg):
-            return
-
-        self._on_backfill_run(book_id, entries)
-
-    @staticmethod
-    def _compress_nums(nums):
-        """把章号列表压成区间字符串，如 [1,2,3,5] -> '1-3,5'。"""
-        uniq = sorted(set(nums))
-        parts, i = [], 0
-        while i < len(uniq):
-            j = i
-            while j + 1 < len(uniq) and uniq[j + 1] == uniq[j] + 1:
-                j += 1
-            parts.append(str(uniq[i]) if i == j else f"{uniq[i]}-{uniq[j]}")
-            i = j + 1
-        return ",".join(parts)
-
-    def _on_backfill_run(self, book_id, entries):
-        """执行补漏：逐章新建→填正文→按各自槽位定时发布（复用修复后的流程）。"""
-        self._set_uploading(True)
-        self.progress["maximum"] = max(len(entries), 1)
-        self.progress["value"] = 0
-        self._install_log_handler()
-        use_ai = self.use_ai_var.get()
-        max_retries = self._cfg.get("max_retries", 2)
-        items = list(entries)
+    def _run_tool_task(self, coro_factory, done_cb=None):
+        """把工具协程放到统一的 worker 上跑；无论成败都解除忙标志。"""
+        # 工具任务不读 _cancel_requested；安全检查结果写预览页
+        self._set_uploading(True, cancellable=False, show_log=False)
 
         async def task():
-            success, failed = 0, 0
-            fail_list = []
+            result, err = None, None
             try:
-                url = NEW_CHAPTER_URL_TPL.format(book_id=book_id)
-                async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=False)
-                    page = await context.new_page()
-                    await page.goto(url)
-                    try:
-                        await wait_for_editor_ready(page)
-                    except Exception as e:
-                        logger.error(f"无法进入编辑器（{e}），请检查登录状态。")
-                        await close_browser_safely(browser)
-                        self._after(0, self._upload_done, 0, 0)
-                        return
-
-                    total = len(items)
-                    for i, (num, date_str, time_str, parsed) in enumerate(items):
-                        if self._cancel_requested:
-                            logger.info("用户取消补漏。")
-                            for r in items[i:]:
-                                fail_list.append((r[0], "用户取消，未处理"))
-                                failed += 1
-                            break
-                        cnum, title, content = parsed
-                        logger.info(f"[{i+1}/{total}] 第{num}章 {title}"
-                                    f" -> {date_str} {time_str}")
-                        ok = False
-                        daily_limit = False
-                        for attempt in range(1, max_retries + 2):
-                            try:
-                                await page.goto(url)
-                                await wait_for_editor_ready(page)
-                                await fill_chapter(page, cnum, title, content)
-                                await publish_scheduled(
-                                    page, date_str, time_str, use_ai=use_ai)
-                                logger.info(f"    -> 定时发布成功 {date_str} {time_str}")
-                                ok = True
-                                break
-                            except DailyLimitReached as ex:
-                                logger.warning(f"    达发布字数上限（{ex}），中止整批")
-                                fail_list.append((num, f"字数上限:{ex}"))
-                                daily_limit = True
-                                break
-                            except Exception as ex:
-                                if attempt <= max_retries:
-                                    logger.warning(f"    第{attempt}次失败: {ex}，重试")
-                                    await page.wait_for_timeout(2000)
-                                else:
-                                    logger.error(f"    失败: {ex}")
-                                    fail_list.append((num, str(ex)[:120]))
-                        if daily_limit:
-                            failed += 1
-                            for r in items[i + 1:]:
-                                fail_list.append((r[0], "字数上限，未处理"))
-                                failed += 1
-                            break
-                        if ok:
-                            success += 1
-                        else:
-                            failed += 1
-                        self._after(0, self._update_progress, i + 1, total)
-
-                    await save_auth(context)
-                    await close_browser_safely(browser)
-
-                    logger.info(f"{'='*40}")
-                    logger.info(f"  补漏完成! 成功: {success}  失败: {failed}")
-                    if fail_list:
-                        nums = [n for n, _ in fail_list]
-                        logger.info(f"  未补章号: {self._compress_nums(nums)}"
-                                    f"（可再次点「补漏章」续补）")
-                    logger.info(f"{'='*40}")
-                    self._after(0, self._upload_done, success, failed)
+                result = await coro_factory()
             except Exception as e:
-                logger.error(f"补漏异常: {e}")
-                self._after(0, self._upload_done, -1, -1)
+                logger.error("操作失败: " + str(e))
+                err = str(e)
+            self._after(0, self._tool_done, result, err, done_cb)
 
         self.worker.submit(task())
 
-    # -----------------------------------------------------------------------
-    # 窗口关闭
-    # -----------------------------------------------------------------------
+    def _tool_done(self, result, err, done_cb):
+        self._set_uploading(False)
+        if err:
+            self._notify("error", "操作失败", err)
+        elif done_cb:
+            done_cb(result)
+
+    # --- 清空草稿箱 ---------------------------------------------------------
+    def _on_autocont_toggle(self):
+        """勾了自动接续就置灰起始日期（改由平台队列末尾决定）。"""
+        self._sync_autocont_state()
+        self._refresh_preview()
+
+    def _sync_autocont_state(self):
+        """按当前勾选状态置灰/恢复起始日期输入框（不触发预览刷新）。"""
+        on = self.autocont_var.get()
+        for attr in ("ent_date", "entry_date", "date_entry"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    w.configure(state="disabled" if on else "normal")
+                except tk.TclError:
+                    pass
+
+    def _autocont_plan(self, cached, parsed):
+        """自动接续: 返回 (要发的章号集合, 起始日期, 中段缺口)。
+
+        复用 tools/keep_ahead 的纯函数 plan_refill —— 只取平台最大章号之后的
+        章，中段缺口靠"发上去"补不回原位（新建只能追加到书尾），那是
+        「章节重排」的活，这里只提醒不碰。
+        """
+        tool = self._load_tool("keep_ahead")
+        # 缓存里的章节来自 _EXTRACT_ALL_JS（DOM 抓取），字段是
+        # {title, chapterNum, editUrl, status, date, time, rowIndex} ——
+        # **没有** display_status / timer_time。之前直接 .get(默认值) 等于把每章
+        # 都当成「已发布、无定时」，queue_tail_date 于是永远找不到待发布章、
+        # 队列末尾恒等于今天、起始日期恒为明天：队列已排到 9 月底时勾上自动接续，
+        # 新章会全堆到明天起的已占用日期上（正是这个功能要防的事）。
+        # 这里按 DOM 的中文状态与日期时间换算出这两个字段。
+        items = []
+        for i, c in enumerate(cached):
+            status = c.get("status", "") or ""
+            pending = "待发布" in status
+            tt = 0
+            d, t = c.get("date"), c.get("time")
+            if pending and d:
+                try:
+                    tt = int(datetime.strptime(
+                        f"{d} {t or '00:00'}", "%Y-%m-%d %H:%M").timestamp())
+                except ValueError:
+                    tt = 0
+            items.append({
+                "index": c.get("rowIndex", i) + 1,
+                "pos": c.get("rowIndex", i) + 1,
+                "title": c.get("title", ""),
+                "display_status": MOVE_PENDING if pending else MOVE_PUBLISHED,
+                "timer_time": tt,
+            })
+        num2path = {}
+        for num, _t, _c in parsed:
+            if num is None:
+                continue
+            try:
+                num2path[int(num)] = True
+            except (TypeError, ValueError):
+                pass
+        try:
+            per_day = max(1, self.perday_var.get())
+        except tk.TclError:
+            per_day = 1
+        raw = getattr(self, "days_ahead_var", None)
+        raw = raw.get().strip() if raw is not None else ""
+        days_ahead = int(raw) if raw.isdigit() and int(raw) > 0 else None
+        nums, start, _days, _tail, gaps = tool.plan_refill(
+            items, num2path, all_remaining=days_ahead is None,
+            days_ahead=days_ahead or 0, per_day=per_day)
+        return set(nums), start, gaps
+
+    def _on_tool_clean_drafts(self):
+        """先做安全检查（草稿内容本地有没有），确认后再删。删除不可恢复。"""
+        book_id = self._tool_precheck()
+        if not book_id:
+            return
+        tool = self._load_tool("clean_drafts")
+        hl = self.headless_var.get()
+        cdir = self._chapters_dir_for_tools()
+
+        async def survey():
+            async with async_playwright() as p:
+                browser, context = await create_context(p, headless=hl)
+                page = await context.new_page()
+                try:
+                    drafts, total = await fetch_draft_list(page, book_id)
+                finally:
+                    await close_browser_safely(browser)
+            ok, why, risky = tool.safety_check(
+                drafts, tool.local_chapter_nums(cdir))
+            return total, ok, why, risky
+
+        def after_survey(res):
+            total, ok, why, risky = res
+            if not total:
+                self._set_preview("草稿箱是空的，没有需要清理的草稿。")
+                self._notify("info", "草稿箱是空的", "没有需要清理的草稿。")
+                return
+            detail = "\n".join("· " + r for r in risky[:8])
+            if len(risky) > 8:
+                detail += "\n… 共 %d 条" % len(risky)
+            self._set_preview(
+                "草稿箱清理\n" + "=" * 60 +
+                "\n共 %d 条草稿\n%s %s\n%s" % (
+                    total, "✓" if ok else "⚠", why, detail))
+            if not ok:
+                self._notify(
+                    "warning", "有草稿本地没有备份",
+                    "%s\n\n这些内容只存在于草稿里，删了就找不回来。\n"
+                    "已中止——请先把它们存到本地再来清理。" % why)
+                return
+            if not self._ask_yes_no(
+                    "清空草稿箱",
+                    "共 %d 条草稿，%s。\n\n删除不可恢复，确定清空吗？" % (total, why)):
+                return
+            self._run_tool_task(
+                lambda: self._clean_drafts_run(book_id, hl, total, tool),
+                lambda r: self._notify(
+                    "info", "清理完成",
+                    "已删除 %d 条，草稿箱现有 %d 条。" % (r[0], r[1])))
+
+        self._set_preview("正在读取草稿箱…")
+        self._run_tool_task(survey, after_survey)
+
+    async def _clean_drafts_run(self, book_id, hl, total, tool):
+        async with async_playwright() as p:
+            browser, context = await create_context(p, headless=hl)
+            page = await context.new_page()
+            try:
+                await tool.open_draft_box(page, book_id)
+                done, stop = await tool.delete_drafts(page, book_id, total)
+                if stop:
+                    logger.warning("提前停止: " + stop)
+                _d, after = await fetch_draft_list(page, book_id)
+                logger.info("已删除 %d 条，草稿箱现有 %d 条" % (done, after))
+                return done, after
+            finally:
+                await close_browser_safely(browser)
+
+    # --- 章节重排 / 续排发布（复用 CLI，先预览再执行）-----------------------
+    def _on_tool_remap(self):
+        self._run_cli_tool(
+            "remap", "章节重排",
+            "把未公开的待发布章按位置重装内容（位置 i 装第 i 章），排期不变。"
+            "已公开的一律不碰。")
+
+    def _chapters_dir_for_tools(self):
+        d = (self._cfg.get("chapters_dir") or "").strip()
+        return d or str(SCRIPT_DIR / "chapters")
+
+    def _run_cli_tool(self, name, title, desc):
+        """remap / keep_ahead 共用：先跑 dry-run 预览，确认后再 --run。
+
+        直接调 CLI 而不是 import: 这两个工具是长任务、自带浏览器会话，
+        独立进程跑不会和 GUI 的事件循环/浏览器抢资源，输出也天然可展示。
+        """
+        book_id = self._tool_precheck()
+        if not book_id:
+            return
+        script = SCRIPT_DIR / "tools" / name / (name + ".py")
+        base = [sys.executable, str(script), "--book-id", book_id,
+                "--content-dir", self._chapters_dir_for_tools()]
+        if self.headless_var.get():
+            base.append("--headless")
+
+        def run_cli(extra, on_done):
+            def work():
+                try:
+                    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+                    r = subprocess.run(
+                        base + extra, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace",
+                        cwd=str(SCRIPT_DIR), env=env, timeout=6 * 3600)
+                    out = (r.stdout or "") + (r.stderr or "")
+                except Exception as e:
+                    out = "启动失败: " + str(e)
+                self._after(0, on_done, out)
+
+            # 重排/工具走子进程，读不到 _cancel_requested；预览结果在预览页
+            self._set_uploading(True, cancellable=False, show_log=False)
+            threading.Thread(target=work, daemon=True).start()
+
+        def after_preview(out):
+            self._set_uploading(False)
+            self._set_preview(out.strip() or "(无输出)")
+            if ("将改写 0 个" in out or "无需补排" in out
+                    or "没有可排的章" in out or "没有需要改写" in out):
+                self._notify("info", title, "没有需要处理的章节，详见预览面板。")
+                return
+            tail = "\n".join(out.strip().splitlines()[-12:])
+            if not self._ask_yes_no(
+                    title, "%s\n\n预览结果：\n%s\n\n确认执行吗？" % (desc, tail)):
+                return
+            run_cli(["--run"], after_run)
+
+        def after_run(out):
+            self._set_uploading(False)
+            self._set_preview(out.strip() or "(无输出)")
+            self._notify("info", title + "完成", "详见预览面板。")
+
+        self._set_preview("正在预览「%s」…" % title)
+        run_cli([], after_preview)
+
+    def _on_audit_gaps(self):
+        """缺口体检：抓平台真实状态，按「谁能修」分三段报告。
+
+        A 未公开段位置与章号不符 → 跑 tools/remap/remap.py --run 自动改写。
+        B 已公开、发布 3 天内、顺序倒挂 → 只能手机 App 申请+审批+逐章移动，
+          所以要在窗口内尽早知道，并显示每章还剩几小时。
+        C 已公开、超 3 天 → 永久错位，只登记不吵。
+        纯只读，不改平台任何东西。
+        """
+        if self.uploading or self._login_in_progress:
+            self._notify("warning", "任务进行中",
+                         "先等当前任务结束再检查缺口。\n"
+                         "上传/修改可以点「停止」中断；工具与体检不支持中途取消。")
+            return
+        if not self._require_login():
+            return
+        idx = self.cmb_book.current()
+        if idx < 0 or not self.books:
+            self._notify("warning", "未选择作品", PICK_BOOK_MSG)
+            return
+        book_id = self.books[idx]["bookId"]
+        hl = self.headless_var.get()
+        # 走统一的 self.worker（全 GUI 单一事件循环）并置忙标志：另起线程 +
+        # asyncio.run 会开出第二个循环，体检和上传能同时各开一个浏览器、
+        # 并发读写 AUTH_FILE；定时器判"有没有任务在跑"看的也是 self.uploading。
+        # 体检结果写在「章节预览」页，且不支持取消
+        self._set_uploading(True, cancellable=False, show_log=False)
+        self._set_preview("正在抓取平台章节状态…")
+
+        async def task():
+            items = None
+            try:
+                async with async_playwright() as p:
+                    browser, context = await create_context(p, headless=hl)
+                    page = await context.new_page()
+                    try:
+                        items, _signed, volumes = await fetch_chapter_items(
+                            page, book_id)
+                    finally:
+                        await close_browser_safely(browser)
+            except Exception as e:
+                logger.error(f"检查缺口失败: {e}")
+                self._after(0, self._audit_done, None, None, str(e))
+                return
+            self._after(0, self._audit_done, items, volumes, None)
+
+        self.worker.submit(task())
+
+    def _audit_done(self, items, volumes, err):
+        """体检收尾（主线程）：无论成败都要解除忙标志，否则界面永久卡在运行态。"""
+        self._set_uploading(False)
+        if err:
+            self._notify("error", "检查缺口失败", err)
+            return
+        self._render_audit(items, volumes)
+
+    def _render_audit(self, items, volumes=None):
+        """把体检结果渲染到预览面板（主线程）。"""
+        rep = audit_chapter_positions(items)
+        pend_bad = rep["pending_bad"]
+        lines = ["缺口体检", "=" * 60]
+        if volume_count(volumes or {}) > 1:
+            # 已跨卷合并；位置按全书连续计（卷序号*10000+卷内位置 → 累加偏移）
+            lines.append(f"本作品 {volume_count(volumes)} 卷，已跨卷合并，"
+                         f"位置按全书连续计。")
+            lines.append("")
+        lines.append(f"A 未公开段位置与章号不符：{len(pend_bad)} 个")
+        if pend_bad:
+            lines.append(f"   位置: {self._compress_nums(pend_bad)}"
+                         f"（全书位置，多卷已折算；不是章号）")
+            lines.append("   → 跑 python tools/remap/remap.py --run 自动改写"
+                         "（只动未公开章，排期不变）")
+            first = min(pend_bad)
+            # pend_bad 存的是全书位置（pos）；多卷下原始 index 带卷偏移，
+            # 拿 index 查会查空，缓冲告警就静默消失了
+            tt = next((int(x.get("timer_time") or 0) for x in items
+                       if x.get("pos", x["index"]) == first), 0)
+            if tt:
+                left_h = (tt - datetime.now().timestamp()) / 3600
+                warn = "⚠ " if left_h < MOVE_WINDOW_H else ""
+                lines.append(
+                    f"   {warn}缓冲：位置 {first} 将于 "
+                    f"{datetime.fromtimestamp(tt):%Y-%m-%d %H:%M} 发出，"
+                    f"还剩 {left_h:.1f} 小时（{left_h / 24:.1f} 天）")
+                if left_h < MOVE_WINDOW_H:
+                    lines.append("   ⚠ 缓冲已跌破 3 天移动窗口：今天必须补跑，"
+                                 "否则错位章发出后只能去 App 申请移动")
+        else:
+            lines.append("   → 未公开段全部就位")
+        lines.append("")
+        lines.append(f"B 已公开、还能在 App 申请移动：{len(rep['in_window'])} 章")
+        for r in rep["in_window"]:
+            lines.append(f"   第{r['num']}章（现在位置 {r['index']}）"
+                         f"发布于 {datetime.fromtimestamp(r['pub_at']):%m-%d %H:%M}，"
+                         f"窗口还剩 {r['left_h']:.1f} 小时")
+        if rep["in_window"]:
+            lines.append("   → 手机 App：申请调整 → 通过后选中该章 → 移动到正确位置")
+        lines.append("")
+        lines.append(f"C 已公开、超 3 天永久错位：{len(rep['expired'])} 章")
+        if rep["expired"]:
+            lines.append("   " + "、".join(
+                f"第{r['num']}章(位置{r['index']})" for r in rep["expired"]))
+        self._set_preview("\n".join(lines))
+        if rep["in_window"]:
+            self._notify(
+                "warning", "有章节还能救",
+                f"{len(rep['in_window'])} 章已公开但顺序错位，还在 3 天移动窗口内。"
+                f"详见预览面板，尽快去手机 App 申请移动。")
+        else:
+            self._notify(
+                "info", "体检完成",
+                f"未公开段待重排 {len(pend_bad)} 个；已公开段没有还能救的错位章。")
+
+    # 章号压缩用 fanqie_upload 的共用实现（原来这里有一份逐字相同的拷贝）
+    _compress_nums = staticmethod(compress_chapter_nums)
+
     def _on_close(self):
         if self.uploading:
-            if not messagebox.askyesno("确认", "上传正在进行中，确定退出吗？"):
+            if not messagebox.askyesno("任务未完成",
+                                       "上传正在进行中，现在退出会中断本次任务。\n"
+                                       "确定退出吗？"):
                 return
         self._closing = True
         # 若正在等待登录，唤醒被阻塞的登录线程并标记取消，

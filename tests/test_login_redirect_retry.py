@@ -34,7 +34,8 @@ class _FakePage:
         self.goto_calls = 0
         self.waited_ms = 0
 
-    async def goto(self, url, wait_until="load"):
+    # 真实签名带 timeout（goto 必须有上限，否则平台埋点会让 load 拖满默认 30s）
+    async def goto(self, url, wait_until="load", timeout=None):
         self.goto_calls += 1
         landing = self._urls[self.goto_calls - 1]
         if isinstance(landing, tuple):

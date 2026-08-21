@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """100 轮对抗战役 #2：失败章节号压缩闭环 + 最后的未测试面。
 
-目标: _compress_chapter_nums/_log_fail_list 闭环、load_config 边界、
+目标: compress_chapter_nums/log_fail_list 闭环、load_config 边界、
       get_md_files/natural_sort_key 文件系统遍历、save_auth 原子写、
       CLI 入口错误路径、端到端 失败→压缩→筛选 往返。
 
@@ -50,7 +50,7 @@ class LogCapture(logging.Handler):
 
 # ------------------------------------------------ R1-20 压缩与失败清单闭环
 def rounds_compress():
-    C = fu._compress_chapter_nums
+    C = fu.compress_chapter_nums
     directed = {
         (79, 80, 81, 83, 84, 114): "79-81,83-84,114",
         (7,): "7",
@@ -65,11 +65,11 @@ def rounds_compress():
         assert got == want, f"C({nums}) = {got!r}, 期望 {want!r}"
     round_pass("压缩定向 7 组")
 
-    # _log_fail_list 真实出口: 捕获 logger 输出验证表达式行
+    # log_fail_list 真实出口: 捕获 logger 输出验证表达式行
     cap = LogCapture()
     fu.logger.addHandler(cap)
     try:
-        fu._log_fail_list([
+        fu.log_fail_list([
             ("第79章 打回原形", "上限"), ("第80章 争孩子", "上限"),
             ("第81章 那点底气", "上限"), ("第114章 更大的世界", "x"),
             ("无号标题", "y"),  # 无章节号 → 清单保留、表达式跳过
@@ -79,13 +79,13 @@ def rounds_compress():
     joined = "\n".join(cap.lines)
     assert "79-81,114" in joined, joined
     assert "无号标题: y" in joined
-    round_pass("_log_fail_list 真实出口含表达式行")
+    round_pass("log_fail_list 真实出口含表达式行")
 
     cap2 = LogCapture()
     fu.logger.addHandler(cap2)
     try:
-        fu._log_fail_list([("纯文字章节", "原因")])
-        fu._log_fail_list([])
+        fu.log_fail_list([("纯文字章节", "原因")])
+        fu.log_fail_list([])
     finally:
         fu.logger.removeHandler(cap2)
     assert not any("失败章节号" in ln for ln in cap2.lines)
@@ -380,7 +380,7 @@ def rounds_e2e():
         cap = LogCapture()
         fu.logger.addHandler(cap)
         try:
-            fu._log_fail_list(fail_list)
+            fu.log_fail_list(fail_list)
         finally:
             fu.logger.removeHandler(cap)
         expr_line = next(ln for ln in cap.lines if "失败章节号" in ln)

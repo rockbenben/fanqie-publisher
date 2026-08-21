@@ -314,9 +314,27 @@ def editor_url_unit_tests():
     check("None不是编辑器", not f(None))
 
 
+def modify_timer_verdict_tests():
+    # --- 改期接口纳入权威判据（2026-08-20 第1396章 误判失败的回归） ---
+    # 改期走 modify_timer，之前不在权威判据里，只剩"按钮消失"启发式：接口已 200、
+    # toast 已"修改成功"，却因按钮没消失被判失败并白重试两次。
+    import inspect as _inspect
+    _src = _inspect.getsource(fu._wait_publish_result)
+    _ok = ('"publish_article" in url or "modify_timer" in url' in _src
+           or '"modify_timer" in url or "publish_article" in url' in _src)
+    check("改期接口纳入权威判据", _ok)
+    # 改期成功/失败响应用同一个解析器
+    check("改期 code=0 判成功",
+          fu._interpret_publish_response('{"code":0,"message":"success"}')[0] == "success")
+    check("改期 code!=0 判失败",
+          fu._interpret_publish_response(
+              '{"code":-1,"message":"服务器开小差了，请稍后再试"}')[0] == "fail")
+
+
 if __name__ == "__main__":
     interpret_unit_tests()
     editor_url_unit_tests()
     success_url_unit_tests()
     integration_tests()
+    modify_timer_verdict_tests()
     print(f"\nALL PASSED ({PASS} 断言)")
