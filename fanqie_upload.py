@@ -1216,13 +1216,23 @@ async def settle_page(page, timeout=None):
 def _at_target_path(current_url, target_url) -> str:
     """current_url 是否已经到了 target_url 那个页（只比 path，不比 query）。
 
-    宽松匹配: 目标 path 是当前 path 的前缀即可——SPA 可能在后面追段，
+    宽松匹配: 目标 path 是当前 path 的前缀即可——SPA 可能在后面追东西，
     但不会把你送到一个不相干的 path。宁可放过一个变形，也不能把正常导航判成失败。
+
+    真机实测(2026-08-21): 番茄会在 path 后面拼上 **&书名**（URL 编码），落地后是
+        /main/writer/chapter-manage/7613749318914149401&%E8%AF%B8%E5%A4%A9...
+    前一版只允许后面跟 "/"，于是把这种正常导航判成失败，连带批末对账
+    那道安全网一起挂掉（且报成“会话失效”，而登录好好的）。所以分隔符要包含 & 。
     """
     from urllib.parse import urlsplit
     cur = urlsplit(current_url or "").path.rstrip("/")
     want = urlsplit(target_url or "").path.rstrip("/")
-    return bool(want) and (cur == want or cur.startswith(want + "/"))
+    if not want:
+        return False
+    if cur == want:
+        return True
+    # 要求紧跟着一个分隔符，而不是裸 startswith：否则 …/123 会匹配到 …/1234。
+    return cur.startswith(want) and cur[len(want):len(want) + 1] in ("/", "&", "?", "#")
 
 
 async def goto_with_login_retry(page, url, *, wait_until="load"):
@@ -2339,7 +2349,7 @@ async def fetch_chapter_items(page, book_id):
     try:
         if not await goto_with_login_retry(
                 page, CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)):
-            raise RuntimeError("会话失效，请先重新登录")
+            raise RuntimeError("打不开章节管理页（登录失效或导航未到达），具体原因见上一条日志")
         for _ in range(20):
             await page.wait_for_timeout(500)
             if seen_ch:
@@ -2734,7 +2744,7 @@ async def fetch_draft_list(page, book_id):
     try:
         if not await goto_with_login_retry(
                 page, CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)):
-            raise RuntimeError("会话失效，请先重新登录")
+            raise RuntimeError("打不开章节管理页（登录失效或导航未到达），具体原因见上一条日志")
         await page.wait_for_timeout(2000)
         # 点「草稿箱」标签，让页面自己发出带签名的 draft_list 请求
         await page.evaluate("""() => {

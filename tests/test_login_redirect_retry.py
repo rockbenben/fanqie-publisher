@@ -128,6 +128,34 @@ def test_late_redirect_persistent_expiry():
     print("  PASS 持续迟到跳转 → 判为会话真失效")
 
 
+def test_landing_path_variants():
+    """落地 URL 的各种变形都要认作「到了目标页」。
+
+    goto 加了超时上限后可能在导航提交之前就超时，此时 page.url 还停在上一页，
+    而「不在登录页」不等于「到了目标页」——所以要比 path。但这个比对容易收得太紧:
+    **番茄会在 path 后面拼上 &书名**（2026-08-21 真机实测）。早先只允许后面跟 "/"，
+    于是把正常导航判成失败，连带批末对账那道安全网一起挂掉，还报成「会话失效」
+    ——而登录好好的、章节也确实发成功了。
+    """
+    A = U._at_target_path
+    W = "https://fanqienovel.com/main/writer/chapter-manage/7613749318914149401"
+    REAL = W + "&%E8%AF%B8%E5%A4%A9%E9%83%BD%E5%B8%82%E5%89%A7%E4%BB%8E%E5%87%A1%E4%BA%BA%E6%AD%8C%E5%BC%80%E5%A7%8B"
+    cases = [
+        (REAL, W, True, "真机: path 后拼了 &书名"),
+        (W, W, True, "完全相同"),
+        (W + "?tab=1", W, True, "带 query"),
+        (W + "/sub", W, True, "子路径"),
+        ("https://fanqienovel.com/main/writer/7613749318914149401/publish/",
+         W, False, "还停在编辑器（就是要抓的那个 case）"),
+        (W + "2", W, False, "另一本书(id 多一位)不能误匹配"),
+        ("", W, False, "空 URL"),
+    ]
+    for cur, want, exp, name in cases:
+        got = A(cur, want)
+        assert got is exp, f"FAIL [{name}] {got} != {exp}"
+        print(f"  [PASS] {name}")
+
+
 def main():
     test_transient_redirect_recovers()
     test_real_expiry_detected()
@@ -136,6 +164,7 @@ def main():
     test_timeout_then_login_then_recover()
     test_late_redirect_caught()
     test_late_redirect_persistent_expiry()
+    test_landing_path_variants()
     print("\nALL PASSED (login-redirect retry)")
 
 
