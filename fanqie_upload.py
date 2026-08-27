@@ -1968,6 +1968,39 @@ async def select_volume(page, volume_text: str) -> bool:
         return False
 
 
+async def _extract_via_api(page, book_id):
+    """在已经打开的章节管理页上，用接口直接取当前卷的章节行。
+
+    成功返回 (chapters, last_publish)；任何一处不对劲都返回 None，让调用方退回
+    逐页点「下一页」的 DOM 抓取——慢 50 倍，但一定是页面上真正显示的那一卷。
+
+    为什么要有那道"首行标题对得上"的校验: 签名 URL 是从 resource timing 里捞
+    的，切卷后如果 SPA 的新请求还没发出，捞到的就是**上一卷**的签名。接口照样
+    返回 code=0 的一整卷数据，没有任何报错——修改模式拿它去匹配章节号，就会把
+    内容写进别的卷的同号章。宁可慢，不可错。
+    """
+    try:
+        url = await page.evaluate(_SIGNED_CHAPTER_LIST_JS)
+        if not url:
+            return None
+        res = await page.evaluate(_FETCH_ITEMS_JS, url)
+        if res.get("error"):
+            logger.debug(f"接口取章节列表失败，退回 DOM 翻页: {res['error']}")
+            return None
+        chapters, last_pub = api_items_to_rows(res.get("items") or [], book_id)
+        if chapters:
+            first = await page.evaluate(
+                "() => (document.querySelector('tr td')||{}).textContent || ''")
+            if chapters[0]["title"] not in (first or ""):
+                logger.debug("接口首行与页面首行对不上（签名可能是上一卷的），"
+                             "退回 DOM 翻页")
+                return None
+        return chapters, last_pub
+    except Exception as e:
+        logger.debug(f"接口取章节列表异常，退回 DOM 翻页: {e}")
+        return None
+
+
 async def extract_chapters_from_page(
     page, book_id: str = "", on_progress=None,
 ) -> tuple[list[dict], dict | None]:
@@ -1979,6 +2012,17 @@ async def extract_chapters_from_page(
     on_progress(已翻页数, 总页数, 已抓章数): 可选。章节多的书要翻十几页、耗时十
     几秒，没有进度的话界面看着像卡死。CLI 不传，行为完全不变。
     """
+    rows = await _extract_via_api(page, book_id)
+    if rows is not None:
+        chapters, last_pub = rows
+        if on_progress is not None:
+            try:
+                on_progress(1, 1, len(chapters))
+            except Exception:
+                pass
+        logger.info(f"  接口直取 {len(chapters)} 个章节")
+        return chapters, last_pub
+
     if on_progress is not None:
         try:
             await page.expose_function(
@@ -2253,19 +2297,23 @@ def chapter_title_num(t):
 # 关键: 不能把"这一页没数据"一律当成翻完了。限流、鉴权失效、data=null 等异常
 # 响应同样返回空 item_list，静默截断会让上层把"没抓到的章"当成"平台上没有"，
 # 反过来制造大规模假漏章（对账要靠这份数据当真相，宁可报错也不能给半份）。
+#
+# 2026-08-27 在 1326 章的书上实测: 逐页串行(每页100条)要 15 次往返、7.8 秒，
+# 是"获取目录"最大的一块。改成「一波并发取 WAVE 页、每页 PAGE_SIZE 条」后
+# 一次往返 0.9 秒。两个常量只影响速度、不影响判据 —— 平台若把页大小压回 100
+# （草稿接口实测 page_count>=50 就 code=-100），下面照样一波波翻到空页为止，
+# 结果完全一致，只是多翻几波；整个大页请求被拒时自动退回 100 再来一遍。
 _FETCH_ITEMS_JS = r"""async (u) => {
-    const out = [];
-    const seen = new Set();
-    let total = null;
-    for (let pg = 0; pg < 60; pg++) {
-        // replace 匹配不上是静默 no-op：那样每一轮都在取同一页（或服务端默认
-        // 页大小），第 0 页短于预期就被当成"全书就这么多"。对账拿这份当真相，
-        // 半份数据会把几百章报成"平台上没有"，用户照单补传就是几百章重复。
-        if (!/page_index=\d+/.test(u) || !/page_count=\d+/.test(u)) {
-            return {error: '签名 URL 里没有 page_index/page_count，无法翻页'};
-        }
+    const PAGE_SIZE = 500, WAVE = 4, MAX_PAGES = 60;
+    // replace 匹配不上是静默 no-op：那样每一波都在取同一页（或服务端默认
+    // 页大小），第 0 页短于预期就被当成"全书就这么多"。对账拿这份当真相，
+    // 半份数据会把几百章报成"平台上没有"，用户照单补传就是几百章重复。
+    if (!/page_index=\d+/.test(u) || !/page_count=\d+/.test(u)) {
+        return {error: '签名 URL 里没有 page_index/page_count，无法翻页'};
+    }
+    const getPage = async (pg, size) => {
         const uu = u.replace(/page_index=\d+/, 'page_index=' + pg)
-                    .replace(/page_count=\d+/, 'page_count=100');
+                    .replace(/page_count=\d+/, 'page_count=' + size);
         let r, j;
         try {
             r = await fetch(uu, {credentials: 'include'});
@@ -2279,34 +2327,146 @@ _FETCH_ITEMS_JS = r"""async (u) => {
                            ' ' + (j.message || '')};
         }
         if (!j || !j.data) return {error: '第' + pg + '页响应无 data 字段'};
-        if (typeof j.data.total === 'number') total = j.data.total;
-        const list = j.data.item_list || [];
-        if (!list.length) break;          // 真的翻完了
-        // 按 item_id 去重再累加：既能拼出全量，也能发现"服务端没理会 page_index、
-        // 每页都返回同一批"这种情况（下面 grew===0 就会停）。
-        let grew = 0;
-        for (const x of list) {
-            if (x.item_id !== undefined && seen.has(x.item_id)) continue;
-            if (x.item_id !== undefined) seen.add(x.item_id);
-            out.push({index: x.index, title: x.title,
-                display_status: x.display_status, timer_time: x.timer_time,
-                create_time: x.create_time, item_id: x.item_id,
-                cant_modify_reason: x.cant_modify_reason});
-            grew++;
+        // 2026-08-28 实测: 本卷总章数在 total_count（任何 page_index/page_count
+        // 都返回它），j.data.total 恒为 null —— 早先只认 total 的写法等于这条
+        // "少了就报错"的守卫从来没生效过。留着 total 兜底以防平台哪天换回去。
+        const tc = typeof j.data.total_count === 'number' ? j.data.total_count
+                 : (typeof j.data.total === 'number' ? j.data.total : null);
+        return {list: j.data.item_list || [], total: tc};
+    };
+    const crawl = async (size) => {
+        const out = [], seen = new Set();
+        let total = null;
+        for (let base = 0; base < MAX_PAGES; base += WAVE) {
+            const pages = await Promise.all(Array.from(
+                {length: WAVE}, (_, i) => getPage(base + i, size)));
+            // 任何一页出错都得整体报错：静默丢一页 = 给半份数据。
+            for (const pgres of pages) if (pgres.error) return {error: pgres.error};
+            // 按 item_id 去重再累加（Promise.all 保序，页内顺序不乱）：既能拼出
+            // 全量，也能发现"服务端没理会 page_index、每页都返回同一批"——那种
+            // 情况下这一波 grew===0，下面就停了，不会空转到 MAX_PAGES。
+            let grew = 0;
+            for (const pgres of pages) {
+                if (pgres.total !== null) total = pgres.total;
+                for (const x of pgres.list) {
+                    if (x.item_id !== undefined && seen.has(x.item_id)) continue;
+                    if (x.item_id !== undefined) seen.add(x.item_id);
+                    out.push({index: x.index, title: x.title,
+                        display_status: x.display_status, timer_time: x.timer_time,
+                        create_time: x.create_time, item_id: x.item_id,
+                        cant_modify_reason: x.cant_modify_reason});
+                    grew++;
+                }
+            }
+            if (!grew) break;                 // 整波都是见过的 = 分页没生效
+            // 只看这一波**最后一页**空不空。这里**不能**用"某页短于 PAGE_SIZE"
+            // 提前收工：平台会把页大小压到请求值以下，那样第 0 页就"短"，整本书
+            // 只取到半份。也不能"波里有空页就停"——中间一个空洞会截掉后面的章。
+            // 多发一波（多是空页）是这里唯一划算的代价。
+            if (!pages[pages.length - 1].list.length) break;
         }
-        if (!grew) break;                 // 整页都是见过的 = 分页没生效，别空转
-        // 这里**不能**用 list.length < 100 提前收工：平台会把页大小压到请求值
-        // 以下（草稿接口实测 page_count>=50 就 code=-100），那样第 0 页就"短"，
-        // 整本书只取到半份。对账拿这份当真相，半份数据会把几百章报成"平台上
-        // 没有"，用户照单补传就是几百章永远移不回去的重复。多发一个空页请求
-        // 是这里唯一划算的代价。
+        // 平台自己报的总章数就是判据: 少一条都不算数。这条守住了才谈得上"准"——
+        // 翻页停在哪、有没有空洞、分页认不认 page_index 全都不必猜，对不上就炸。
+        // 多出来不管（抓取途中刚发布了新章，不是数据丢失）。
+        if (total !== null && out.length < total) {
+            return {error: '章节列表只取到 ' + out.length + '/' + total +
+                           ' 条（分页被平台截断？），拒绝返回半份数据'};
+        }
+        return {items: out};
+    };
+    const res = await crawl(PAGE_SIZE);
+    if (!res.error) return res;
+    // 大页被整体拒绝（平台改了页大小上限）时退回 100 —— 100 是平台一直认的值，
+    // 慢一点也好过"对账整个不能用"。两种页大小都失败才把原始错误抛上去。
+    const fallback = await crawl(100);
+    return fallback.error ? res : fallback;
+}"""
+
+
+# ---------------------------------------------------------------------------
+# 章节列表: 接口版（替代逐页点「下一页」的 DOM 抓取）
+#
+# 2026-08-27 在 1326 章的书上实测: DOM 翻页 47.2 秒（要点 67 次下一页、每次等
+# 表格重渲染），同一批数据走 chapter_list 接口 1.0 秒。接口的每个 item 已经带
+# 齐 DOM 那几列的原料，下面把它翻译成与 _EXTRACT_ALL_JS 完全相同的行结构，
+# 调用方一个字都不用改。
+# ---------------------------------------------------------------------------
+# display_status -> DOM 那一列的中文。只有这两个值在真实书上出现过。
+_DISPLAY_STATUS_TEXT = {DISPLAY_PUBLISHED: "已发布", DISPLAY_PENDING: "待发布"}
+
+# 章节管理页「编辑」按钮的链接形状（2026-08-27 与 DOM 实测逐条比对一致）
+_EDIT_URL_TPL = "/main/writer/{book_id}/publish/{item_id}/?enter_from=modifychapter"
+
+
+def api_items_to_rows(items, book_id):
+    """chapter_list 接口的 item -> _EXTRACT_ALL_JS 的行结构。
+
+    返回 (chapters, last_publish)，与 extract_chapters_from_page 的返回同形:
+      chapters: [{title, chapterNum, editUrl, status, date, time, rowIndex}]
+      last_publish: {date, time, chapter} —— 行里最大的那个时刻，同 DOM 版。
+
+    date/time 取哪个时间戳: 待发布章看 timer_time（排期时刻，改排期要用它），
+    已发布章看 create_time（平台在发布时把它改写成实际发布时刻）。两者都是
+    unix 秒，按本机时区格式化 —— DOM 里那串也是浏览器按本机时区渲染的。
+    """
+    rows, last_pub, last_key = [], None, ""
+    for i, it in enumerate(items):
+        title = it.get("title") or ""
+        ds = it.get("display_status")
+        reason = (it.get("cant_modify_reason") or "").strip()
+        status = _DISPLAY_STATUS_TEXT.get(ds)
+        if status is None:
+            # 没见过的 display_status（审核中/已拒绝之类，手头没有样本）。别猜成
+            # 「已发布」——那会把它拉进各种名单。用平台自己的说法当状态文本，
+            # 修改模式的 "审核中" in status 才有机会命中；同时不给编辑链接。
+            status, editable = (reason or f"未知状态{ds}"), False
+        else:
+            # cant_modify_reason 非空时平台**根本不渲染「编辑」按钮**（2026-08-28
+            # 在完结作品上实测: DOM 的 editUrl 是 None，理由是"完结作品不可修改"）。
+            # 这里照办 —— 凭空拼一个编辑链接会让修改模式从"安全跳过"变成
+            # "导航过去改一章平台明说不让改的章"。
+            editable = not reason
+        ts = it.get("timer_time") if ds == DISPLAY_PENDING else it.get("create_time")
+        try:
+            ts = int(ts or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        if ts > 0:
+            dt = datetime.fromtimestamp(ts)
+            d, t = dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
+        else:
+            d = t = None
+        item_id = it.get("item_id")
+        rows.append({
+            "title": title,
+            "chapterNum": chapter_title_num(title),
+            "editUrl": (_EDIT_URL_TPL.format(book_id=book_id, item_id=item_id)
+                        if editable and item_id and book_id else None),
+            "status": status,
+            "date": d, "time": t,
+            "rowIndex": i,
+        })
+        if d:
+            key = f"{d} {t}"
+            if key > last_key:
+                last_pub, last_key = {"date": d, "time": t, "chapter": title}, key
+    return rows, last_pub
+
+
+# 页面自己发过的已签名 chapter_list URL —— 从 resource timing 里捞，不必额外
+# 挂 request 监听器（调用方拿到的往往已经是导航完成后的页面，监听器挂晚了）。
+# 取最新一条: 用户切卷后 SPA 会带新的 volume_id 再请求一次，旧的那条是别的卷。
+# ponytail: resource timing 缓冲区默认 250 条，实测这页载入 88 条、之后每分钟
+# 才涨 3 条（埋点轮询），撑满要半小时以上；真撑满了也只是捞不到最新那条，被
+# _extract_via_api 的首行校验挡下退回 DOM——慢，但不会错。真遇上再在
+# create_context 里 add_init_script 调大缓冲区。
+_SIGNED_CHAPTER_LIST_JS = r"""() => {
+    let best = null, bestT = -1;
+    for (const e of performance.getEntriesByType('resource')) {
+        if (e.name.indexOf('chapter/chapter_list') < 0) continue;
+        if (e.startTime > bestT) { bestT = e.startTime; best = e.name; }
     }
-    // 平台给了总数就必须对上——宁可报错也不能给半份（这是本文件的一贯原则）。
-    if (total !== null && out.length < total) {
-        return {error: '章节列表只取到 ' + out.length + '/' + total +
-                       ' 条（分页被平台截断？），拒绝返回半份数据'};
-    }
-    return {items: out};
+    return best;
 }"""
 
 
@@ -2371,10 +2531,10 @@ async def fetch_chapter_items(page, book_id):
         if not await goto_with_login_retry(
                 page, CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)):
             raise RuntimeError("打不开章节管理页（登录失效或导航未到达），具体原因见上一条日志")
-        for _ in range(20):
-            await page.wait_for_timeout(500)
+        for _ in range(40):
             if seen_ch:
                 break
+            await page.wait_for_timeout(250)
         if not seen_ch:
             raise RuntimeError("没抓到 chapter_list 请求，页面结构可能已变")
         # volume_list 通常先于 chapter_list 发出，但别赌时序——再宽限几秒。
