@@ -39,7 +39,7 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
 
-      # 6 个测试 import fanqie_gui，需要 tkinter 能 import（不需要显示器，
+      # 部分测试 import fanqie_gui，需要 tkinter 能 import（不需要显示器，
       # 没有任何测试会创建 Tk 窗口，所以不用 xvfb）。Windows 自带 tkinter。
       - name: 安装 tkinter (Linux)
         if: runner.os == 'Linux'
@@ -47,9 +47,9 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # 不装浏览器内核：两个 DOM 夹具测试无内核时会自动 SKIP，
+      # 不装浏览器内核：DOM 夹具测试无内核时会自动 SKIP，
       # 省掉每次约 150MB 下载。要跑它们请手动触发 browser-tests。
-      - name: 回归测试（26 套件）
+      - name: 回归测试
         shell: bash
         run: |
           for f in tests/test_*.py; do

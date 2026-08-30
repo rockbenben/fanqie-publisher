@@ -26,14 +26,14 @@ GUI 和命令行共用 `fanqie_upload.py` 里的同一套核心函数——**同
 
 ## 测试
 
-`tests/` 下共 26 个回归测试，其中 24 个零依赖（不需要浏览器或番茄账号），直接运行即可：
+`tests/` 下的回归测试绝大多数零依赖（不需要浏览器或番茄账号），直接运行即可：
 
 ```bash
 python tests/test_chapter_filter.py     # 单个套件
 for f in tests/test_*.py; do python "$f" || break; done   # 整目录
 ```
 
-另外 2 个（`test_js_blocks_browser.py`、`test_js_blocks_browser2.py`）需要 Playwright 浏览器内核来跑 DOM 夹具，缺内核时自动 SKIP，不影响其余套件。
+例外是 `test_js_blocks_browser.py`、`test_js_blocks_browser2.py`：它们需要 Playwright 浏览器内核来跑 DOM 夹具，缺内核时自动 SKIP，不影响其余套件。
 
 覆盖的几类：
 
@@ -52,16 +52,16 @@ for f in tests/test_*.py; do python "$f" || break; done   # 整目录
 
 | 检查 | 范围 |
 | ---- | ---- |
-| 回归测试 | 26 套件 × （Ubuntu / Windows）×（Python 3.10 / 3.14）= 4 个 job |
+| 回归测试 | 全部套件 × （Ubuntu / Windows）×（Python 3.10 / 3.14）= 4 个 job |
 | 工具自检 | remap / keep_ahead / clean_drafts 的 `--self-check` |
-| 子命令冒烟 | 7 个子命令的 `-h`（argparse 挂了不会有测试报错，但用户第一条命令就跑不通） |
+| 子命令冒烟 | 各子命令的 `-h`（argparse 挂了不会有测试报错，但用户第一条命令就跑不通） |
 | pyflakes | 主程序 + tools + tests |
 
 **为什么矩阵里有 3.10：** README、支持范围表、`run.bat` 的版本检查三处都声称下限是 3.10，
 这个 job 就是那三句话的唯一证据。**为什么有 Windows：** 主要用户双击 `run.bat` 启动，
 路径与编码差异只有它能暴露。
 
-两个需要浏览器内核的 DOM 夹具测试不进每次推送（省掉每次约 150MB 下载），
+需要浏览器内核的 DOM 夹具测试不进每次推送（省掉每次约 150MB 下载），
 要跑在 Actions 页面手动触发 `browser-tests`。
 
 **改动核心逻辑后整目录跑一遍确认全绿。** 尤其是发布路径——这个项目历史上出过「日志说成功、平台实际漏 151 章」的静默故障，那两道防线全靠测试守着。
