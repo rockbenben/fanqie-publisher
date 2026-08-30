@@ -67,6 +67,8 @@ class Stub:
             self.publish_calls.append(num)
             if act[0] == "limit":
                 raise fu.DailyLimitReached(act[1])
+            if act[0] == "boom":
+                raise RuntimeError(act[1])
             return (True, "") if act[0] == "ok" else (False, act[1])
 
         async def draft(page, url, num, title, content, **kw):
@@ -74,6 +76,8 @@ class Stub:
             self.publish_calls.append(num)
             if act[0] == "limit":
                 raise fu.DailyLimitReached(act[1])
+            if act[0] == "boom":
+                raise RuntimeError(act[1])
             return act
 
         async def edit(page, edit_url, num, title, content, **kw):
@@ -183,14 +187,84 @@ check("success 不会变成负数", s_ >= 0, s_)
 creation_invariant("覆盖+对账同章", s_, f_, fl, 3)
 
 st = Stub(publish_script=[])
-s_, f_, fl = run_creation(st, cancel=lambda: True)
+import logging as _lg
+
+
+class _Cap(_lg.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, r):
+        self.lines.append(r.getMessage())
+
+
+_cap = _Cap()
+fu.logger.setLevel(_lg.INFO)
+fu.logger.addHandler(_cap)
+try:
+    s_, f_, fl = run_creation(st, cancel=lambda: True)
+finally:
+    fu.logger.removeHandler(_cap)
 check("取消: 一章都不发", st.publish_calls == [], st.publish_calls)
 check("取消后仍走收尾对账", st.reconciled == [], st.reconciled)
+# 取消不算失败（用户自己按的停止），但必须告诉他从哪接着跑
+# 口径与其余中止路径一致: 剩余章进清单、计入 failed、原因写明是取消
+check("取消: 剩余章记入补传清单", (s_, f_) == (0, 3) and len(fl) == 3, (s_, f_, fl))
+check("取消: 原因写明是用户取消",
+      all("用户取消" in r for _, r in fl), fl)
+creation_invariant("用户取消", s_, f_, fl, 3)
+_cap3 = _Cap()
+fu.logger.addHandler(_cap3)
+try:
+    fu.log_fail_list(fl)
+finally:
+    fu.logger.removeHandler(_cap3)
+check("取消: 清单能压出可粘贴的续跑章号",
+      any("失败章节号: 1-3" in ln for ln in _cap3.lines), _cap3.lines)
+
+# 中途取消：只报没跑过的那些（第1章已发，续跑从第2章起）
+st = Stub(publish_script=[("ok",)])
+_calls = {"n": 0}
+
+
+def _cancel_after_first():
+    _calls["n"] += 1
+    return _calls["n"] > 1          # 第 2 次检查时取消
+
+
+_cap2 = _Cap()
+fu.logger.addHandler(_cap2)
+try:
+    s_, f_, fl = run_creation(st, cancel=_cancel_after_first)
+finally:
+    fu.logger.removeHandler(_cap2)
+check("中途取消: 已发的不进剩余清单",
+      [l for l, _ in fl] == ["第2章 乙", "第3章 丙"], fl)
+check("中途取消: 成功计数保住", s_ == 1, s_)
+creation_invariant("中途取消", s_, f_, fl, 3)
 
 st = Stub(publish_script=[("ok",)] * 3, miss=[2])
 s_, f_, fl = run_creation(st)
 check("对账缺 1 章: 成功回撤、失败+1", (s_, f_) == (2, 1), (s_, f_))
 creation_invariant("对账缺章", s_, f_, fl, 3)
+
+# 原语泄漏非上限异常（浏览器崩溃/页面被关）不得穿透执行器 —— 穿透了就走到入口
+# 的外层 except，汇总与补传清单一起丢掉。日志里 5 次
+# "上传异常: Target page, context or browser has been closed" 全是这么没的账。
+st = Stub(publish_script=[("ok",), ("boom", "Target page, context or browser has been closed")])
+s_, f_, fl = run_creation(st)
+check("原语抛异常不穿透执行器: 正常返回", (s_, f_) == (1, 2), (s_, f_))
+check("异常章带原因入清单", any("未预期异常" in r for _, r in fl), fl)
+check("异常后按不可逆规则停手", st.publish_calls == [1, 2], st.publish_calls)
+check("剩余第3章记入补传清单", any("前方中止" in r for _, r in fl), fl)
+creation_invariant("原语异常", s_, f_, fl, 3)
+
+st = Stub(draft_script=[(True, "d1", ""), ("boom", "browser closed"),
+                        (True, "d3", "")])
+s_, f_, fl = run_creation(st, is_draft=True)
+check("草稿路径同样不穿透", (s_, f_) == (2, 1), (s_, f_))
+creation_invariant("草稿原语异常", s_, f_, fl, 3)
 
 print("== run_edit_batch: 修改路径 ==")
 MATCHED = [(0, {"status": "已发布", "editUrl": "/e1"}, 1, "甲", "一"),

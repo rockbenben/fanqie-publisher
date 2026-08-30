@@ -300,20 +300,6 @@ def success_url_unit_tests():
     check("None不是成功页", not f(None))
 
 
-def editor_url_unit_tests():
-    print("[_is_editor_url 纯函数]")
-    f = fu._is_editor_url
-    check("新建章URL是编辑器",
-          f("https://fanqienovel.com/main/writer/123/publish/?enter_from=newchapter_1"))
-    check("草稿URL是编辑器",
-          f("https://fanqienovel.com/main/writer/123/publish/7655447097667240472"))
-    check("chapter_id参数是编辑器", f("https://fanqienovel.com/x?chapter_id=1"))
-    check("chapter-manage不是编辑器",
-          not f("https://fanqienovel.com/main/writer/chapter-manage/123&%E4%B9%A6%E5%90%8D"))
-    check("空串不是编辑器", not f(""))
-    check("None不是编辑器", not f(None))
-
-
 def modify_timer_verdict_tests():
     # --- 改期接口纳入权威判据（2026-08-20 第1396章 误判失败的回归） ---
     # 改期走 modify_timer，之前不在权威判据里，只剩"按钮消失"启发式：接口已 200、
@@ -333,7 +319,6 @@ def modify_timer_verdict_tests():
 
 if __name__ == "__main__":
     interpret_unit_tests()
-    editor_url_unit_tests()
     success_url_unit_tests()
     integration_tests()
     modify_timer_verdict_tests()

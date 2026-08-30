@@ -95,4 +95,24 @@ check("R5 补传号连续覆盖撞限章+剩余",
       fu.compress_chapter_nums(nums) == "79-85",
       fu.compress_chapter_nums(nums))
 
+# 6) 每月 ≠ 每日：各条中止分支的措辞与补传清单原因都得跟着变
+#    （is_monthly_limit 早就有，却只有 tools/remap 用；主路径一律硬写"每日"，
+#     于是 2026-08-06/08-10/08-13 三次撞的其实是每月上限，日志却让人明天再来）
+check("每月上限识别",
+      fu.limit_label("提交字数超出每月上限") == "每月字数上限")
+check("每日上限识别",
+      fu.limit_label("已到达当日发布字数上限") == "每日字数上限")
+check("异常对象也能判",
+      fu.limit_label(fu.DailyLimitReached(
+          "当日发布字数已达上限: 提交字数超出每月上限")) == "每月字数上限")
+check("空/None 落到每日（保守，不误报月度硬顶）",
+      fu.limit_label(None) == "每日字数上限"
+      and fu.limit_label("") == "每日字数上限")
+
+fl = []
+fu.record_unprocessed(fl, [(9, "甲"), (10, "乙")],
+                      reason=f"{fu.limit_label('超出每月上限')}，未处理")
+check("清单原因跟着措辞走",
+      all(r == "每月字数上限，未处理" for _l, r in fl), str(fl))
+
 print(f"\nALL PASSED ({PASS} 断言)")

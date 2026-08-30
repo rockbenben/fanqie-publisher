@@ -553,9 +553,18 @@ def compress_chapter_nums(nums) -> str:
     return out
 
 
-def log_fail_list(fail_list):
-    """批量结束时打印失败章节及原因清单（CLI/GUI 上传与修改共用）。
+# 连续同一原因的条目超过这么多章就折成一行。中止整批时剩余章节会被逐章记入
+# 清单（要的是补传章节号），但逐条打出来就是几千行同一句"前方中止，未处理"——
+# 真正的失败原因被冲到屏幕外了。折叠只影响显示，记账与末尾的章节号压缩不变。
+_FAIL_RUN_COLLAPSE = 3
 
+
+def log_fail_list(fail_list):
+    """批量结束时打印失败章节及原因清单（上传 / 修改 / 改期共用，CLI+GUI）。
+
+    连续同一原因的条目会折成一行（见 _FAIL_RUN_COLLAPSE）——中止整批时剩余
+    章节是逐章记进来的，不折叠就是几千行同一句"前方中止，未处理"，唯一有
+    信息量的那条真实原因反而被冲出屏幕。
     末尾追加按筛选语法压缩的失败章节号（如 "79-81,83-114"）。同一串号在两个
     入口都能直接用: GUI 粘进「按章节号筛选」，CLI 传给 --chapters。
     单章会输出成 "83-83" 而不是 "83"：裸数字在 GUI 会跟 ≤/≥ 下拉框拼成阈值，
@@ -564,8 +573,20 @@ def log_fail_list(fail_list):
     if not fail_list:
         return
     logger.info("  失败章节及原因:")
-    for label, reason in fail_list:
-        logger.info(f"    - {label}: {reason}")
+    i, n = 0, len(fail_list)
+    while i < n:
+        reason = fail_list[i][1]
+        j = i
+        while j + 1 < n and fail_list[j + 1][1] == reason:
+            j += 1
+        run = j - i + 1
+        if run > _FAIL_RUN_COLLAPSE:
+            logger.info(f"    - {fail_list[i][0]} … {fail_list[j][0]}"
+                        f"（共 {run} 章）: {reason}")
+        else:
+            for label, r in fail_list[i:j + 1]:
+                logger.info(f"    - {label}: {r}")
+        i = j + 1
     nums = []
     for label, _ in fail_list:
         m = re.match(r"第(\d+)章", label)
@@ -581,11 +602,13 @@ def record_unprocessed(fail_list, remaining, reason="每日字数上限，未处
     """中止整批后，把剩余未处理章节如实记入失败清单（不静默丢弃）。
 
     remaining: 可迭代的 (章节号, 标题) 二元组，章节号可为 None/空字符串。
-    reason: 记入清单的原因文案（每日上限 / 流程异常中止等）。
+    reason: 记入清单的原因文案（字数上限 / 流程异常中止 / 用户取消等）。
+            撞上限时用 limit_label 生成，别一律写"每日"——每月额度耗尽时
+            "明天接着发"是错的。
     返回追加的条数，供上层据此累加 failed 计数，使「成功+失败=总数」对得上。
 
     这些条目带"第N章"标签，会被 log_fail_list 末尾的章节号压缩收进去，
-    用户明天粘进 GUI 的「按章节号筛选」或 CLI 的 --chapters 就能接着发——
+    用户把那串号粘进 GUI 的「按章节号筛选」或 CLI 的 --chapters 就能接着发——
     这正是"记录剩余"的落点。
     """
     n = 0
@@ -610,18 +633,6 @@ _SUBMIT_CONFIRM_GRACE_S = 5.0  # 按钮消失后等待「提交确认」信号�
                                # 页面导航离开编辑器）的宽限窗
 
 
-def _is_editor_url(url) -> bool:
-    """判断 URL 是否仍是章节编辑器页。
-
-    编辑器页 URL 实测均含 /publish（新建章:
-    /main/writer/{book_id}/publish/?enter_from=newchapter_1；
-    草稿/编辑: .../publish/<id>），编辑已有章还可能带 chapter_id 参数。
-    chapter-manage 列表页两个特征都没有。
-    """
-    u = url or ""
-    return "/publish" in u or "chapter_id" in u
-
-
 def _is_publish_success_url(url) -> bool:
     """判断 URL 是否是「提交成功后应落到」的页面：章节管理页。
 
@@ -629,6 +640,10 @@ def _is_publish_success_url(url) -> bool:
     /login 也离开了编辑器，若把它当成功就又制造静默漏章（正是本次要消灭的
     bug 类）。故成功导航必须是显式的 chapter-manage，掉登录页/错误页一律
     不算成功、按未提交处理触发重试。
+
+    曾经旁边还有个 _is_editor_url（"URL 还在 /publish 就算编辑器页"），
+    2026-08-30 复查时已无任何调用方——它的语义正是上面那段警告要防的
+    "任意非编辑器页都算成功"，留着只会被人顺手捡起来重演漏章，故删除。
     """
     return "chapter-manage" in (url or "")
 
@@ -1204,7 +1219,7 @@ async def settle_page(page, timeout=None):
     每次白等 30 秒。真正的就绪判据是调用方后面的 wait_for_selector / 提取 JS
     自带的表格等待，所以这里超时不是错误，是常态。
 
-    六处调用点原来各写一遍这个 try/except，改一次上限要改六处。
+    各调用点原来各写一遍这个 try/except，改一次上限就得挨个改。
     """
     try:
         await page.wait_for_load_state(
@@ -1387,7 +1402,13 @@ async def wait_for_editor_ready(page, timeout=None, draft_action="放弃"):
     """
     if timeout is None:
         timeout = _browser_timeout
-    await page.wait_for_load_state("networkidle", timeout=timeout)
+    # networkidle 只当"碰巧静下来就用上"的加速，静不下来不是错误（settle_page
+    # 的注释里写了原因: 番茄的埋点/轮询让作家后台永远不进 networkidle）。
+    # 这里原来是硬等且超时即抛——2026-08-30 第1385章就是这么挂的: 前一次尝试
+    # 留下弹窗后页面一直有请求，两次重试都在这一行超时（15000ms），
+    # 连"正文字数"都没打出来，最后 3710 章全部未处理。
+    # 真正的就绪判据是下面两个选择器。
+    await settle_page(page)
     # 等待 ProseMirror 编辑器出现
     await page.wait_for_selector(".ProseMirror", timeout=timeout)
     # 等待标题输入框出现
@@ -2563,6 +2584,17 @@ def is_monthly_limit(msg):
     return bool(_MONTHLY_LIMIT_RE.search(str(msg or "")))
 
 
+def limit_label(msg) -> str:
+    """撞的是「每月」还是「每日」上限——两者的下一步完全不同，别混着说。
+
+    每日: 常态，明天接着跑。每月: 本月剩下的日子一章都发不动，"明天再来"
+    是错的，得当场算余量够不够撑到下月（tools/remap 据此提醒降速）。
+    is_monthly_limit 早就在了，却只有 remap 用——三条中止分支一律硬写"每日"，
+    于是 2026-08-06/08-10/08-13 三次撞的其实是**每月**上限，日志却说每日。
+    """
+    return "每月字数上限" if is_monthly_limit(msg) else "每日字数上限"
+
+
 # 新章确认: 只拉列表第一页（新建章必是最新的），1 个请求就够
 # 必须区分「平台确实没这章」和「这次问不出来」: 接口 429 / code=-100
 # （平台真会返回"服务器开小差了"）时 j.data 为空，若当成"没有"就会判定
@@ -3179,8 +3211,8 @@ async def cmd_login():
 def record_rest_unprocessed(fail_list, parsed, start, stop, **kw):
     """中止整批时把 [start, stop) 的剩余章节记入补传清单，返回失败增量。
 
-    CLI 和 GUI 的中止分支各有 5 条（每日上限 / 提交后查不到 / 不可逆失败 /
-    连续失败熔断 / 页面已死），原来两边各写一份这个生成器表达式。漏掉一处的
+    CLI 和 GUI 的每条中止分支（每日上限、提交后查不到、不可逆失败、
+    连续失败熔断、页面已死、用户取消 等）原来两边各写一份这个生成器表达式。漏掉一处的
     表现是汇总里"成功 + 失败 < 总数"，而且补传清单缺这几章——创建路径缺章
     补不回原位（番茄目录按追加序排，后补的只会吊在书尾）。
     """
@@ -3204,10 +3236,15 @@ async def run_creation_batch(page, parsed, new_chapter_url, *, book_id,
       · 发布类逐章确认新章真落地；确认不到或提交失败 → 中止整批——新建只能
         追加到书尾，跳过失败继续发会把缺口永久卡在中段，停在队尾才是无害的。
       · 存草稿保留连续 3 次熔断（草稿丢失不影响正文顺序），批末拿草稿箱对账。
-      · 撞每日字数上限 → 中止整批，本章与剩余章节全部记入补传清单。
+      · 撞字数上限（每日或每月，措辞走 limit_label）→ 中止整批，本章与
+        剩余章节全部记入补传清单。
+      · 原语泄漏的意外异常（浏览器崩溃/页面被关）在循环里兜住，按不可逆
+        规则处理——绝不让它穿透执行器，否则汇总与补传清单一起丢。
       · 收尾统一走 reconcile_batch_auto: 日志记成功 ≠ 平台上真有。
 
     cancel_check(): 返回 True 则在章节边界停下（GUI 的「停止」按钮；CLI 不传）。
+        停下时剩余章节同样记入 fail_list（原因写明是取消）并计入 failed，
+        口径与其余中止路径一致——补传章节号就是靠它生成的。
     progress_cb(done, total): 每章之后与各中止点回报进度（GUI 进度条；CLI 不传）。
     err_tag_fn(i): 第 i 章失败截图的文件名标签。
     返回 (success, failed, fail_list)。
@@ -3256,7 +3293,14 @@ async def run_creation_batch(page, parsed, new_chapter_url, *, book_id,
 
     for i in range(total):
         if cancel_check and cancel_check():
+            # 与其余中止路径同款记账。取消确实不是"失败"，但这里的
+            # fail_list 本质是「没做成的都在这」——log_fail_list 末尾那行压缩
+            # 章节号（可直接粘回筛选框续跑）就是靠它生成的，原因文案已写明
+            # 是取消。曾短暂改成"只打日志不记账"，结果 run_edit_batch 主循环
+            # 与它自己的批末二次尝试对同一次点击给出两种数，是更糟的分叉。
             logger.info("用户取消，中止批次。")
+            failed += record_rest_unprocessed(
+                fail_list, parsed, i, total, reason="用户取消，未处理")
             break
 
         chapter_num, title, content = parsed[i]
@@ -3283,20 +3327,38 @@ async def run_creation_batch(page, parsed, new_chapter_url, *, book_id,
                 # 重试与失败截图都在原语里做过了，这里只记账
                 fail_list.append((f"{num_str}{title}", err))
         except DailyLimitReached as e:
-            # 每日字数上限 = 平台当日发布额度已耗尽。继续提交后续章节
-            # 只会重复撞限或触发别的拦截（实测续发会产生额外错误），
-            # 故中止整批；本章与所有剩余章节如实记入清单，留待明天接着发。
-            logger.warning(f"  达每日字数上限（{e}），中止整批")
+            # 字数额度耗尽。继续提交后续章节只会重复撞限或触发别的拦截
+            # （实测续发会产生额外错误），故中止整批；本章与所有剩余章节
+            # 如实记入清单。**每日**明天接着发，**每月**得等下月——所以
+            # 措辞走 limit_label，别一律说成"每日"（见那里的注释）。
+            lab = limit_label(e)
+            logger.warning(f"  达{lab}（{e}），中止整批")
+            if lab.startswith("每月"):
+                logger.warning("  这是**每月**额度耗尽，明天再跑同样发不动；"
+                               "请先核对余量够不够撑到下月（tools/remap 会算）")
             fail_list.append((f"{num_str}{title}", str(e)))
             daily_limit = True
+        except Exception as e:
+            # 兜底浏览器崩溃/页面被关等意外——原语正常不会漏非上限异常，但它
+            # 重试间隔的 wait_for_timeout 在页面已死时就会抛，而这里原先只接
+            # DailyLimitReached：异常穿透整个执行器 → 入口的外层 except →
+            # **汇总与补传清单一起丢掉**。日志里 5 次
+            # "上传异常: Target page, context or browser has been closed"
+            # 全是这么没的账，用户根本不知道哪些章没发。
+            # run_edit_batch 早有这道兜底，创建路径漏了——而创建缺章补不回原位。
+            # ok 仍为 False，下面的失败分支会照常记账、按不可逆规则中止，并把
+            # 剩余章记入补传清单。
+            logger.error(f"  本章发生未预期异常: {e}")
+            fail_list.append((f"{num_str}{title}", f"未预期异常: {e}"))
 
         if daily_limit:
             failed += 1
             # 中止整批：把所有剩余未处理章节如实记入清单（不是静默丢弃）。
-            rest = record_rest_unprocessed(fail_list, parsed, i + 1, total)
+            rest = record_rest_unprocessed(fail_list, parsed, i + 1, total,
+                                           reason=f"{lab}，未处理")
             failed += rest
             if rest:
-                logger.warning(f"  剩余 {rest} 章未处理（每日字数上限），已记入清单")
+                logger.warning(f"  剩余 {rest} 章未处理（{lab}），已记入清单")
             _progress(total, total)
             break
         elif ok:
@@ -3427,6 +3489,9 @@ async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
     原因不明失败才熔断；「标题重复」是本地重新编号的临时冲突，留待批末二次
     尝试（此时占用旧标题的章多已更新、冲突自然解除）。
 
+    每条中止路径（熔断 / 字数上限 / 页面已死 / 用户取消）都把剩余章记入
+    fail_list 并计入 failed，口径与主循环、批末二次尝试三处一致。
+
     matched: [(local_idx, plat_ch, ch_num, title, content), ...]
     返回 (success, failed, skipped, fail_list)。
     """
@@ -3444,7 +3509,7 @@ async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
 
         必须记入清单 —— 只累加 skipped 的话，这些章不会出现在 log_fail_list
         末尾那行压缩章节号里，用户就拿不到可直接粘贴续跑的补传清单
-        （创建路径的五条中止分支都是这么做的）。
+        （创建路径的每条中止分支都是这么做的）。
         """
         rest = total - (i + 1)
         logger.error(
@@ -3458,7 +3523,11 @@ async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
 
     for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched):
         if cancel_check and cancel_check():
+            # 记账口径与批末二次尝试的取消分支保持一致（见那里）
             logger.info("用户取消，中止批次。")
+            failed += record_unprocessed(
+                fail_list, ((m[2], m[3]) for m in matched[i:]),
+                reason="用户取消，未处理")
             break
 
         logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
@@ -3506,14 +3575,17 @@ async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
             # 每日字数上限 = 平台当日额度已耗尽。继续提交后续章节只会重复
             # 撞限或触发别的拦截（实测续发产生额外错误），故中止整批；
             # 本章与所有剩余章节（含批末待二次尝试的）如实记入清单。
-            logger.warning(f"  达每日字数上限（{e}），中止整批")
+            lab = limit_label(e)
+            logger.warning(f"  达{lab}（{e}），中止整批")
             fail_list.append((f"第{ch_num}章 {title}", str(e)))
             failed += 1
             # 剩余主循环章节 + 批末待二次尝试的章节都记为未处理。
             failed += record_unprocessed(
-                fail_list, ((m[2], m[3]) for m in matched[i + 1:]))
+                fail_list, ((m[2], m[3]) for m in matched[i + 1:]),
+                reason=f"{lab}，未处理")
             failed += record_unprocessed(
-                fail_list, ((d[0], d[1]) for d in dup_pending))
+                fail_list, ((d[0], d[1]) for d in dup_pending),
+                reason=f"{lab}，未处理")
             dup_pending = []
             rest = total - (i + 1)
             if rest:
@@ -3580,11 +3652,13 @@ async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
             except DailyLimitReached as e:
                 # 二次尝试阶段撞每日上限：与主循环一致，中止整批，
                 # 本条与剩余二次条目如实记入清单。
-                logger.warning(f"  达每日字数上限（{e}），中止二次尝试")
+                lab = limit_label(e)
+                logger.warning(f"  达{lab}（{e}），中止二次尝试")
                 fail_list.append((f"第{ch_num}章 {title}", str(e)))
                 failed += 1
                 failed += record_unprocessed(
-                    fail_list, ((d[0], d[1]) for d in dup_pending[k + 1:]))
+                    fail_list, ((d[0], d[1]) for d in dup_pending[k + 1:]),
+                    reason=f"{lab}，未处理")
                 break
             except Exception as e:
                 logger.error(f"  二次尝试异常: {e}")
@@ -3890,6 +3964,10 @@ async def publish_one_chapter(page, new_chapter_url, chapter_num, title, content
     返回 (是否成功, 最后一次错误信息)。DailyLimitReached 直接向上抛——
     本章重试无意义（字数不会变），该由上层中止整批并记录剩余章节。
     """
+    # 别再抬这个次数: 翻过两份日志共 225 段重试，第 2 次救回 151 段、第 3 次
+    # 救回 21 段，**没有一段活到第 4 次**（第1385章 2026-07-24 那次正是第 3 次
+    # 成的）。剩下 53 段的终局原因是错别字/重复内容、浏览器已关这类确定性失败，
+    # 多试 7 次只是每章白烧 5 分钟。真要调，config.json 的 max_retries 就是旋钮。
     last_err = ""
     for attempt in range(1, max_retries + 2):
         try:
@@ -4145,9 +4223,11 @@ async def reschedule_on_manage_page(
         failed += f
 
     if remaining:
-        for title in remaining:
-            logger.error(f"未处理: {title}")
+        # 走 log_fail_list 而不是逐条 error：它会把同因条目折叠成一行，并在
+        # 末尾给出可直接粘贴的章节号。原来 609 章的改期批次一中止就刷几百行
+        # "未处理: xxx"，还得自己从标题里抠章号才知道从哪接着改。
         failed += len(remaining)
+        log_fail_list([(t, "未处理") for t in remaining])
 
     return success, failed
 

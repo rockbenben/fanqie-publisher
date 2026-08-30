@@ -3325,6 +3325,11 @@ class FanqieGUI:
 
     def _upload_done(self, success, failed):
         auto = self._auto_run_pending
+        # 必须在 _set_uploading(False) 之前取——那里会把标志清掉。
+        # 用户主动点「停止」时，剩余章节在执行器里按"用户取消，未处理"记进了
+        # 失败清单（口径与其余中止路径一致，续跑章号才生成得出来），但对着
+        # 用户不能叫"失败 3269 章"：他自己按的停止键。
+        cancelled = self._cancel_requested
         self._auto_run_pending = False
         self._remove_log_handler()
         # 先清缓存再切换上传状态，使 _set_uploading 在缓存为空时正确禁用按钮
@@ -3353,16 +3358,21 @@ class FanqieGUI:
                 pass
 
         if success >= 0:
+            word = "未处理" if cancelled else "失败"
             if auto:
-                logger.info(f"[定时] 操作完成：成功 {success} 章，失败 {failed} 章")
+                logger.info(f"[定时] {'已停止' if cancelled else '操作完成'}："
+                            f"成功 {success} 章，{word} {failed} 章")
                 self.lbl_timer_status.configure(
-                    text=f"✅ 定时执行完成 · 成功 {success} 失败 {failed}",
+                    text=(f"{'⏹ 已停止' if cancelled else '✅ 定时执行完成'}"
+                          f" · 成功 {success} {word} {failed}"),
                     foreground="green")
             else:
+                title = "已停止" if cancelled else {
+                    "edit": "修改完成", "reschedule": "排期修改完成"}.get(
+                        self.mode_var.get(), "上传完成")
+                tail = "，续跑章节号见运行日志" if cancelled and failed else ""
                 messagebox.showinfo(
-                    {"edit": "修改完成", "reschedule": "排期修改完成"}.get(
-                        self.mode_var.get(), "上传完成"),
-                    f"成功 {success} 章，失败 {failed} 章")
+                    title, f"成功 {success} 章，{word} {failed} 章{tail}")
         elif auto:
             # success < 0 表示运行期异常
             self.lbl_timer_status.configure(
