@@ -1646,9 +1646,11 @@ class FanqieGUI:
         else:
             self._hide_volumes()
 
-        # 修改内容/修改排期模式: 走专用的章节列表获取（同时获取上次发布信息）
-        if self.mode_var.get() in ("edit", "reschedule"):
-            self.btn_upload.configure(state="disabled")
+        # 需要整份平台章节表的模式走章节表抓取（它顺带带回队尾时刻）；
+        # 其余模式只看首页拿「队列排到哪天」
+        if self._needs_chapter_list():
+            if self.mode_var.get() in ("edit", "reschedule"):
+                self.btn_upload.configure(state="disabled")
             self._fetch_platform_chapters_for_edit()
         elif book_id in self._last_publish_cache:
             # 有缓存直接用（_apply_last_publish 会通过 date_var trace 触发预览刷新）
@@ -1727,7 +1729,25 @@ class FanqieGUI:
             self.lbl_last_publish.configure(
                 text="暂无发布记录", foreground=CLR_INK_SOFT)
 
-    def _apply_last_publish(self, info):
+    @staticmethod
+    def _last_published(chapters):
+        """平台章节表里最后一章**已发布**的 {date, time, chapter}；没有则 None。
+
+        与 api_items_to_rows 的 last_publish 同形，但只看已发布章——修改排期
+        要挪的就是待发布章，起点得接在没被挪的那些后面。
+        """
+        best, best_key = None, ""
+        for c in chapters:
+            d = c.get("date")
+            if not d or "已发布" not in (c.get("status") or ""):
+                continue
+            key = f"{d} {c.get('time') or ''}"
+            if key > best_key:
+                best, best_key = {"date": d, "time": c.get("time"),
+                                  "chapter": c.get("title", "")}, key
+        return best
+
+    def _apply_last_publish(self, info, label="队列排到"):
         """将「队列排到哪天」显示到 UI 并自动建议次日为起始日期。
 
         取的是章节表里的**最大时间**，不过滤状态——包含待发布章，所以它是
@@ -1746,7 +1766,7 @@ class FanqieGUI:
             self.lbl_last_publish.configure(text="暂无发布记录", foreground=CLR_INK_SOFT)
             return
         chapter = info.get("chapter", "")
-        label = f"队列排到: {date_str} {time_str}"
+        label = f"{label}: {date_str} {time_str}"
         if chapter:
             label += f" ({chapter})"
         self.lbl_last_publish.configure(text=label, foreground=CLR_SCHED_TX)
@@ -1942,7 +1962,10 @@ class FanqieGUI:
                         chs, lp = await extract_chapters_from_page(
                             page, book_id, on_progress=on_page_progress)
                         all_chapters.extend(chs)
-                        if lp and not last_pub:
+                        # 队尾要取各卷里最晚的：只留第一卷的话，「队列排到」
+                        # 标签和起始日期就停在第一卷末尾，后面卷排到哪看不见
+                        if lp and (not last_pub or f"{lp['date']} {lp['time']}"
+                                   > f"{last_pub['date']} {last_pub['time']}"):
                             last_pub = lp
                     chapters = all_chapters
                 else:
@@ -2040,11 +2063,24 @@ class FanqieGUI:
             return
 
         self._platform_chapters_cache[self._chapter_cache_key(book_id)] = chapters
-        # 缓存上次发布信息（来自同一浏览器会话）
-        if last_pub and book_id not in self._last_publish_cache:
+        # 缓存上次发布信息（来自同一浏览器会话；新的一份更准，直接盖）
+        if last_pub:
             self._last_publish_cache[book_id] = last_pub
-        self.lbl_last_publish.configure(
-            text=f"已索引 {len(chapters)} 个章节", foreground=CLR_SCHED_TX)
+        lp = self._last_publish_cache.get(book_id)
+        mode = self.mode_var.get()
+        if mode == "reschedule":
+            # 修改排期挪的正是待发布章，起始日期不能接在它们（队尾）后面，
+            # 要接在最后一章**已发布**之后。此前这条路从不碰起始日期，
+            # 框里一直是启动时的「明天」或定时发布模式留下的旧值
+            lp = self._last_published(chapters)
+        if mode == "edit" or not lp:
+            self.lbl_last_publish.configure(
+                text=f"已索引 {len(chapters)} 个章节", foreground=CLR_SCHED_TX)
+        else:
+            # 定时发布（续排）也走这条抓取：标签和起始日期要像 _fetch_last_publish
+            # 那样给出「队列排到哪天」，否则勾了续排就只剩一句「已索引 N 章」
+            self._apply_last_publish(
+                lp, label="最后发布" if mode == "reschedule" else "队列排到")
         # 载入完成，恢复上传按钮
         if not self.uploading and self.mode_var.get() in ("edit", "reschedule"):
             self.btn_upload.configure(state="normal")
@@ -3001,14 +3037,15 @@ class FanqieGUI:
         if not has_book:
             issues.append("尚未选择作品")
         mode = self.mode_var.get()
-        if mode in ("edit", "reschedule"):
-            # 修改/排期模式依赖平台章节列表是否已加载完成
+        if self._needs_chapter_list():
+            # 修改/排期/续排都依赖平台章节列表是否已加载完成。到点执行时缓存
+            # 为空，_on_upload 只会发起抓取并 return，这次定时就白等了
             ck = self._chapter_cache_key(self.books[idx]["bookId"]) if has_book else None
             if not (ck and ck in self._platform_chapters_cache):
                 issues.append("平台章节列表尚未加载完成（请等待加载或重选作品）")
             elif mode == "edit" and not self._matched_edit:
                 issues.append("没有匹配到可修改的章节")
-        elif not self.files:
+        if mode not in ("edit", "reschedule") and not self.files:
             # 上传类模式需要本地章节文件
             issues.append("尚未选择章节文件夹或无可用章节")
         return issues
@@ -3108,6 +3145,10 @@ class FanqieGUI:
                 logger.info("[定时] 目录刷新完成。")
             except Exception as e:
                 logger.warning(f"[定时] 目录刷新失败: {e}")
+            # 平台章节表缺着（启动时抓失败/登录晚于选作品）就趁这一分钟补上，
+            # 否则到点 _on_upload 只发起抓取就 return，这次定时白等
+            if self._needs_chapter_list() and not self._ensure_platform_chapters():
+                logger.info("[定时] 平台章节列表缺失，触发前补抓…")
         # 目标时刻就在上方输入框里，状态行只报倒计时——重复写一遍日期会把这行
         # 撑到装不下、末尾被裁
         prefix = "🔄 已刷新目录 ｜ " if self._timer_prerefresh_done else ""
@@ -3351,11 +3392,12 @@ class FanqieGUI:
         self._set_uploading(False)
 
         # 缓存刚被清掉，两种模式都得重拉，只是重拉的东西不同:
-        #   修改/排期 —— 要平台章节列表，否则切筛选器时 _refresh_edit_preview
-        #                拿不到数据会把 _matched_edit 置空；
+        #   修改/排期/续排 —— 要平台章节列表，否则切筛选器时 _refresh_edit_preview
+        #                拿不到数据会把 _matched_edit 置空、续排点「开始上传」
+        #                又得先抓一遍；
         #   新建类   —— 要「队列排到哪天」。刚把队列往后推了一截，不重取的话
         #                标签和起始日期还停在推之前，下一批照它填就插队了。
-        if self.mode_var.get() in ("edit", "reschedule"):
+        if self._needs_chapter_list():
             self._fetch_platform_chapters_for_edit()
         else:
             _idx = self.cmb_book.current()
@@ -3673,6 +3715,18 @@ class FanqieGUI:
         if self.autocont_var.get():
             self._ensure_platform_chapters()
         self._refresh_preview()
+
+    def _needs_chapter_list(self) -> bool:
+        """选作品 / 发完一批后是否该直接拉整份平台章节表。
+
+        修改/排期本来就靠它；定时发布勾了「接着上次往后排」也靠它算起点和
+        范围。此前续排只在用户手点勾选框或点「开始上传」时才去拉——勾选状态
+        从配置恢复的启动路径两者都不经过，于是启动抓了一次（队尾日期），
+        点「开始上传」又抓一次（章节表），用户被要求再点一次。
+        """
+        mode = self.mode_var.get()
+        return mode in ("edit", "reschedule") or (
+            mode == "schedule" and bool(self.autocont_var.get()))
 
     def _ensure_platform_chapters(self):
         """平台章节缓存没有就发起一次抓取；已有则 no-op。
