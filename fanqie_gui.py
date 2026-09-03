@@ -38,7 +38,7 @@ try:
         wait_for_editor_ready,
         run_creation_batch, run_edit_batch,
         extract_chapters_from_page, match_chapters,
-        reschedule_on_manage_page, detect_volumes, select_volume,
+        reschedule_on_manage_page, build_schedule_map, detect_volumes, select_volume,
         settle_page,
         AUTH_FILE, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
         CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL, CONFIG_FILE, GUI_STATE_FILE,
@@ -3572,16 +3572,11 @@ class FanqieGUI:
                          "当前的章节号筛选把待发布章节都排除了，放宽后再试。")
             return
 
-        # 计算排期并构建 schedule_map
+        # 计算排期并构建 schedule_map（排期未变的章不进 map）
         schedule = compute_schedule(
             len(platform_chapters), date_str, time_str, per_day)
-        schedule_map = {}
-        dup_titles = []
-        for i, ch in enumerate(platform_chapters):
-            title = ch.get("title", "")
-            if title in schedule_map:
-                dup_titles.append(title)
-            schedule_map[title] = schedule[i]
+        schedule_map, dup_titles, unchanged, order = build_schedule_map(
+            platform_chapters, schedule)
         if dup_titles:
             names = "、".join(dict.fromkeys(dup_titles))  # 去重保序
             # 无人值守(定时)模式下同名章节会导致排期被覆盖、错配，直接中止本次
@@ -3595,9 +3590,16 @@ class FanqieGUI:
                 "warning", "同名章节",
                 f"存在同名章节: {names}\n同名章节的排期可能不准确，建议先在平台修改章节标题。")
 
-        count = len(platform_chapters)
+        count = len(schedule_map)
+        if not count:
+            self._notify("info", "排期无变化",
+                         f"{len(platform_chapters)} 个待发布章节的排期"
+                         f"与平台现有一致，无需修改。")
+            return
         msg = (f"即将修改「{book_name}」{count} 个待发布章节的排期\n"
                f"排期: {schedule[0][0]} ~ {schedule[-1][0]}")
+        if unchanged:
+            msg += f"\n另有 {unchanged} 章排期未变，跳过"
         if not self._ask_yes_no("确认修改排期", msg):
             return
 
@@ -3630,6 +3632,7 @@ class FanqieGUI:
                             0, self._update_progress, done, total),
                         volume_text=vol,
                         volume_texts=all_vol_names,
+                        order=order,
                     )
 
                     await save_auth(context)

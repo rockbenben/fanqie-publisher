@@ -4354,6 +4354,97 @@ _CLICK_CLOCK_ICON_JS = r"""(targetTitle) => {
                     }""".replace("ICON_PICK", _CLOCK_ICON_PICK_JS)
 
 
+def build_schedule_map(chapters, schedule):
+    """按章配排期，返回 ({标题: (date, time)}, 同名标题列表, 排期未变的章数, 处理顺序)。
+
+    排期和平台上现有的一模一样（date/time 都同）就不进 map：改一章就是一次
+    提交，续排批次里大半章本来就原地不动，白点几百次不说，还多几百次撞
+    "每日上限"toast 的机会。同名判定看全部章节（含被跳过的）：改期在管理页
+    按标题找行，同名章哪怕只剩一章要改，也可能点到另一章的时钟。
+
+    处理顺序 'asc'=旧→新、'desc'=新→旧（管理页本来的顺序）。平台按**目标日**
+    累计字数设上限：一天里"旧占位还没搬走 + 新的已搬进来"就会被拒——2026-09-04
+    实证，整体提前一天、新→旧处理，每天首槽章（第 12 章）全报"提交字数超出每日
+    上限"，改期接口本身并不消耗当日额度。排期整体提前要先把目标日的旧占位搬走，
+    即旧→新；推后则反之。
+
+    CLI 与 GUI 原各抄一份这个循环，漏改一边行为就不一样。
+    """
+    smap, dups, unchanged, seen = {}, [], 0, set()
+    earlier = later = 0
+    for ch, (d, t) in zip(chapters, schedule):
+        title = ch.get("title", "")
+        if title in seen:
+            dups.append(title)
+        seen.add(title)
+        old = (ch.get("date"), ch.get("time"))
+        if old == (d, t):
+            unchanged += 1
+            continue
+        smap[title] = (d, t)
+        if old[0] and old[1]:
+            if (d, t) < old:
+                earlier += 1
+            else:
+                later += 1
+    if earlier and later:
+        # ponytail: 有提前也有推后时只能顾多数；少数方向可能撞上限、记为失败，
+        # 重跑一次即可补上。真要一次到位得按方向分两轮扫。
+        logger.warning(f"排期提前 {earlier} 章、推后 {later} 章，按多数方向处理；"
+                       "少数方向可能撞每日上限，重跑一次即可补上")
+    return smap, dups, unchanged, ("asc" if earlier > later else "desc")
+
+
+async def _flip_page(page, btn) -> bool:
+    """点一个翻页控件，等表格首格变化；9 秒没变返回 False（翻页卡住/跨页首格同名）。"""
+    first_cell = "() => document.querySelector('tr td')?.textContent?.trim() || ''"
+    before = await page.evaluate(first_cell)
+    await btn.click()
+    for _ in range(30):
+        await page.wait_for_timeout(300)
+        cur = await page.evaluate(first_cell)
+        if cur and cur != before:
+            return True
+    return False
+
+
+async def _goto_last_page(page) -> None:
+    """跳到章节表最后一页（旧→新顺序从这里倒着翻）。
+
+    先点分页条最大的页码（DOM 抓取那段 JS 早就靠它数总页数），若分页条没有页码
+    就一路点「下一页」到 disabled；单页表两者都是空操作，一次都不点。
+    """
+    nums = page.locator("li.arco-pagination-item", has_text=re.compile(r"^\s*\d+\s*$"))
+    if await nums.count():
+        last = nums.last
+        if "arco-pagination-item-active" not in (await last.get_attribute("class") or ""):
+            await _flip_page(page, last)
+    nxt = page.locator("li.arco-pagination-item-next:not(.arco-pagination-item-disabled)")
+    for _ in range(500):
+        if await nxt.count() == 0 or not await _flip_page(page, nxt):
+            break
+
+
+async def _dismiss_resched_dialog(page) -> bool:
+    """关掉残留的「修改定时」对话框，并确认它真的关了。
+
+    Arco Modal 默认响应 Escape；只在对话框还开着时才按（没弹窗时裸按 Escape
+    会关掉别的东西，见 escape-closes-publish-modal 的教训），按完要等
+    「确认修改」按钮消失才算数——键盘操作不验证生效等于没做。
+    """
+    btn = page.locator("button", has_text="确认修改").first
+    for _ in range(3):
+        try:
+            if not await btn.is_visible():
+                return True
+            await page.keyboard.press("Escape")
+            await btn.wait_for(state="hidden", timeout=2000)
+            return True
+        except Exception:
+            pass
+    return False
+
+
 async def reschedule_on_manage_page(
     page,
     book_id: str,
@@ -4365,6 +4456,7 @@ async def reschedule_on_manage_page(
     progress_cb=None,
     volume_text: str = "",
     volume_texts: list[str] | None = None,
+    order: str = "desc",
 ) -> tuple[int, int]:
     """在章节管理页上批量修改待发布章节的定时发布设置。
 
@@ -4373,6 +4465,7 @@ async def reschedule_on_manage_page(
     progress_cb:  (done, total) 回调
     volume_text:  多卷时选择的卷名（空字符串表示不切换）
     volume_texts: 多卷索引模式时传入所有卷名列表（优先级高于 volume_text）
+    order:        'desc' 新→旧（页面顺序）/ 'asc' 旧→新，取 build_schedule_map 算的
     返回 (success, failed)。
     """
     total = len(schedule_map)
@@ -4390,11 +4483,15 @@ async def reschedule_on_manage_page(
     except Exception:
         logger.error("章节管理页表格未加载")
         return 0, total
+    if order == "asc":
+        logger.info("排期整体提前：按旧→新顺序处理，先把目标日的旧占位搬走再搬新的进来")
 
     # 单卷 = "只有一卷"的特例，走同一条循环。这两条路曾各写一份调用，
     # 给 _reschedule_current_volume 加参数时漏改一处，单卷和多卷行为就会不一样。
     if volume_texts:
-        targets = list(volume_texts)
+        # 卷的顺序也跟着方向走：推后（新→旧）先动最新的卷，否则旧卷搬进的目标日
+        # 还被新卷的旧占位占着，一样撞每日上限；提前（旧→新）则从第一卷起
+        targets = list(volume_texts) if order == "asc" else list(reversed(volume_texts))
     else:
         if volume_text:
             await select_volume(page, volume_text)
@@ -4412,13 +4509,22 @@ async def reschedule_on_manage_page(
                 # 的章节当"未处理"统计且诊断误导——跳过本卷，留待"未处理"汇报
                 logger.error(f"  切换到分卷失败，跳过本卷: {vt}")
                 continue
-        s, f = await _reschedule_current_volume(
-            page, remaining, total,
-            max_retries=max_retries, delay=delay,
-            cancel_check=cancel_check, progress_cb=progress_cb,
-            success_so_far=success, failed_so_far=failed)
+        try:
+            s, f, aborted = await _reschedule_current_volume(
+                page, remaining, total,
+                max_retries=max_retries, delay=delay,
+                cancel_check=cancel_check, progress_cb=progress_cb,
+                success_so_far=success, failed_so_far=failed, order=order)
+        except Exception as e:
+            # 扫描里的意外（翻页被残留弹窗挡住、浏览器被关…）不能让整批以
+            # "修改排期异常"收场——那样剩余章节没人记账。停下，走下面的未处理清单。
+            logger.error(f"  扫描中断: {e}，停止修改排期")
+            break
         success += s
         failed += f
+        if aborted:
+            # 页面已死 / 对话框关不掉：换卷继续只会在同一张坏页上错改章
+            break
 
     if remaining:
         # 走 log_fail_list 而不是逐条 error：它会把同因条目折叠成一行，并在
@@ -4443,11 +4549,15 @@ async def _reschedule_current_volume(
     progress_cb=None,
     success_so_far: int = 0,
     failed_so_far: int = 0,
+    order: str = "desc",
 ) -> tuple[int, int]:
     """扫描当前卷的所有页面，处理 remaining 中匹配到的章节。
 
+    order='asc' 时从最后一页起倒着翻、页内行也倒序，整体就是旧→新。
+
     会直接从 remaining 中删除已处理的条目。
-    返回本轮 (success, failed)。
+    返回本轮 (success, failed, aborted)；aborted=True 表示页面已死或残留对话框
+    关不掉，调用方不该再换卷继续（换卷是 JS 点击，不会被弹窗挡住）。
     """
     success = 0
     failed = 0
@@ -4455,6 +4565,9 @@ async def _reschedule_current_volume(
     # 诊断行结构，找出时钟图标的选择器
     icon_selector = await page.evaluate(_DETECT_CLOCK_ICON_JS)
     logger.debug(f"  时钟图标元素: {icon_selector or '未检测到'}")
+
+    if order == "asc":
+        await _goto_last_page(page)
 
     page_num = 0
     while remaining:
@@ -4480,6 +4593,8 @@ async def _reschedule_current_volume(
         matched_on_page = list(dict.fromkeys(
             t for t in page_titles if t in remaining))
 
+        if order == "asc":
+            matched_on_page = list(reversed(matched_on_page))
         for title in matched_on_page:
             if cancel_check and cancel_check():
                 logger.info("用户取消修改定时。")
@@ -4541,14 +4656,10 @@ async def _reschedule_current_volume(
                     break
 
                 except Exception as e:
-                    # 尝试关闭可能残留的弹窗
-                    try:
-                        await page.keyboard.press("Escape")
-                        await page.wait_for_timeout(300)
-                    except Exception:
-                        pass
                     if attempt <= max_retries:
                         logger.warning(f"第{attempt}次失败: {e}，重试中...")
+                        # 关掉残留对话框再重开；关不掉也无妨——重开的仍是本章的
+                        await _dismiss_resched_dialog(page)
                         await page.wait_for_timeout(1000)
                     else:
                         logger.error(f"失败: {e}")
@@ -4558,6 +4669,14 @@ async def _reschedule_current_volume(
                             logger.error(f"截图: {err_path}")
                         except Exception:
                             pass
+
+            # 失败/跳过后对话框必须真的关了才能碰下一章：留着不关，下一章会把
+            # 日期填进本章的对话框（改错章），翻页点击也会被 arco-modal-wrapper
+            # 挡住超时（2026-09-04 第3079章撞上限 toast 后实证）。关不掉宁可停
+            # 下：本章和后面的都留在 remaining，由调用方计入"未处理"。
+            if not ok and not await _dismiss_resched_dialog(page):
+                logger.error("  残留的修改定时对话框关不掉，停止扫描，剩余章节计入未处理")
+                return success, failed, True
 
             if ok:
                 success += 1
@@ -4575,7 +4694,7 @@ async def _reschedule_current_volume(
                     # 等待时页面已死（如用户关掉浏览器窗口）：立即结束本卷扫描，
                     # 保住已有计数；remaining 由调用方如实计入"未处理"
                     logger.warning("页面已失效，停止扫描，剩余章节计入未处理")
-                    return success, failed
+                    return success, failed, True
 
         # cancel_check 在内部 break 后也需要退出外层
         if cancel_check and cancel_check():
@@ -4584,33 +4703,23 @@ async def _reschedule_current_volume(
         if not remaining:
             break
 
-        # 翻页
-        next_btn = page.locator(
+        # 翻页：新→旧点「下一页」，旧→新（已在最后一页起步）点「上一页」
+        flip_btn = page.locator(
+            "li.arco-pagination-item-prev:not(.arco-pagination-item-disabled)"
+            if order == "asc" else
             "li.arco-pagination-item-next:not(.arco-pagination-item-disabled)")
-        if await next_btn.count() == 0:
+        if await flip_btn.count() == 0:
             break
         if page_num >= 500:
             # 硬上限：防止异常情况下（按钮永不 disabled 等）无限翻页
             logger.warning("翻页超过 500 页，停止扫描本卷")
             break
-        first_title = await page.evaluate(
-            "() => document.querySelector('tr td')?.textContent?.trim() || ''")
-        await next_btn.click()
-        # 等待表格内容变化
-        changed = False
-        for _ in range(30):
-            await page.wait_for_timeout(300)
-            cur = await page.evaluate(
-                "() => document.querySelector('tr td')?.textContent?.trim() || ''")
-            if cur and cur != first_title:
-                changed = True
-                break
-        if not changed:
+        if not await _flip_page(page, flip_btn):
             # 9 秒内首格未变：翻页卡住（或跨页首格同名），再扫只会原地打转
             logger.warning("翻页未检测到内容变化，停止扫描本卷")
             break
 
-    return success, failed
+    return success, failed, False
 
 
 # ---------------------------------------------------------------------------
@@ -4855,13 +4964,7 @@ async def cmd_reschedule_cli(args):
 
             schedule = compute_schedule(
                 len(pending), args.schedule, args.time, per_day)
-            schedule_map = {}
-            dups = []
-            for i, ch in enumerate(pending):
-                t = ch.get("title", "")
-                if t in schedule_map:
-                    dups.append(t)
-                schedule_map[t] = schedule[i]
+            schedule_map, dups, unchanged, order = build_schedule_map(pending, schedule)
             if dups:
                 # 排期按标题匹配行，同名会互相覆盖、排错章 —— 无人值守下直接中止
                 logger.error(
@@ -4870,13 +4973,18 @@ async def cmd_reschedule_cli(args):
                       "请先在平台修改章节标题后再试。")
                 return
 
+            if not schedule_map:
+                logger.info(f"待发布章节 {len(pending)} 个，排期与平台现有一致，无需修改。")
+                return
+
             logger.info(f"待发布章节 {len(pending)} 个，"
-                        f"排期 {schedule[0][0]} ~ {schedule[-1][0]}")
+                        f"排期 {schedule[0][0]} ~ {schedule[-1][0]}"
+                        + (f"，其中 {unchanged} 章排期未变、跳过" if unchanged else ""))
             ok, bad = await reschedule_on_manage_page(
                 page, args.book_id, schedule_map,
                 max_retries=cfg.get("max_retries", 2),
                 delay=cfg.get("delay_between_chapters", 3),
-                volume_texts=vol_texts)
+                volume_texts=vol_texts, order=order)
             logger.info("=" * 40)
             logger.info(f"  修改排期完成! 成功: {ok}  失败: {bad}")
             logger.info("=" * 40)
