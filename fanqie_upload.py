@@ -652,8 +652,10 @@ async def _await_submit_confirmation(page, verdict_holder, *,
                                      grace_s: float = _SUBMIT_CONFIRM_GRACE_S):
     """「确认发布」按钮消失后，等待提交真正落地的确认信号。
 
-    按钮消失 ≠ 提交成功：对话框被异常关闭（Escape 残留、点击被吞后 DOM
-    重建、弹窗抢焦点）时按钮同样消失，而章节根本没提交。2026-07-24 实测
+    按钮消失 ≠ 提交成功：对话框被异常关闭（点击被吞后 DOM 重建、弹窗抢焦点）
+    时按钮同样消失，而章节根本没提交。（成因之一"填完时间后裸按 Escape 把
+    Modal 一起关掉"已于 2026-09-03 从 publish_scheduled 里删除，见那里的注释。）
+    2026-07-24 实测
     该假成功让 748 章的定时发布批量漏掉 151 章——日志全记"成功"，平台上
     却无此章，正文只留在自动草稿里（草稿箱大量堆积是同一根因的另一面）。
 
@@ -3174,9 +3176,13 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_act
             if picked:
                 logger.info("    内容检测方式 -> 仅基础检测")
                 await page.wait_for_timeout(500)
-                # 选完可能还需点"确定/确认"才推进（标准 Arco 弹窗页脚）
+                # 选完可能还需点"确定/确认"才推进（标准 Arco 弹窗页脚）。
+                # 必须整词匹配：has_text 是子串匹配，"确认"会命中「确认发布」——
+                # 若此时「发布设置」弹窗已经挂上，就等于跳过定时开关直接立即发布，
+                # 而且不可逆。至今没炸只是因为弹窗一般 500ms 后才起来。
                 for label in ("确定", "确认"):
-                    btn = page.locator("button", has_text=label)
+                    btn = page.locator(
+                        "button", has_text=re.compile(rf"^\s*{label}\s*$"))
                     try:
                         if await btn.count() > 0 and await btn.first.is_visible():
                             await btn.first.click()
@@ -3228,6 +3234,20 @@ async def _apply_publish_options(page, *, use_ai: bool = False):
         }
     }""", target)
     await page.wait_for_timeout(500)
+
+
+async def _read_back(inp, expected: str, what: str):
+    """键盘填完日期/时间后回读输入框，没填上就抛错（交给重试），绝不带着空值去点确认。
+
+    键盘操作没有回执：焦点被弹窗/公告抢走、或格式不合 Arco 校验时，Enter 之后
+    框里是空的（2026-09-03 真机实测：抢焦点→日期框='' 时间框=''），而流程照样点
+    「确认发布」——章节按平台默认时刻发出去，日志却记着"-> 定时发布 2027-02-16 12:00"。
+    批末对账只查"章在不在"、不比 timer_time，这种错发永远没人发现。
+    用 startswith 而非 ==：时间框格式若是 HH:mm:ss，回读 '12:00:00' 也算填上。
+    """
+    got = (await inp.input_value()).strip()
+    if not got.startswith(expected):
+        raise RuntimeError(f"{what}没填上: 期望 {expected!r}，输入框里是 {got!r}")
 
 
 async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool = False):
@@ -3298,9 +3318,7 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
         await page.keyboard.type(date_str, delay=50)
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(500)
-        # Escape 关闭可能残留的日期选择下拉面板
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(300)
+        await _read_back(date_input, date_str, "日期")
 
     # 4. 填写时间 (Arco TimePicker)
     time_input = page.locator("input[placeholder='请选择时间']")
@@ -3313,9 +3331,14 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
         await page.keyboard.type(time_str, delay=50)
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(500)
-        # Escape 关闭可能残留的时间选择下拉面板
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(300)
+        await _read_back(time_input, time_str, "时间")
+        # Enter 已把面板关了，这里绝不能再按 Escape "保险"：面板关着时 Escape
+        # 穿透到 Arco Modal（escToExit 默认开）把「发布设置」整个关掉，~0.3s 后卸载，
+        # 正好撞上下面的「确认发布」点击——日志只剩 15s Locator.click 超时
+        # (element was detached from the DOM)，真因全被盖住。2026-09-03 419 次里
+        # 21 次(5%)中招，第1783章 三次重试全撞上 → 整批中止、剩 3483 章没发。
+        # 面板也不需要另外关：改期路径同样填法、从不按 Escape，1005 次无一
+        # 被面板挡住（两份日志 0 次 intercepts pointer events）。
 
     # 5. 确认发布
     await _submit_confirm_publish(page)
@@ -3335,7 +3358,21 @@ async def _submit_confirm_publish(page):
     confirm_btn = page.locator("button", has_text="确认发布")
     if await confirm_btn.count() == 0:
         raise RuntimeError("未找到确认发布按钮")
-    await confirm_btn.first.click(no_wait_after=True, timeout=_browser_timeout)
+    try:
+        await confirm_btn.first.click(
+            no_wait_after=True, timeout=_browser_timeout)
+    except Exception as e:
+        # 点击期间按钮被卸载 -> Playwright 只会报"Timeout ... exceeded"，
+        # 看日志的人无从知道是弹窗自己没了。查一下弹窗还在不在，把真因写出来。
+        try:
+            gone = await page.locator("text=发布设置").count() == 0
+        except Exception:
+            gone = False
+        if gone:
+            raise RuntimeError(
+                f"「发布设置」对话框在点击「确认发布」前消失，本章未提交（原始错误: {e}）"
+            ) from e
+        raise
     await _wait_publish_result(page, confirm_btn.first)
 
 
@@ -3424,7 +3461,7 @@ async def run_creation_batch(page, parsed, new_chapter_url, *, book_id,
     # 调用方进来时页面停在编辑器（它们用 goto+wait_for_editor_ready
     # 做登录校验），所以第一章本可以省一次导航。但下面的签名预取会把
     # 页面导到 chapter-manage，那个前提就不成立了——必须跟着改，否则
-    # 第 1 章会在章节管理页上填正文：max_retries>0 时白燒一个超时再重试成功，
+    # 第 1 章会在章节管理页上填正文：max_retries>0 时白烧一个超时再重试成功，
     # max_retries=0 时直接失败——而新建类是失败即停，整批当场中止。
     on_editor = True
     tail_vol = None        # 新章追加到的那一卷（全书最后一卷）；单卷书为 None
@@ -4475,6 +4512,7 @@ async def _reschedule_current_volume(
                     await page.keyboard.type(date_str, delay=50)
                     await page.keyboard.press("Enter")
                     await page.wait_for_timeout(500)
+                    await _read_back(date_input, date_str, "日期")
 
                     # 填写时间（点击时间输入框会自动关闭日期面板）
                     time_input = page.locator(
@@ -4485,6 +4523,7 @@ async def _reschedule_current_volume(
                     await page.keyboard.type(time_str, delay=50)
                     await page.keyboard.press("Enter")
                     await page.wait_for_timeout(500)
+                    await _read_back(time_input, time_str, "时间")
 
                     # 点击"确认修改"，判定结果: 按钮消失=成功；toast 分类失败原因
                     await confirm_btn.first.click(no_wait_after=True, timeout=_browser_timeout)

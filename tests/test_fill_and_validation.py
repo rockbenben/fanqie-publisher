@@ -464,12 +464,34 @@ class DetectMethodPage:
     needs_confirm: True 时选完还需点"确定"才推进（Arco 弹窗页脚）。
     """
 
-    def __init__(self, needs_confirm=False):
+    def __init__(self, needs_confirm=False, settings_premounted=False):
         self.stage = "detect"     # detect -> (selected) -> settings
         self.needs_confirm = needs_confirm
+        # 选完检测方式的瞬间「发布设置」弹窗（含「确认发布」）就已挂上
+        self.settings_premounted = settings_premounted
         self.picked = None
         self.confirm_clicks = 0
+        self.publish_clicks = 0   # 「确认发布」被误点的次数——必须为 0
         self.clock = 0.0
+
+    def _buttons(self):
+        """当前页面上的按钮文本（按 Playwright 语义供 has_text 匹配）。"""
+        out = []
+        if self.stage == "detect" and self.needs_confirm:
+            out.append("确定")
+        if self.stage == "settings" or self.settings_premounted:
+            out.append("确认发布")
+        return out
+
+    @staticmethod
+    def _match(has_text, text):
+        # Playwright: str 是子串匹配，regex 按 search 匹配
+        if hasattr(has_text, "search"):
+            return bool(has_text.search(text))
+        return has_text in text
+
+    def _hit(self, has_text):
+        return [b for b in self._buttons() if self._match(has_text, b)]
 
     async def evaluate(self, js, *args):
         self.clock += 0.02
@@ -494,18 +516,23 @@ class DetectMethodPage:
                     return 1 if page.stage == "detect" else 0
                 if selector == "button.auto-editor-next":
                     return 0
-                if selector == "button" and has_text in ("确定", "确认"):
-                    return 1 if (page.stage == "detect"
-                                 and page.needs_confirm) else 0
+                if selector == "button" and has_text is not None:
+                    return len(page._hit(has_text))
                 return 0
 
             async def is_visible(self):
                 return await self.count() > 0
 
             async def click(self, **kw):
-                if has_text in ("确定", "确认"):
+                hit = page._hit(has_text)
+                if not hit:
+                    return
+                if hit[0] == "确定":
                     page.confirm_clicks += 1
                     page.stage = "settings"
+                elif hit[0] == "确认发布":
+                    page.publish_clicks += 1   # 立即发布了——事故
+                    page.stage = "published"
 
             @property
             def first(self):
@@ -539,7 +566,18 @@ def test_detect_method_with_confirm():
           f"picked={p.picked!r} confirm={p.confirm_clicks}")
 
 
+def test_detect_method_never_hits_confirm_publish():
+    """选完检测方式时「发布设置」弹窗已在（有「确认发布」、没有「确定」）。
+    子串匹配的 has_text="确认" 会命中「确认发布」-> 跳过定时开关直接发布（不可逆）。"""
+    p = DetectMethodPage(needs_confirm=False, settings_premounted=True)
+    err = run(fu._navigate_to_publish_settings(p))
+    check("内容检测方式(发布设置已挂上): 到达发布设置", err is None, f"err={err!r}")
+    check("内容检测方式(发布设置已挂上): 没误点「确认发布」",
+          p.publish_clicks == 0, f"publish_clicks={p.publish_clicks}")
+
+
 def main():
+    test_detect_method_never_hits_confirm_publish()
     test_fill_self_heals_chapter_num()
     test_fill_raises_if_never_ready()
     test_fill_edit_mode_skips_num_check()
