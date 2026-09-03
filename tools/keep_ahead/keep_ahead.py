@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""续排工具 —— 把本地还没发的章接在平台队列末尾，按天排期。
+"""续排工具 —— 把本地还没发的章接在平台队列末尾（接的是时刻，不是整天）。
 
 两种模式（自己选）:
   · 默认「维持深度」—— 只补到"今天 + N 天"，队列保持浅（--days-ahead N）
@@ -68,12 +68,16 @@ LOG_DIR = Path(__file__).resolve().parent / "logs"
 DEFAULT_DAYS_AHEAD = 3
 
 
-def queue_tail_date(items, *, today=None):
-    """平台队列排到哪一天了（返回 date）。没有待发布章就返回今天。
+# 起排槽位至少晚于"现在"这么多分钟。平台拒掉定时到过去的章，而提交本身要跑
+# 十几秒/章；真正的最小提前量没有样本，宁可保守。
+LEAD_MINUTES = 10
+
+
+def queue_tail_dt(items):
+    """平台队列排到哪一刻（datetime，精确到分）。没有待发布章返回 None。
 
     只看待发布章的 timer_time——已发布的是过去，不构成"队列深度"。
     """
-    today = today or datetime.now().date()
     tails = []
     for it in items:
         if it.get("display_status") != fu.DISPLAY_PENDING:
@@ -83,8 +87,47 @@ def queue_tail_date(items, *, today=None):
         except (TypeError, ValueError):
             tt = 0
         if tt:
-            tails.append(datetime.fromtimestamp(tt).date())
-    return max(tails) if tails else today
+            tails.append(datetime.fromtimestamp(tt))
+    return max(tails) if tails else None
+
+
+def queue_tail_date(items, *, today=None):
+    """平台队列排到哪一天了（返回 date）。没有待发布章就返回今天。"""
+    dt = queue_tail_dt(items)
+    return dt.date() if dt else (today or datetime.now().date())
+
+
+def schedule_after(tail_dt, n, pub_time, per_day, *, now=None):
+    """接着队尾往后排 n 章：先填满队尾那天剩下的槽位，再逐日往后。返回 [(date, time)]。
+
+    以前只按日期接（队尾次日第 0 槽），队尾那天哪怕只排了 2/6 章也永远空着——
+    2026-09-03 批次中止在 02-16 07:01，下次接续就从 02-17 起。现在:
+      cut   = max(队尾时刻, 现在 + LEAD_MINUTES)
+      start = cut 当天；丢掉当天模板里 ≤ cut 的槽位，其余照 compute_schedule 排
+    按"≤ 队尾时刻的槽位数"切、不按"当天已有几章"数：平台上那天哪怕是用别的时间
+    配置排的，新章也严格晚于队尾——章节顺序 = 发布顺序这条线不能破。
+    队列排干/队尾在过去时从"现在 + 余量"起，只跳过已过去的槽——老逻辑起排
+    "今天第 0 槽"，--daily 晚上跑时第一章就被平台拒、失败即停、每晚重现。
+    """
+    now = now or datetime.now()
+    cut = now + timedelta(minutes=LEAD_MINUTES)
+    if tail_dt and tail_dt > cut:
+        cut = tail_dt
+    if n <= 0:
+        return []
+    start = cut.strftime("%Y-%m-%d")
+    cut_hm = cut.strftime("%H:%M")
+    times = fu.validate_times(pub_time) or ["08:00"]
+    effective = max(per_day, len(times))
+    day = fu.compute_schedule(effective, start, pub_time, per_day)     # 当天模板
+    k = sum(1 for _d, t in day if t <= cut_hm)
+    sched = fu.compute_schedule(n + k, start, pub_time, per_day)[k:]
+    # compute_schedule 的保序修复只会把临近午夜挤住的槽位前挪；万一挪到 ≤ cut，
+    # 退回老行为——次日整天。宁可空半天，不能让新章早于队尾。
+    if any(d == start and t <= cut_hm for d, t in sched):
+        nxt = (cut + timedelta(days=1)).strftime("%Y-%m-%d")
+        sched = fu.compute_schedule(n, nxt, pub_time, per_day)
+    return sched
 
 
 def plan_refill(items, num2path, *, days_ahead=DEFAULT_DAYS_AHEAD, per_day=9,
@@ -103,13 +146,15 @@ def plan_refill(items, num2path, *, days_ahead=DEFAULT_DAYS_AHEAD, per_day=9,
 
     返回 (nums, start_date, need_days, tail, gaps):
       nums       要排的章号（升序，只取平台最大章号之后的）
-      start_date 从这天开始排（队列末尾的次日）
+      start_date 队列末尾的次日；**只用来算 need_days**，不是真正的起排点
+                 —— 那个由 schedule_after 接着队尾的时刻算（会先填满队尾那天
+                 剩下的时间点）
       need_days  这批要占几天
       tail       当前队列排到哪天
       gaps       平台中段缺的章号（本工具不碰，交给 tools/remap；仅用于提醒）
 
-    只按整天补：队列末尾那天可能只排了半天，补半天要处理"当天已用掉哪几个
-    时间点"，复杂度和出错面都不划算——次日整天开始排，最多让深度多半天。
+    start_date 只用于维持深度模式算 need_days（按整天）；真正的排期由
+    schedule_after 接着队尾的**时刻**算，会先填满队尾那天剩下的时间点。
     """
     today = today or datetime.now().date()
     tail = queue_tail_date(items, today=today)
@@ -209,7 +254,8 @@ def print_plan(items, nums, schedule, tail, need_days, days_ahead, per_day):
               else "队列已达目标深度，无需补排。", flush=True)
         return
     print(f"本次补 {need_days} 天 / {len(nums)} 章："
-          f"第{nums[0]}~{nums[-1]}章", flush=True)
+          f"第{nums[0]}~{nums[-1]}章，从 {schedule[0][0]} {schedule[0][1]} 起接着排",
+          flush=True)
     for n, (d, t) in list(zip(nums, schedule))[:5]:
         print(f"    第{n}章 -> {d} {t}", flush=True)
     if len(nums) > 5:
@@ -227,7 +273,9 @@ async def main_async(args):
         return True
 
     per_day = args.per_day or cfg.get("default_per_day", 9)
-    pub_time = args.time or cfg.get("default_time", "07:00,12:00,20:00")
+    # load_config 会用 DEFAULT_CONFIG 补齐该键，回退值只是防御；
+    # 写成和 DEFAULT_CONFIG 一致的值，别让人以为本工具另有默认时间表
+    pub_time = args.time or cfg.get("default_time", "08:00")
 
     async with async_playwright() as p:
         browser, ctx = await fu.create_context(p, headless=headless)
@@ -241,9 +289,8 @@ async def main_async(args):
             nums, start_date, need_days, tail, gaps = plan_refill(
                 items, num2path, days_ahead=args.days_ahead, per_day=per_day,
                 all_remaining=args.all, limit=args.limit)
-            schedule = fu.compute_schedule(
-                len(nums), start_date.strftime("%Y-%m-%d"), pub_time, per_day) \
-                if nums else []
+            schedule = schedule_after(queue_tail_dt(items), len(nums),
+                                      pub_time, per_day)
             print_plan(items, nums, schedule, tail, need_days,
                        None if args.all else args.days_ahead, per_day)
             if gaps:
@@ -368,6 +415,43 @@ def demo():
                                            all_remaining=True, today=TODAY)
     assert numsL == [3, 4, 5, 6, 7] and startL == startA, (numsL, startL)
     assert daysL == 3, daysL                        # 5 章 / 每天 2 章 → 3 天
+
+    # ---- schedule_after: 接着队尾的时刻续排，不再整天跳 ----
+    NOW = datetime(2026, 8, 20, 9, 0)
+    T = "07:00,12:00,20:00"
+    # 队尾 02-16 07:01（2026-09-03 中止现场），模板 3 时点 ×2 → 先填满当天
+    s = schedule_after(datetime(2027, 2, 16, 7, 1), 5, T, 6, now=NOW)
+    assert s == [("2027-02-16", "12:00"), ("2027-02-16", "12:01"),
+                 ("2027-02-16", "20:00"), ("2027-02-16", "20:01"),
+                 ("2027-02-17", "07:00")], s
+    # 队尾那天已满 → 次日第 0 槽，与老行为一致
+    s = schedule_after(datetime(2027, 2, 16, 20, 1), 2, T, 6, now=NOW)
+    assert s[0] == ("2027-02-17", "07:00"), s
+    # 平台上那天是按别的配置排的（队尾 15:30）：新章仍严格晚于队尾
+    s = schedule_after(datetime(2027, 2, 16, 15, 30), 1, T, 6, now=NOW)
+    assert s[0] == ("2027-02-16", "20:00"), s
+    # 队列空 / 队尾在过去 → 从"现在+余量"起，只跳过已过去的槽
+    s = schedule_after(None, 2, T, 6, now=datetime(2026, 8, 20, 15, 0))
+    assert s[0] == ("2026-08-20", "20:00"), s
+    s = schedule_after(datetime(2026, 8, 1, 7, 0), 1, T, 6,
+                       now=datetime(2026, 8, 20, 21, 0))
+    assert s[0] == ("2026-08-21", "07:00"), s        # 今天的槽都过了 → 明天
+    s = schedule_after(None, 1, T, 6, now=datetime(2026, 8, 20, 6, 55))
+    assert s[0] == ("2026-08-20", "12:00"), s        # 07:00 只差 5 分钟 < 余量，跳过
+    assert schedule_after(datetime(2027, 1, 1, 7, 0), 0, T, 6, now=NOW) == []
+    # 随机队尾 × 随机模板：新槽严格晚于队尾与 now+余量，且全程严格递增
+    import random
+    rnd = random.Random(7)
+    lead = (NOW + timedelta(minutes=LEAD_MINUTES)).strftime("%Y-%m-%d %H:%M")
+    for _ in range(300):
+        tl = datetime(2026, 8, 20) + timedelta(minutes=rnd.randrange(0, 60 * 24 * 40))
+        pd = rnd.randint(1, 9)
+        tm = rnd.choice([T, "08:00", "23:50,23:55", "06:00,18:00", "00:00,23:59"])
+        s = schedule_after(tl, rnd.randint(1, 12), tm, pd, now=NOW)
+        cut = max(tl.strftime("%Y-%m-%d %H:%M"), lead)
+        stamps = [f"{d} {t}" for d, t in s]
+        assert all(x > cut for x in stamps), (tl, tm, pd, s)
+        assert all(a < b for a, b in zip(stamps, stamps[1:])), (tl, tm, pd, s)
     # limit 在维持深度模式下同样生效
     assert len(plan_refill(thin, local, days_ahead=3, per_day=2, limit=2,
                            today=TODAY)[0]) == 2

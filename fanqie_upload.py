@@ -4049,16 +4049,17 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
     # 自动接续队列: 起始日期和章号范围都由平台队列决定，不用手填。
     # 与 GUI 的「自动接续队列」勾选框对等，共用 tools/keep_ahead 的纯函数。
+    schedule = None
     if getattr(args, "auto_continue", False):
-        parsed, files, schedule_date = await _auto_continue_plan(
-            book_id, parsed, files, per_day, headless, args)
+        parsed, files, schedule = await _auto_continue_plan(
+            book_id, parsed, files, per_day, schedule_time, headless, args)
         if not parsed:
             logger.info("本地章节都已经在平台上了，没有可接续的。")
             return
+        schedule_date = schedule[0][0]
 
-    # 计算排期
-    schedule = None
-    if schedule_date:
+    # 计算排期（自动接续已经算好；这里只剩手填日期的情况）
+    if schedule is None and schedule_date:
         try:
             datetime.strptime(schedule_date, "%Y-%m-%d")
         except ValueError:
@@ -4706,9 +4707,13 @@ async def cmd_edit(directory: Path, book_id: str, args):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-async def _auto_continue_plan(book_id, parsed, files, per_day, headless,
-                              args=None):
-    """按平台队列自动决定"发哪几章、从哪天起"。返回 (parsed, files, 起始日期)。
+async def _auto_continue_plan(book_id, parsed, files, per_day, pub_time,
+                              headless, args=None):
+    """按平台队列自动决定"发哪几章、从哪一刻起"。返回 (parsed, files, schedule)。
+
+    schedule 由 keep_ahead.schedule_after 接着队尾的**时刻**排：先填满队尾那天
+    剩下的槽位再往后，不再整天跳到次日（2026-09-03 中止在 02-16 07:01，
+    老逻辑会让 02-16 永远只有 2/6 章）。
 
     只取平台最大章号之后的章——中段缺口靠"发上去"补不回原位（新建只能追加到
     书尾），那是 remap 的活，这里只提醒不碰。
@@ -4735,7 +4740,7 @@ async def _auto_continue_plan(book_id, parsed, files, per_day, headless,
         days_ahead=days_ahead or 0, per_day=max(1, per_day))
     mode = ("全部补齐" if days_ahead is None
             else f"只排到 {days_ahead} 天后")
-    logger.info(f"自动接续（{mode}）: 平台队列排到 {tail}，从 {start} 起接着排")
+    tail_dt = mod.queue_tail_dt(items)
     if gaps:
         logger.warning(
             f"⚠ 平台中段还缺 {len(gaps)} 章（如 第"
@@ -4746,8 +4751,12 @@ async def _auto_continue_plan(book_id, parsed, files, per_day, headless,
             if p_[0] is not None and str(p_[0]).isdigit() and int(p_[0]) in keep]
     if not kept:
         return [], [], None
+    schedule = mod.schedule_after(tail_dt, len(kept), pub_time, per_day)
+    tail_s = tail_dt.strftime("%Y-%m-%d %H:%M") if tail_dt else "空"
+    logger.info(f"自动接续（{mode}）: 平台队列排到 {tail_s}，"
+                f"从 {schedule[0][0]} {schedule[0][1]} 起接着排")
     logger.info(f"自动接续: 本次发 {len(kept)} 章，第{nums[0]}~{nums[-1]}章")
-    return [k[0] for k in kept], [k[1] for k in kept], start.strftime("%Y-%m-%d")
+    return [k[0] for k in kept], [k[1] for k in kept], schedule
 
 
 _TOOL_CACHE: dict = {}

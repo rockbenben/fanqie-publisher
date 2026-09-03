@@ -94,7 +94,7 @@ SECTION_HELP = {
                 "· 修改排期：只改已有章节的发布时间，不动正文\n"
                 "所有模式都能「按章节号筛选」，只操作指定范围（如 1,3,5-10）的章节。\n"
                 "定时发布还可勾「接着上次往后排」：不用自己填起始日期、也不用挑哪几章——"
-                "工具去平台看已经排到哪天，从次日接着往后排，且只发平台上还没有的章。"
+                "工具去平台看已经排到哪一刻，先填满那天剩下的时间点再逐日往后排，且只发平台上还没有的章。"
                 "旁边「排到 N 天后」留空就全排上去，填 N 则只排到那天为止。",
     "定时执行": "设定一个未来时刻（格式 YYYY-MM-DD HH:MM），到点自动执行当前所选操作（仅一次），"
                 "适合无人值守（比如半夜自动上传）。到点若有任务在跑会等它结束再执行，"
@@ -784,7 +784,7 @@ class FanqieGUI:
         self.chk_headless.pack(side="left", padx=6)
         self.headless_var.trace_add("write", lambda *_: self._schedule_config_save())
 
-        # 自动接续队列：起始日期和章号范围都不用自己算——从平台队列末尾的次日
+        # 自动接续队列：起始时刻和章号范围都不用自己算——接在平台队列末尾之后
         # 开始排，只发平台最大章号之后的章。勾上后起始日期输入框置灰。
         # （这就是原来独立的"续排发布"工具在 GUI 里该有的样子，不必另开入口）
         self.autocont_var = tk.BooleanVar(
@@ -793,7 +793,7 @@ class FanqieGUI:
             row_opts, text="接着上次往后排",
             variable=self.autocont_var, command=self._on_autocont_toggle)
         self.chk_autocont.pack(side="left", padx=6)
-        self._attach_tooltip(self.chk_autocont, "不用自己填起始日期、也不用挑哪几章：\n工具去平台看已经排到哪天，从次日接着往后排，\n并且只发平台上还没有的章。\n\n→ 攒了一批新稿，想直接接在现有排期后面时用。\n→ 要自己定日期、或只补某几章，就别勾。")
+        self._attach_tooltip(self.chk_autocont, "不用自己填起始日期、也不用挑哪几章：\n工具去平台看已经排到哪一刻，先填满那天剩下的时间点，\n再逐日往后排，并且只发平台上还没有的章。\n\n→ 攒了一批新稿，想直接接在现有排期后面时用。\n→ 要自己定日期、或只补某几章，就别勾。")
         self.autocont_var.trace_add("write", lambda *_: self._schedule_config_save())
         # 「排到 N 天后」的控件放在下面的排期参数行（r1）里，不放这一行：
         # 它本来就和「每天章数」同类，而这一行在 1280 宽以下已经装不下第 6 个控件
@@ -2606,6 +2606,7 @@ class FanqieGUI:
         # 于是勾上之后预览显示的是「按你手填的日期排的全部本地章」，而实际发的是
         # 另一批章、另一个日期——所见非所得，用户只能靠确认框里那个数字兜底。
         autocont_start = None
+        autocont_tail = None
         autocont_wait = False
         if mode == "schedule" and self.autocont_var.get():
             _idx = self.cmb_book.current()
@@ -2614,10 +2615,10 @@ class FanqieGUI:
                        if _bid else None)
             if _cached:
                 try:
-                    _keep, autocont_start, _gaps = self._autocont_plan(
+                    _keep, autocont_start, _gaps, autocont_tail = self._autocont_plan(
                         _cached, self.parsed_chapters)
                 except Exception:
-                    _keep, autocont_start = None, None
+                    _keep, autocont_start, autocont_tail = None, None, None
                 if _keep is not None:
                     kept_set = {
                         i for i in kept_set
@@ -2634,12 +2635,15 @@ class FanqieGUI:
         schedule = None
         if mode == "schedule":
             try:
-                date_str = (autocont_start.strftime("%Y-%m-%d") if autocont_start
-                            else self.date_var.get())
-                datetime.strptime(date_str, "%Y-%m-%d")
                 time_str = self.time_var.get().strip() or "08:00"
                 per_day = self.perday_var.get()
-                schedule = compute_schedule(kept_count, date_str, time_str, per_day)
+                if autocont_start:
+                    schedule = self._autocont_schedule(
+                        autocont_tail, kept_count, time_str, per_day)
+                else:
+                    date_str = self.date_var.get()
+                    datetime.strptime(date_str, "%Y-%m-%d")
+                    schedule = compute_schedule(kept_count, date_str, time_str, per_day)
             except (ValueError, tk.TclError):
                 pass
 
@@ -2685,10 +2689,11 @@ class FanqieGUI:
         elif autocont_start:
             summary += " | 自动接续: 只发平台还没有的章"
         if schedule:
-            # 统计首天章数即为 effective per_day
-            first_day = schedule[0][0]
-            eff = sum(1 for d, _ in schedule if d == first_day)
-            summary += f" | 每天{eff}章 | 排期: {date_str} ~ {schedule[-1][0]}"
+            # 自动接续会先填满队尾那天剩下的槽位，首天章数不再等于每天章数，
+            # 按 compute_schedule 的公式算（与 CLI 的 mode_str 同款）
+            eff = max(per_day, len(validate_times(time_str)) or 1)
+            summary += (f" | 每天{eff}章 | 排期: {schedule[0][0]} {schedule[0][1]}"
+                        f" ~ {schedule[-1][0]}")
 
         self._set_preview(summary + "\n" + "-" * 60 + "\n" + "\n".join(lines))
         self.progress["maximum"] = max(kept_count, 1)
@@ -3182,6 +3187,7 @@ class FanqieGUI:
         autocont = (mode == "schedule" and getattr(self, "autocont_var", None)
                     and self.autocont_var.get())
         autocont_start = None
+        autocont_tail = None
         # 自动接续筛出的子集只放局部变量，**绝不写回 self.***：用户在下面的确认框
         # 点「否」（或在「起始日期已过去」提醒里取消）时，若 self.parsed_chapters
         # 已被裁剪，预览就永久只剩那几章 —— 下次哪怕没勾自动接续也只发这几章，
@@ -3199,7 +3205,7 @@ class FanqieGUI:
                     "「自动接续队列」要先知道平台排到哪天了。\n"
                     "已开始获取，等它跑完再点一次「开始上传」即可。")
                 return
-            keep, autocont_start, gaps = self._autocont_plan(
+            keep, autocont_start, gaps, autocont_tail = self._autocont_plan(
                 cached, self.parsed_chapters)
             if not keep:
                 self._notify("info", "没有可接续的章节",
@@ -3247,8 +3253,16 @@ class FanqieGUI:
             if params is None:
                 return
             date_str, per_day, time_str = params
-            schedule = compute_schedule(
-                len(parsed), date_str, time_str, per_day)
+            if autocont_start:
+                schedule = self._autocont_schedule(
+                    autocont_tail, len(parsed), time_str, per_day)
+                tail_s = (autocont_tail.strftime("%Y-%m-%d %H:%M")
+                          if autocont_tail else "空")
+                logger.info(f"自动接续：平台队列排到 {tail_s}，"
+                            f"从 {schedule[0][0]} {schedule[0][1]} 起接着排")
+            else:
+                schedule = compute_schedule(
+                    len(parsed), date_str, time_str, per_day)
 
         # 确认
         count = len(parsed)
@@ -3445,16 +3459,18 @@ class FanqieGUI:
         """读取并校验排期三参数，返回 (date_str, per_day, time_str)。
 
         任一项不合法、或用户在"日期已过去"的确认框里选了取消，弹窗后返回
-        None，调用方直接 return。start 给定时跳过日期输入框（自动接续已经
-        按平台队列末尾算好了起始日）。
+        None，调用方直接 return。start 给定时跳过日期输入框；注意自动接续时
+        返回的 date_str 只用于"日期已过去"校验，真正的起排时刻由
+        keep_ahead.schedule_after 接着队尾算（会先填满队尾那天剩下的时间点）。
 
         定时发布和修改排期两条路曾各抄一份这 20 多行，改一句提示语就得记得
         改两处，漏一处两边行为就不一样。
         """
         if start is not None:
+            # 自动接续：这里只做"日期已过去"校验；真实起点（接着队尾的时刻）
+            # 由调用方按 schedule_after 算好后再记日志
             date_str = start.strftime("%Y-%m-%d")
             start_dt = datetime.combine(start, datetime.min.time())
-            logger.info(f"自动接续：从 {date_str} 起（平台队列末尾的次日）")
         else:
             try:
                 date_str = self.date_var.get()
@@ -3739,7 +3755,13 @@ class FanqieGUI:
         nums, start, _days, _tail, gaps = tool.plan_refill(
             items, num2path, all_remaining=days_ahead is None,
             days_ahead=days_ahead or 0, per_day=per_day)
-        return set(nums), start, gaps
+        return set(nums), start, gaps, tool.queue_tail_dt(items)
+
+    def _autocont_schedule(self, tail_dt, n, time_str, per_day):
+        """自动接续的排期：接着平台队尾的**时刻**续排——先填满队尾那天剩下的
+        槽位再往后，不再整天跳到次日。算法在 keep_ahead.schedule_after（CLI 同款）。"""
+        return self._load_tool("keep_ahead").schedule_after(
+            tail_dt, n, time_str, per_day)
 
     def _on_tool_clean_drafts(self):
         """先做安全检查（草稿内容本地有没有），确认后再删。删除不可恢复。"""

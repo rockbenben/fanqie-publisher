@@ -12,7 +12,7 @@ fanqie/
 ├── tests/              # 回归测试
 ├── docs/images/        # README 首屏截图（改过界面记得重截）
 ├── tools/remap/        # 章节重排（把未公开的待发布章按位置重装内容，消掉中段缺口）
-├── tools/keep_ahead/   # 续排（把本地还没发的章接在队列末尾按天排期）
+├── tools/keep_ahead/   # 续排（把本地还没发的章接在队列末尾，接的是时刻不是整天）
 ├── tools/clean_drafts/ # 草稿箱清理（带本地源文件安全检查）
 ├── config.json         # 配置文件（自动生成，不纳入版本控制）
 ├── .gui_state.json     # GUI 内部状态（自动生成，勿手动编辑）
