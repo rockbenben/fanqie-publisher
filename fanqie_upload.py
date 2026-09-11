@@ -559,7 +559,7 @@ def compress_chapter_nums(nums) -> str:
 _FAIL_RUN_COLLAPSE = 3
 
 
-def log_fail_list(fail_list):
+def log_fail_list(fail_list, *, fix_hint=None):
     """批量结束时打印失败章节及原因清单（上传 / 修改 / 改期共用，CLI+GUI）。
 
     连续同一原因的条目会折成一行（见 _FAIL_RUN_COLLAPSE）——中止整批时剩余
@@ -593,9 +593,10 @@ def log_fail_list(fail_list):
         if m:
             nums.append(int(m.group(1)))
     if nums:
-        logger.info(
-            f"  失败章节号: {compress_chapter_nums(nums)}"
-            f"（补传: GUI 粘进「按章节号筛选」，命令行加 --chapters）")
+        # 默认文案是给上传/修改用的。改期没有"按章号重跑"的入口，照抄这句会把人
+        # 引去 GUI 的「按章节号筛选」——那是上传，会把这些章又发一遍。
+        hint = fix_hint or "补传: GUI 粘进「按章节号筛选」，命令行加 --chapters"
+        logger.info(f"  失败章节号: {compress_chapter_nums(nums)}（{hint}）")
 
 
 def record_unprocessed(fail_list, remaining, reason="每日字数上限，未处理"):
@@ -617,6 +618,40 @@ def record_unprocessed(fail_list, remaining, reason="每日字数上限，未处
         fail_list.append((f"{label}{title}", reason))
         n += 1
     return n
+
+
+# 重试间隔（秒），第 N 次失败后等第 N 项。原来四处都写死 1~2s，三次重试全挤在
+# 10 秒内，服务端抽一下就是一起撞同一个故障窗（2026-09-04 改期第2782章:
+# "网络不好"→"服务器开小差了"×2，12 秒里三连败，1698 章只这一章没改成）。
+# 次数不动（3 次够，依据见 publish_one_chapter 上方），只把间隔拉开。
+_RETRY_BACKOFF_S = (1, 4, 10)
+
+
+def retry_wait_ms(attempt: int) -> int:
+    """第 attempt 次失败后该等多少毫秒（attempt 从 1 起，超表长取最后一项）。"""
+    return int(_RETRY_BACKOFF_S[min(attempt, len(_RETRY_BACKOFF_S)) - 1] * 1000)
+
+
+async def after_attempt_failed(page, attempt, max_retries, err, err_tag=None):
+    """一次尝试失败后的收尾：还有次数就退避重试，用完了记错并截图。
+
+    发布/存草稿/改内容/改排期四条重试路径原来各抄一份，退避一改就得改四处
+    （改漏的那处就永远是老间隔）。截图留到最后一次：页面上残留的对话框/toast
+    正是诊断要看的东西，中途关掉就没了。
+    """
+    if attempt <= max_retries:
+        logger.warning(f"第{attempt}次失败: {err}，重试中...")
+        await page.wait_for_timeout(retry_wait_ms(attempt))
+        return
+    logger.error(f"失败: {err}")
+    if not err_tag:
+        return
+    try:
+        err_path = SCRIPT_DIR / f"error_{err_tag}.png"
+        await page.screenshot(path=str(err_path))
+        logger.error(f"截图: {err_path}")
+    except Exception:
+        pass
 
 
 # _wait_publish_result 行为参数
@@ -4187,18 +4222,7 @@ async def publish_one_chapter(page, new_chapter_url, chapter_num, title, content
             raise
         except Exception as e:
             last_err = str(e)
-            if attempt <= max_retries:
-                logger.warning(f"第{attempt}次失败: {e}，重试中...")
-                await page.wait_for_timeout(2000)
-            else:
-                logger.error(f"失败: {e}")
-                if err_tag:
-                    try:
-                        err_path = SCRIPT_DIR / f"error_{err_tag}.png"
-                        await page.screenshot(path=str(err_path))
-                        logger.error(f"截图: {err_path}")
-                    except Exception:
-                        pass
+            await after_attempt_failed(page, attempt, max_retries, e, err_tag)
     return False, last_err
 
 
@@ -4234,18 +4258,7 @@ async def draft_one_chapter(page, new_chapter_url, chapter_num, title, content,
             raise
         except Exception as e:
             last_err = str(e)
-            if attempt <= max_retries:
-                logger.warning(f"第{attempt}次失败: {e}，重试中...")
-                await page.wait_for_timeout(2000)
-            else:
-                logger.error(f"失败: {e}")
-                if err_tag:
-                    try:
-                        err_path = SCRIPT_DIR / f"error_{err_tag}.png"
-                        await page.screenshot(path=str(err_path))
-                        logger.error(f"截图: {err_path}")
-                    except Exception:
-                        pass
+            await after_attempt_failed(page, attempt, max_retries, e, err_tag)
     return False, None, last_err
 
 
@@ -4292,17 +4305,8 @@ async def edit_one_chapter(
             raise
         except Exception as e:
             last_err = str(e)
-            if attempt <= max_retries:
-                logger.warning(f"第{attempt}次失败: {e}，重试中...")
-                await page.wait_for_timeout(2000)
-            else:
-                logger.error(f"失败: {e}")
-                try:
-                    err_path = SCRIPT_DIR / f"error_edit_{ch_num}.png"
-                    await page.screenshot(path=str(err_path))
-                    logger.error(f"截图: {err_path}")
-                except Exception:
-                    pass
+            await after_attempt_failed(page, attempt, max_retries, e,
+                                       f"edit_{ch_num}")
     return False, last_err
 
 
@@ -4471,6 +4475,7 @@ async def reschedule_on_manage_page(
     total = len(schedule_map)
     success = 0
     failed = 0
+    fail_list = []                  # (章节, 原因)，末尾统一汇报
     remaining = dict(schedule_map)  # 未处理的
 
     chapter_manage_url = CHAPTER_MANAGE_URL_TPL.format(book_id=book_id)
@@ -4514,7 +4519,8 @@ async def reschedule_on_manage_page(
                 page, remaining, total,
                 max_retries=max_retries, delay=delay,
                 cancel_check=cancel_check, progress_cb=progress_cb,
-                success_so_far=success, failed_so_far=failed, order=order)
+                success_so_far=success, failed_so_far=failed, order=order,
+                fail_list=fail_list)
         except Exception as e:
             # 扫描里的意外（翻页被残留弹窗挡住、浏览器被关…）不能让整批以
             # "修改排期异常"收场——那样剩余章节没人记账。停下，走下面的未处理清单。
@@ -4527,11 +4533,17 @@ async def reschedule_on_manage_page(
             break
 
     if remaining:
-        # 走 log_fail_list 而不是逐条 error：它会把同因条目折叠成一行，并在
-        # 末尾给出可直接粘贴的章节号。原来 609 章的改期批次一中止就刷几百行
-        # "未处理: xxx"，还得自己从标题里抠章号才知道从哪接着改。
-        failed += len(remaining)
-        log_fail_list([(t, "未处理") for t in remaining])
+        # 和真失败记进同一份清单：log_fail_list 会把这一片同因条目折叠成一行，
+        # 中止时才不会刷几百行"未处理: xxx"，把上面真正的失败原因冲出屏幕。
+        failed += record_unprocessed(
+            fail_list, ((None, t) for t in remaining), reason="未处理")
+    # 横幅连同清单都在这里打：CLI/GUI 各抄一份的话，改一处漏一处，
+    # 而且失败明细会落在"完成!"横幅上面——最该看的东西被结论盖住。
+    logger.info("=" * 40)
+    logger.info(f"  修改排期完成! 成功: {success}  失败: {failed}")
+    log_fail_list(fail_list,
+                  fix_hint="改期没有按章号重跑的入口，去平台按上面的时间逐章手改")
+    logger.info("=" * 40)
 
     return success, failed
 
@@ -4550,12 +4562,14 @@ async def _reschedule_current_volume(
     success_so_far: int = 0,
     failed_so_far: int = 0,
     order: str = "desc",
+    fail_list: list,
 ) -> tuple[int, int]:
     """扫描当前卷的所有页面，处理 remaining 中匹配到的章节。
 
     order='asc' 时从最后一页起倒着翻、页内行也倒序，整体就是旧→新。
 
-    会直接从 remaining 中删除已处理的条目。
+    会直接从 remaining 中删除已处理的条目；失败的章以 (标题, 原因+原定时间)
+    追加进 fail_list，由调用方连同"未处理"一起汇报。
     返回本轮 (success, failed, aborted)；aborted=True 表示页面已死或残留对话框
     关不掉，调用方不该再换卷继续（换卷是 JS 点击，不会被弹窗挡住）。
     """
@@ -4605,6 +4619,7 @@ async def _reschedule_current_volume(
             logger.info(f"[{done_so_far + 1}/{total}] {title} -> {date_str} {time_str}")
 
             ok = False
+            err = ""
             for attempt in range(1, max_retries + 2):
                 try:
                     # 点击时钟图标: 在匹配行的中间列中查找可点击元素
@@ -4653,22 +4668,17 @@ async def _reschedule_current_volume(
                     # 改期不提交字数，上限 toast 多为相邻操作残留；
                     # 重试无意义，按失败记录并继续后续章节（不截图）。
                     logger.warning(f"  跳过本章（{e}）")
+                    err = str(e)
                     break
 
                 except Exception as e:
+                    err = str(e)
                     if attempt <= max_retries:
-                        logger.warning(f"第{attempt}次失败: {e}，重试中...")
                         # 关掉残留对话框再重开；关不掉也无妨——重开的仍是本章的
                         await _dismiss_resched_dialog(page)
-                        await page.wait_for_timeout(1000)
-                    else:
-                        logger.error(f"失败: {e}")
-                        try:
-                            err_path = SCRIPT_DIR / f"error_resched_{_safe_filename(title, 20)}.png"
-                            await page.screenshot(path=str(err_path))
-                            logger.error(f"截图: {err_path}")
-                        except Exception:
-                            pass
+                    await after_attempt_failed(
+                        page, attempt, max_retries, e,
+                        f"resched_{_safe_filename(title, 20)}")
 
             # 失败/跳过后对话框必须真的关了才能碰下一章：留着不关，下一章会把
             # 日期填进本章的对话框（改错章），翻页点击也会被 arco-modal-wrapper
@@ -4682,6 +4692,12 @@ async def _reschedule_current_volume(
                 success += 1
             else:
                 failed += 1
+                # 记在 failed += 1 的同一处：清单和「成功+失败」永远对得上，也
+                # 不会跟上面"对话框关不掉"的提前 return 撞车（那条路本章留在
+                # remaining，由调用方记未处理）。原定时间必须带上——改期失败只
+                # 能去平台手改，光有章名不知道该填几点几分。
+                fail_list.append(
+                    (title, f"{err or '未知错误'}（原定 {date_str} {time_str}）"))
             del remaining[title]
 
             if progress_cb:
@@ -4985,9 +5001,6 @@ async def cmd_reschedule_cli(args):
                 max_retries=cfg.get("max_retries", 2),
                 delay=cfg.get("delay_between_chapters", 3),
                 volume_texts=vol_texts, order=order)
-            logger.info("=" * 40)
-            logger.info(f"  修改排期完成! 成功: {ok}  失败: {bad}")
-            logger.info("=" * 40)
         finally:
             await save_auth(context)
             await close_browser_safely(browser)

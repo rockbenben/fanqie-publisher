@@ -3426,7 +3426,10 @@ class FanqieGUI:
                 title = "已停止" if cancelled else {
                     "edit": "修改完成", "reschedule": "排期修改完成"}.get(
                         self.mode_var.get(), "上传完成")
-                tail = "，续跑章节号见运行日志" if cancelled and failed else ""
+                # 失败也得给指路：弹窗只报个数字，用户关掉就再也不知道
+                # 是哪一章、原定几点（改期失败只能照原定时间去平台手改）
+                tail = ("，续跑章节号见运行日志" if cancelled and failed
+                        else "，失败章节及原因见运行日志" if failed else "")
                 messagebox.showinfo(
                     title, f"成功 {success} 章，{word} {failed} 章{tail}")
         elif auto:
@@ -3638,13 +3641,10 @@ class FanqieGUI:
                     await save_auth(context)
                     await close_browser_safely(browser)
 
-                    # 汇总与完成通知放在 async with 内：浏览器挂死时
-                    # playwright stop（with 退出）可能同样阻塞，不能让它
-                    # 挡住结果汇报（实测曾让 GUI"卡死"41 分钟）
-                    logger.info(f"{'='*40}")
-                    logger.info(f"  修改排期完成! 成功: {success}  失败: {failed}")
-                    logger.info(f"{'='*40}")
-
+                    # 完成通知放在 async with 内：浏览器挂死时 playwright stop
+                    # （with 退出）可能同样阻塞，不能让它挡住结果汇报（实测曾让
+                    # GUI"卡死"41 分钟）。横幅和失败清单由 reschedule_on_manage_page
+                    # 自己打，比这里更早，同样不受收尾阻塞影响。
                     self._after(0, self._upload_done, success, failed)
 
             except Exception as e:
