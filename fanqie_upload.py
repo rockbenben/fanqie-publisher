@@ -277,11 +277,51 @@ async def _check_editor_validation(page):
 
     只扫瞬态 message（不扫常驻 notification，避免公告误杀）。带上平台原文，
     让真实原因可见、并让上层快速重试，而不是空转到"发布设置超时"。
+
+    ⚠ 这只覆盖走 toast 的那部分校验。平台的**字段**校验（正文字数/标题长度）
+    不走 toast，而是渲染在编辑器自己的内联提示里 —— 见 _check_editor_tip，
+    两处都要有，否则正文不足时仍会空转（2026-09-24 真机实测）。
     """
     toasts = await _visible_toast_texts(page)
     for t in toasts["messages"]:
         if _EDITOR_VALIDATION_RE.search(t):
             raise RuntimeError(f"章节字段校验未通过，页面提示: {t}")
+
+
+async def _check_editor_tip(page):
+    """检测编辑器**内联**字段校验提示（如「正文至少输入1000字」），命中即抛错。
+
+    平台这类校验不弹 Arco toast，而是渲染在编辑器自己的 .serial-editor-tip 里。
+    2026-09-24 真机实测（正文 775 字点"下一步"）：
+
+        <span>正文至少输入1000字</span>
+        祖先链 DIV.serial-editor-tip < .serial-editor-content < .serial-editor-container-inner
+
+    而此刻 document 里 arco-message / arco-notification / arco-alert 容器数**全为 0**
+    —— 只扫 toast 的 _check_editor_validation 永远看不见它，正则匹配得上也白搭。
+    后果正是 _EDITOR_VALIDATION_RE 那段注释要防的：空转 14 轮 + 15s 误报
+    "发布设置超时"，真实原因（正文没写够）全丢。实测复现：正文 930 字时向导
+    全程推不动，只有一条红色内联提示躺在编辑器里。
+
+    只取可见节点：不可见的退场残留 innerText 仍返回旧文案，会把已消失的提示
+    反复算成当前提示（与 _visible_toast_texts 同一理由）。
+    """
+    try:
+        tips = await page.evaluate("""() => {
+            const out = [];
+            for (const el of document.querySelectorAll('.serial-editor-tip')) {
+                if (el.getClientRects().length === 0) continue;
+                const t = (el.innerText || '').trim();
+                if (t && !out.includes(t)) out.push(t);
+                if (out.length >= 4) break;
+            }
+            return out;
+        }""")
+    except Exception:
+        return
+    for t in (tips or []):
+        if isinstance(t, str) and _EDITOR_VALIDATION_RE.search(t):
+            raise RuntimeError(f"章节字段校验未通过，编辑器提示: {t}")
 
 
 # 退出码契约（计划任务/cron 读它）: 0=正常、1=崩溃、3=跑完了但需要人处理。
@@ -667,6 +707,17 @@ _RECLICK_BUDGET_S = 7.0       # 发起重点击所需的最少剩余预算（2s 
 _SUBMIT_CONFIRM_GRACE_S = 5.0  # 按钮消失后等待「提交确认」信号（接口 code /
                                # 页面导航离开编辑器）的宽限窗
 
+# 「发布设置」弹窗页脚那颗提交按钮的文案。2026-09 番茄改版把它由「确认发布」
+# 改成「确认提交」（弹窗标题仍是「发布设置」，其余选项不变），而 has_text 传
+# 字符串是**子串**匹配——「确认发布」匹配不到「确认提交」，count()==0 就把每
+# 一章都判成"未找到确认发布按钮"。三条提交路径共用 _submit_confirm_publish，
+# 于是表现为整批中止而非零星失败（issue #3，2026-09-23 报告）。
+# 两种文案都认：平台灰度期或回滚任一版本都能提交。
+# 必须整词匹配（与 _navigate_to_publish_settings 里「确定/确认」同一理由）：
+# 不带锚的 "确认" 会命中这颗页脚按钮，若「发布设置」弹窗已挂上，就等于跳过
+# 定时开关直接立即发布，且不可逆。
+_CONFIRM_SUBMIT_RE = re.compile(r"^\s*(?:确认提交|确认发布)\s*$")
+
 
 def _is_publish_success_url(url) -> bool:
     """判断 URL 是否是「提交成功后应落到」的页面：章节管理页。
@@ -685,7 +736,8 @@ def _is_publish_success_url(url) -> bool:
 
 async def _await_submit_confirmation(page, verdict_holder, *,
                                      grace_s: float = _SUBMIT_CONFIRM_GRACE_S):
-    """「确认发布」按钮消失后，等待提交真正落地的确认信号。
+    """页脚提交按钮（「确认提交」/「确认发布」，见 _CONFIRM_SUBMIT_RE）消失后，
+    等待提交真正落地的确认信号。
 
     按钮消失 ≠ 提交成功：对话框被异常关闭（点击被吞后 DOM 重建、弹窗抢焦点）
     时按钮同样消失，而章节根本没提交。（成因之一"填完时间后裸按 Escape 把
@@ -722,7 +774,7 @@ async def _await_submit_confirmation(page, verdict_holder, *,
 
 
 async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None):
-    """点击「确认发布」后判定发布结果，每 200ms 轮询，按真实时钟控制超时。
+    """点击页脚提交按钮后判定发布结果，每 200ms 轮询，按真实时钟控制超时。
 
     判定规则（实测）:
     - publish_article 接口回 code==0 → 成功；code!=0 → 失败/上限（权威信号，
@@ -842,7 +894,7 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
                     # 输出窗口期接口响应，供排查定时发布实际命中的提交端点
                     logger.info(f"    窗口期接口响应: {'; '.join(api_probe[:8])}")
                 raise RuntimeError(
-                    "确认发布按钮已消失但提交未获确认"
+                    "提交按钮已消失但提交未获确认"
                     "（无接口 code=0 响应且页面仍停留在编辑器）——"
                     "对话框疑似被异常关闭，按未提交处理")
             now = time.monotonic()
@@ -895,7 +947,7 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
         pass
     if api_probe:
         logger.info(f"    窗口期接口响应: {'; '.join(api_probe[:8])}")
-    raise RuntimeError(f"确认发布按钮未消失，发布可能失败{extra}")
+    raise RuntimeError(f"提交按钮未消失，发布可能失败{extra}")
 
 
 # ---------------------------------------------------------------------------
@@ -3227,6 +3279,14 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False, draft_act
                 await page.wait_for_timeout(800)
                 continue
 
+        # 5.9) 编辑器内联字段校验提示（如「正文至少输入1000字」）-> 立即抛错。
+        #      与 1.5 同理，但来源是编辑器自己的 .serial-editor-tip 而非 toast。
+        #      **放在"点下一步"之前而不是 1.5 那个位置**：草稿恢复弹窗在场时编辑器
+        #      是空的、内联提示也可能在场，而那个中间态点"继续编辑"就能自愈——
+        #      在 1.5 查会把它误判成校验失败。只有真要往前推的时候，这条提示
+        #      才确定是拦路石。
+        await _check_editor_tip(page)
+
         # 6) 仍停在编辑器（含首次进入、以及"下一步"被吞的情况）-> 点"下一步"推进。
         #    仅当编辑器的 next 按钮可见时才点，避免误点其它流程的"下一步"。
         editor_next = page.locator("button.auto-editor-next")
@@ -3380,7 +3440,9 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
 
 
 async def _submit_confirm_publish(page):
-    """点「确认发布」并等接口判定。三条提交路径共用同一份动作。
+    """点页脚提交按钮（「确认提交」/「确认发布」，见 _CONFIRM_SUBMIT_RE）并等接口判定。
+
+    三条提交路径共用同一份动作。
 
     调用方: publish_scheduled（定时发布）、publish_one_chapter（立即发布）、
     edit_one_chapter（修改内容）。
@@ -3388,11 +3450,16 @@ async def _submit_confirm_publish(page):
     这是全流程最关键的一步——判定"是否真的提交成功"。曾经按"按钮消失"算成功，
     对话框异常关闭时按钮同样消失，748 章漏了 151 章。散成三份写就意味着以后改
     判定逻辑可能只改到其中一两处。
+
+    定位用 _CONFIRM_SUBMIT_RE 而非死文案：平台 2026-09 把按钮改名成「确认提交」，
+    按死文案找 count()==0，每一章都在这里抛错、整批中止（issue #3）。改文案的
+    风险不止"找不到"——判定成功后按钮消失的信号也走同一个 locator，故必须让
+    locator 本身认得两种文案。
     """
     await _check_daily_limit(page)
-    confirm_btn = page.locator("button", has_text="确认发布")
+    confirm_btn = page.locator("button", has_text=_CONFIRM_SUBMIT_RE)
     if await confirm_btn.count() == 0:
-        raise RuntimeError("未找到确认发布按钮")
+        raise RuntimeError("未找到确认提交按钮（确认发布/确认提交）")
     try:
         await confirm_btn.first.click(
             no_wait_after=True, timeout=_browser_timeout)
@@ -3405,7 +3472,7 @@ async def _submit_confirm_publish(page):
             gone = False
         if gone:
             raise RuntimeError(
-                f"「发布设置」对话框在点击「确认发布」前消失，本章未提交（原始错误: {e}）"
+                f"「发布设置」对话框在点击提交按钮前消失，本章未提交（原始错误: {e}）"
             ) from e
         raise
     await _wait_publish_result(page, confirm_btn.first)

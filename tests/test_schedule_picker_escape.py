@@ -23,6 +23,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import fanqie_upload as fu  # noqa: E402
 
 
+def _match(has_text, text):
+    """按 Playwright 语义判断 has_text 是否命中 text。
+
+    str 是**子串**匹配，regex 按 search 匹配——不能写成等值比较：源码用
+    _CONFIRM_SUBMIT_RE（regex）定位页脚提交按钮，等值比较会让这个假 page
+    永远返回 0，测试就变成"因为找不到按钮所以没点"，反而掩盖真问题。
+    """
+    if has_text is None:
+        return False
+    if hasattr(has_text, "search"):
+        return bool(has_text.search(text))
+    return has_text in text
+
+
 class FakeLocator:
     def __init__(self, page, key):
         self.page, self.key = page, key
@@ -56,6 +70,9 @@ class FakePage:
     """「发布设置」弹窗 + 日期/时间面板的状态机。
 
     关键真实行为：Enter 会关掉面板；面板关着时按 Escape 关的是弹窗本身。
+    submit_label 是页脚提交按钮的文案：2026-09 番茄由「确认发布」改成
+    「确认提交」（issue #3），源码按 _CONFIRM_SUBMIT_RE 两种都认，所以这个
+    假 page 也必须按 Playwright 语义（str 子串 / re search）匹配，不能写死等值。
     """
 
     def __init__(self):
@@ -66,6 +83,10 @@ class FakePage:
         self.published = False
         self.escapes = 0
         self.steal_focus = False   # 弹窗/公告抢焦点：键盘打不进输入框
+        self.submit_label = "确认发布"
+
+    def _is_submit(self, has_text):
+        return has_text is not None and _match(has_text, self.submit_label)
 
     def _count(self, key):
         sel, has_text = key
@@ -77,7 +98,7 @@ class FakePage:
             return 1
         if sel == "input[placeholder='请选择时间']":
             return 1
-        if sel == "button" and has_text == "确认发布":
+        if sel == "button" and self._is_submit(has_text):
             return 1
         return 0
 
@@ -93,7 +114,7 @@ class FakePage:
             self.focus, self.panel = "time", "time"
         if self.steal_focus:
             self.focus = None
-        elif sel == "button" and has_text == "确认发布":
+        elif sel == "button" and self._is_submit(has_text):
             if self.panel:             # 面板没关会盖住页脚按钮
                 raise fu.PWTimeout(
                     f"Locator.click: Timeout {timeout or 30000}ms exceeded.\n"
@@ -211,7 +232,7 @@ def test_vanished_modal_reports_real_reason():
         orig_count = page._count
         def count_then_kill(key):
             n = orig_count(key)
-            if key == ("button", "确认发布"):
+            if key[0] == "button" and page._is_submit(key[1]):
                 page.modal = False
             return n
         page._count = count_then_kill
@@ -223,7 +244,27 @@ def test_vanished_modal_reports_real_reason():
     except Exception as e:
         err = e
     check("弹窗消失 -> 报真因而非裸超时",
-          "对话框在点击「确认发布」前消失" in str(err), f"err={err!r}")
+          "对话框在点击提交按钮前消失" in str(err), f"err={err!r}")
+
+
+def test_new_confirm_submit_label():
+    """2026-09 番茄改版：页脚按钮由「确认发布」改成「确认提交」（issue #3）。
+
+    按死文案定位时 count()==0 -> 每章抛"未找到确认发布按钮" -> 整批中止
+    （三条提交路径共用 _submit_confirm_publish）。定位改用 _CONFIRM_SUBMIT_RE
+    后，新旧两种文案都必须能提交；同时也确认旧文案没被顺手丢掉——平台灰度
+    或回滚任一版本都得能跑。
+    """
+    for label in ("确认提交", "确认发布"):
+        page = FakePage()
+        page.submit_label = label
+        err = None
+        try:
+            asyncio.run(_run(page))
+        except Exception as e:
+            err = e
+        # 只留这一条断言：失败路径下 published 必为 False，不存在"没跑也算过"。
+        check(f"「{label}」文案下真的提交了", page.published, f"err={err!r}")
 
 
 if __name__ == "__main__":
@@ -231,5 +272,6 @@ if __name__ == "__main__":
     test_modal_survives_and_publishes()
     test_stolen_focus_never_publishes()
     test_vanished_modal_reports_real_reason()
+    test_new_confirm_submit_label()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

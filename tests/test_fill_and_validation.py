@@ -130,9 +130,11 @@ def test_fill_edit_mode_skips_num_check():
 class TextPage:
     """按可见文本集合驱动 .count()；toasts 经 _visible_toast_texts。"""
 
-    def __init__(self, present=(), messages=()):
+    def __init__(self, present=(), messages=(), tips=()):
         self.present = set(present)
         self.messages = list(messages)
+        # 编辑器内联提示（.serial-editor-tip），走 _check_editor_tip
+        self.tips = list(tips)
         self.clock = 0.0
         self.next_clicks = 0
 
@@ -140,6 +142,8 @@ class TextPage:
         self.clock += 0.02
         if "arco-message" in js or "messages:" in js:
             return {"messages": self.messages, "notifications": []}
+        if "serial-editor-tip" in js:
+            return list(self.tips)
         return None
 
     def locator(self, selector, has_text=None):
@@ -198,6 +202,69 @@ def test_reach_settings_not_blocked_by_check():
     p = TextPage(present={"发布设置"}, messages=["章节序号只支持阿拉伯数字"])
     err = run(fu._navigate_to_publish_settings(p, draft_action="放弃"))
     check("已到发布设置: 不被残留toast误杀", err is None, f"err={err!r}")
+
+
+def test_reach_settings_not_blocked_by_tip():
+    # 同理：已到发布设置时，残留的内联提示也不得误杀（分支 1 在 5.9 之前）
+    p = TextPage(present={"发布设置"}, tips=["正文至少输入1000字"])
+    err = run(fu._navigate_to_publish_settings(p, draft_action="放弃"))
+    check("已到发布设置: 不被残留内联提示误杀", err is None, f"err={err!r}")
+
+
+# ---------------- 编辑器内联校验提示（不走 toast 的那一半） ----------------
+def test_inline_tip_direct():
+    """2026-09-24 真机实测：正文不足 1000 字时平台弹的是编辑器**内联**提示。
+
+        <span>正文至少输入1000字</span>
+        祖先链 .serial-editor-tip < .serial-editor-content < ...
+        此刻 arco-message / arco-notification / arco-alert 容器数全为 0。
+
+    所以只扫 toast 的 _check_editor_validation 永远看不见它 —— 正则匹配得上也白搭。
+    """
+    bad = TextPage(tips=["正文至少输入1000字"])
+    err = run(fu._check_editor_tip(bad))
+    check("内联提示: 命中即抛 RuntimeError", isinstance(err, RuntimeError),
+          f"err={err!r}")
+    check("内联提示: 带平台原文",
+          err and "正文至少输入1000字" in str(err), f"err={err!r}")
+
+    # 提示区里与校验无关的文案不得误杀
+    ok = TextPage(tips=["本章已自动保存", "支持粘贴 Markdown"])
+    check("内联提示: 无关文案不抛错", run(fu._check_editor_tip(ok)) is None)
+
+    # 真机上没有该节点时返回 []；测试替身可能返回 None，两种都不能炸
+    check("内联提示: 节点不存在不抛错",
+          run(fu._check_editor_tip(TextPage())) is None)
+
+
+def test_inline_tip_fails_fast_in_state_machine():
+    """正文不足时必须在"点下一步"前抛错，而不是空转 14 轮 + 15s 误报超时。
+
+    真机复现（2026-09-24）：正文 930 字，向导全程推不动，日志只有
+    「发布设置超时」，真实原因（正文没写够）全丢 —— 正是
+    _EDITOR_VALIDATION_RE 那段注释要防的情况。
+    """
+    p = TextPage(present={"button.auto-editor-next"}, tips=["正文至少输入1000字"])
+    err = run(fu._navigate_to_publish_settings(p, draft_action="放弃"))
+    check("内联提示: 状态机里抛 RuntimeError", isinstance(err, RuntimeError),
+          f"err={err!r}")
+    check("内联提示: 错误带平台原文",
+          err and "正文至少输入1000字" in str(err), f"err={err!r}")
+    check("内联提示: 快速失败(虚拟<5s, 线上15s+)", p.clock < 5,
+          f"clock={p.clock:.1f}s")
+
+
+def test_inline_tip_not_checked_in_self_healing_state():
+    """内联提示只能在"点下一步"前查，**不能**挪到 1.5（toast 检查旁边）。
+
+    草稿恢复弹窗在场时编辑器是空的（真机实测：标题框空、正文 7 字），内联提示
+    也可能在场 —— 但那个中间态点"继续编辑"就自愈。挪到 1.5 会把可自愈状态
+    误判成字段校验失败，整章白白重试。
+    """
+    p = DraftWipePage(tip_during_popup=True)
+    err = run(fu._navigate_to_publish_settings(p))
+    check("内联提示(自愈态): 仍能到达发布设置", err is None, f"err={err!r}")
+    check("内联提示(自愈态): 内容未被丢弃", p.wc == 2570, f"wc={p.wc}")
 
 
 # ---------------- save_draft 误判成功 ----------------
@@ -259,17 +326,22 @@ class DraftWipePage:
       - 点"继续编辑": 保留内容 → 下一步 → 发布设置
     """
 
-    def __init__(self):
+    def __init__(self, tip_during_popup=False):
         self.stage = "editor"     # editor -> settings
         self.wc = 2570
         self.next_clicks = 0
         self.draft_popup = False  # 首次点下一步后出现
+        # 草稿恢复弹窗在场时，编辑器是空的、内联校验提示也在场（真机实测的中间态）
+        self.tip_during_popup = tip_during_popup
         self.clock = 0.0
 
     async def evaluate(self, js, *args):
         self.clock += 0.02
         if "arco-message" in js or "messages:" in js:
             return {"messages": [], "notifications": []}
+        if "serial-editor-tip" in js:
+            return (["正文至少输入1000字"]
+                    if (self.tip_during_popup and self.draft_popup) else [])
         if "正文字数" in js:
             return None
         return None
@@ -464,14 +536,18 @@ class DetectMethodPage:
     needs_confirm: True 时选完还需点"确定"才推进（Arco 弹窗页脚）。
     """
 
-    def __init__(self, needs_confirm=False, settings_premounted=False):
+    def __init__(self, needs_confirm=False, settings_premounted=False,
+                 submit_label="确认发布"):
         self.stage = "detect"     # detect -> (selected) -> settings
         self.needs_confirm = needs_confirm
-        # 选完检测方式的瞬间「发布设置」弹窗（含「确认发布」）就已挂上
+        # 选完检测方式的瞬间「发布设置」弹窗（含页脚提交按钮）就已挂上
         self.settings_premounted = settings_premounted
+        # 页脚提交按钮的文案。2026-09 番茄把它由「确认发布」改成「确认提交」
+        # （issue #3）——两种都含"确认"二字，都必须不被子串匹配误点。
+        self.submit_label = submit_label
         self.picked = None
         self.confirm_clicks = 0
-        self.publish_clicks = 0   # 「确认发布」被误点的次数——必须为 0
+        self.publish_clicks = 0   # 页脚提交按钮被误点的次数——必须为 0
         self.clock = 0.0
 
     def _buttons(self):
@@ -480,7 +556,7 @@ class DetectMethodPage:
         if self.stage == "detect" and self.needs_confirm:
             out.append("确定")
         if self.stage == "settings" or self.settings_premounted:
-            out.append("确认发布")
+            out.append(self.submit_label)
         return out
 
     @staticmethod
@@ -530,7 +606,7 @@ class DetectMethodPage:
                 if hit[0] == "确定":
                     page.confirm_clicks += 1
                     page.stage = "settings"
-                elif hit[0] == "确认发布":
+                elif hit[0] == page.submit_label:
                     page.publish_clicks += 1   # 立即发布了——事故
                     page.stage = "published"
 
@@ -567,13 +643,20 @@ def test_detect_method_with_confirm():
 
 
 def test_detect_method_never_hits_confirm_publish():
-    """选完检测方式时「发布设置」弹窗已在（有「确认发布」、没有「确定」）。
-    子串匹配的 has_text="确认" 会命中「确认发布」-> 跳过定时开关直接发布（不可逆）。"""
-    p = DetectMethodPage(needs_confirm=False, settings_premounted=True)
-    err = run(fu._navigate_to_publish_settings(p))
-    check("内容检测方式(发布设置已挂上): 到达发布设置", err is None, f"err={err!r}")
-    check("内容检测方式(发布设置已挂上): 没误点「确认发布」",
-          p.publish_clicks == 0, f"publish_clicks={p.publish_clicks}")
+    """选完检测方式时「发布设置」弹窗已在（有页脚提交按钮、没有「确定」）。
+    子串匹配的 has_text="确认" 会命中它 -> 跳过定时开关直接发布（不可逆）。
+
+    两种文案都过一遍：平台 2026-09 把页脚按钮由「确认发布」改成「确认提交」
+    （issue #3），新文案同样含"确认"，这个误点风险一字未减。
+    """
+    for label in ("确认发布", "确认提交"):
+        p = DetectMethodPage(needs_confirm=False, settings_premounted=True,
+                             submit_label=label)
+        err = run(fu._navigate_to_publish_settings(p))
+        check(f"内容检测方式(发布设置已挂上/{label}): 到达发布设置", err is None,
+              f"err={err!r}")
+        check(f"内容检测方式(发布设置已挂上/{label}): 没误点页脚提交按钮",
+              p.publish_clicks == 0, f"publish_clicks={p.publish_clicks}")
 
 
 def main():
@@ -584,6 +667,10 @@ def main():
     test_validation_toast_fails_fast()
     test_body_validation_toast()
     test_reach_settings_not_blocked_by_check()
+    test_reach_settings_not_blocked_by_tip()
+    test_inline_tip_direct()
+    test_inline_tip_fails_fast_in_state_machine()
+    test_inline_tip_not_checked_in_self_healing_state()
     test_save_draft_rejects_on_error_toast()
     test_save_draft_success()
     test_keep_draft_preserves_content()

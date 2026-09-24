@@ -82,9 +82,14 @@ for src, frag, label in GONE:
     check(f"{label} 已消除", frag not in src)
 # 提交动作只能存在一次：它就在 _submit_confirm_publish 里，多一次就是又抄了一份。
 # 这一步是"是否真的提交成功"的判定所在，曾按"按钮消失"算成功漏掉 151 章。
-_SUBMIT = 'confirm_btn = page.locator("button", has_text="确认发布")'
+_SUBMIT = 'confirm_btn = page.locator("button", has_text=_CONFIRM_SUBMIT_RE)'
 _n = FU.count(_SUBMIT)
 check(f"提交动作全仓只有一份（实测 {_n} 处）", _n == 1 and _SUBMIT not in GUI)
+# 页脚提交按钮不得按死文案定位：平台 2026-09 把它由「确认发布」改成「确认提交」
+# （issue #3），死文案找不到 -> 每章抛错 -> 整批中止。认文案必须走
+# _CONFIRM_SUBMIT_RE 这一个常量，两种文案都在里面。
+for _dead in ('has_text="确认发布"', 'has_text="确认提交"'):
+    check(f"提交按钮不按死文案定位（{_dead}）", _dead not in FU)
 
 print()
 print("== 不得出现「同一个东西两个名字」==")
