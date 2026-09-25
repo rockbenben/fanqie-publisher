@@ -92,6 +92,9 @@ class FillPage:
             async def text_content(self):
                 return f"正文字数 {page.wc}"
 
+            def nth(self, i):
+                return self
+
             @property
             def first(self):
                 return self
@@ -370,6 +373,9 @@ class DraftWipePage:
 
             async def text_content(self):
                 return f"正文字数 {page.wc}"
+
+            def nth(self, i):
+                return self
 
             async def click(self, **kw):
                 if has_text == "继续编辑":
@@ -659,11 +665,73 @@ def test_detect_method_never_hits_confirm_publish():
               p.publish_clicks == 0, f"publish_clicks={p.publish_clicks}")
 
 
+# ---------------- _get_word_count 双匹配误报（第4577章线上事故） ----------------
+class BodyMentionWordCountPage:
+    """顶部标签与正文段落都含「正文字数」的页面（chapter-4577.md 第123行实测）。
+
+    nth(0)=正文段落（"十一页每一页的正文字数，页脚归谁"，无 ASCII 数字），
+    nth(1)=顶部标签（"正文字数 1926"）。
+    对整个 locator 直接 text_content() 按 Playwright 语义抛 strict mode——
+    正是旧实现被 except 吞掉、恒返回 0 的那条路径。
+    """
+
+    def __init__(self, wc, body="十一页每一页的正文字数，页脚归谁，一行一行列着"):
+        self.wc = wc
+        self.body = body
+
+    def locator(self, selector, has_text=None):
+        page = self
+
+        class L:
+            def __init__(self, idx=None):
+                self.idx = idx
+
+            async def count(self):
+                return 2 if selector == "text=正文字数" else 0
+
+            def nth(self, i):
+                return L(i)
+
+            async def text_content(self):
+                if self.idx is None:
+                    raise RuntimeError(
+                        f'strict mode violation: locator("{selector}") '
+                        "resolved to 2 elements")
+                if self.idx == 0:
+                    return page.body
+                return f"正文字数 {page.wc}"
+
+        return L()
+
+    async def wait_for_timeout(self, ms):
+        pass
+
+    async def evaluate(self, js, *args):
+        return None
+
+
+def test_word_count_when_body_mentions_label():
+    """正文含「正文字数」四个字时仍要读到顶部真实字数（第4577章线上事故）。
+
+    旧实现 text_content() 撞 strict mode 被 except 吞掉 -> 恒 0 -> 粘贴明明
+    成功（截图里内容在、顶部显示 1926）却误报「正文粘贴失败 (字数=0)」，
+    整批在这一章中止、余下 714 章全部卡死。
+    """
+    wc = asyncio.run(fu._get_word_count(BodyMentionWordCountPage(wc=1926)))
+    check("正文含「正文字数」: 读到顶部真实字数", wc == 1926, f"wc={wc}")
+
+    # 正文匹配无数字时跳过它，取下一个（顶部标签）的数字
+    p = BodyMentionWordCountPage(wc=1926, body="正文字数")
+    wc = asyncio.run(fu._get_word_count(p))
+    check("正文段落无数字: 落到顶部标签", wc == 1926, f"wc={wc}")
+
+
 def main():
     test_detect_method_never_hits_confirm_publish()
     test_fill_self_heals_chapter_num()
     test_fill_raises_if_never_ready()
     test_fill_edit_mode_skips_num_check()
+    test_word_count_when_body_mentions_label()
     test_validation_toast_fails_fast()
     test_body_validation_toast()
     test_reach_settings_not_blocked_by_check()

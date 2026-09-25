@@ -1510,16 +1510,23 @@ async def wait_for_editor_ready(page, timeout=None, draft_action="放弃"):
 async def _get_word_count(page) -> int:
     """从页面顶部获取正文字数，返回整数。"""
     try:
-        el = page.locator("text=正文字数")
-        if await el.count() > 0:
-            txt = await el.text_content()
-            # text_content() 可能返回 None（节点暂无文本/正在重渲染）——直接喂给
-            # re.search 会抛 TypeError 被下面 except 吞掉、错当成"字数=0 粘贴失败"。
-            if txt:
-                # 去掉千分位逗号，避免 "1,234" 被截成 1。
-                m = re.search(r"(\d[\d,]*)", txt)
-                if m:
-                    return int(m.group(1).replace(",", ""))
+        els = page.locator("text=正文字数")
+        # 正文里出现「正文字数」四个字时（第4577章第123行实测），顶部标签和正文
+        # 段落会有两个匹配，对整个 locator 调 text_content() 会撞 Playwright
+        # strict mode（resolved to N elements），异常被下面 except 吞掉 ->
+        # 恒返回 0 -> 粘贴明明成功（截图里内容在、顶部 1926）却误报
+        # 「正文粘贴失败 (字数=0)」。逐个 nth 取文本，按 DOM 顺序（顶部标签在
+        # 前）取第一个含数字的；正文段落匹配不到数字就跳过。
+        for i in range(await els.count()):
+            # nth(i) 定位到单个元素，不受 strict mode 限制；
+            # text_content() 也可能返回 None（节点暂无文本/正在重渲染）。
+            txt = await els.nth(i).text_content()
+            if not txt:
+                continue
+            # 去掉千分位逗号，避免 "1,234" 被截成 1。
+            m = re.search(r"(\d[\d,]*)", txt)
+            if m:
+                return int(m.group(1).replace(",", ""))
     except Exception:
         pass
     return 0

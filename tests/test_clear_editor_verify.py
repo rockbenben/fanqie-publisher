@@ -78,6 +78,9 @@ class FakeLocator:
     async def text_content(self):
         return f"正文字数 {self.page.wc}"
 
+    def nth(self, i):
+        return self
+
     async def click(self, **kw):
         if self.kind == "ack" and not self.page.modal_undismissable:
             self.page.modal_visible = False
