@@ -72,10 +72,14 @@ if errorlevel 1 (
 REM ---- ensure browser engine is present ----
 REM The chromium binary is a SEPARATE artifact from the pip package; if it's
 REM missing or stale (e.g. after a Playwright upgrade) the GUI's login fails
-REM with "Executable doesn't exist". executable_path is version-specific, so
-REM this probe also catches the upgraded-but-not-synced case. Only install
-REM (in a visible window) when actually missing.
-%PYEXE% -c "import os,sys; from playwright.sync_api import sync_playwright; p=sync_playwright().start(); ep=p.chromium.executable_path; p.stop(); sys.exit(0 if os.path.exists(ep) else 1)" >nul 2>nul
+REM with "Executable doesn't exist".
+REM
+REM 探测必须是「真启动一次 headless 浏览器」，不能只查 chromium.executable_path：
+REM 新版 Playwright 把无头内核拆成了独立产物 chrome-headless-shell，只查有头
+REM chromium 会误判「已装好」而跳过安装，缺的那个就永远补不上——用户看到的是
+REM Executable doesn't exist at ...\chromium_headless_shell-1243\... 
+REM (rockbenben/fanqie-publisher#4)。真启动与内部产物名解耦，版本再变也对。
+%PYEXE% -c "import sys; from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); b.close(); p.stop()" >nul 2>nul
 if errorlevel 1 (
     if "%MODE%"=="hidden" (
         start "fanqie - installing browser engine" /wait cmd /c "echo [INFO] Installing browser engine (chromium)... & %PYEXE% -m playwright install chromium || (echo [WARN] Install failed - the app offers a one-click retry at login. & pause)"

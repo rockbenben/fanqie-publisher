@@ -1821,6 +1821,105 @@ BOOKS_JS = r"""() => {
 }"""
 
 
+# JS: 作品列表页的「渲染完成」判据 + 失败取证。
+#
+# 2026-10-10 实测（domcontentloaded 之后按时间采样）：
+#     0ms    body 全空（len=0），SPA 还没启动
+#   700ms    侧栏文案出来了，骨架仍在转（1 个 spinner），一本作品都还没到
+#  1500ms    列表落地，spinner 归零
+# 所以「侧栏就绪 + 不再转圈」才是渲染完成；chapter-manage 链接是渲染完成的
+# **结果**，不是它的信号——拿它当判据，见下面 wait_book_list_ready 的说明。
+BOOK_PAGE_STATE_JS = r"""() => {
+    const body = document.body.innerText || '';
+    const ids = [...new Set([...document.querySelectorAll('a[href*="/main/writer/"]')]
+        .map(a => (a.getAttribute('href') || '')
+            .match(/\/main\/writer\/(\d{10,})/)?.[1])
+        .filter(Boolean))];
+    return {
+        url: location.href,
+        body_len: body.length,
+        shell: /我的小说|作品管理/.test(body),
+        spinning: document.querySelectorAll(
+            '[class*="skeleton"], [class*="loading"], [class*="spin"], '
+            + '[class*="placeholder"], [class*="Skeleton"]').length > 0,
+        cards: document.querySelectorAll('a[href*="chapter-manage/"]').length,
+        ids,
+        short_story: /短故事/.test(body),
+        empty_hint: (body.match(/还没有作品|暂无作品|去创建|新建作品|创建作品/g) || [])
+            .slice(0, 3),
+    };
+}"""
+
+
+async def wait_book_list_ready(page, *, timeout_s=15, poll_ms=500):
+    """等作品列表页**渲染完成**，返回 (ready, state)。
+
+    为什么不能拿 `a[href*="chapter-manage/"]` 当判据: 那样等于把
+    「这个账号一本都没抓到」和「页面还没渲染完」混成同一件事。用户看到
+    "系统繁忙/请稍后重试" 就会一直刷新，而真正的原因（书建在短故事分区 /
+    新书还没有章节管理链接 / 平台改了页面结构）一个都不会被说出来。
+    GitHub issue #4 就是这样被卡住的。
+
+    ready=True 只说明"页面该长的样子长出来了"，不代表"页面上有书"——
+    有没有书是拿到 state 之后的下一步判断。
+    """
+    state = {}
+    deadline = time.monotonic() + timeout_s
+    while True:
+        state = await page.evaluate(BOOK_PAGE_STATE_JS)
+        if state.get("shell") and not state.get("spinning"):
+            return True, state
+        if time.monotonic() >= deadline:
+            return False, state
+        await page.wait_for_timeout(poll_ms)
+
+
+def describe_book_page(state, books=()):
+    """空结果时把"页面实际长什么样"讲清楚。返回给人看的多行文本。
+
+    只说页面上**能证实**的事，不猜原因——猜出来的原因会把人带偏。
+    """
+    state = state or {}
+    cards = state.get("cards", 0)
+    ids = state.get("ids") or []
+    # 有书时只报正常状态。调用方不该在有书时调它，但真调了也不能反过来报
+    # "一条都没抓到"——那是一句彻头彻尾的假话，比没有诊断更坏。
+    if books:
+        return ("作品列表页诊断：\n"
+                f"  当前 URL: {state.get('url')}\n"
+                f"  ✓ 页面已渲染完成，抓到 {len(books)} 本作品"
+                f"（{cards} 条 chapter-manage 链接）")
+    lines = ["作品列表页诊断：",
+             f"  当前 URL: {state.get('url')}"]
+    if not state.get("shell"):
+        lines.append("  ✗ 侧栏都没渲染出来 —— 页面可能确实没加载完"
+                     "（系统繁忙/网络慢/被风控拦下），可以稍后重试")
+    elif state.get("spinning"):
+        lines.append("  ✗ 侧栏已就绪但列表还在转圈 —— 平台返回慢，再等一会儿重试")
+    else:
+        lines.append("  ✓ 页面已渲染完成，但没有抓到任何作品")
+    # 两个旁证要分开：cards 是**本工具自己的选择器**命中数，ids 是页面里
+    # 另一套模式（/main/writer/<id>/）扫出来的。实测 3 本书的真实页面上
+    # cards=3 而 ids 只有 1——所以 ids 弱、cards 强，判断时不能混为一谈。
+    if cards:
+        lines.append(f"  ⚠ 本工具的选择器命中了 {cards} 条 chapter-manage 链接，"
+                     f"BOOKS_JS 却一条都没产出 —— 解析逻辑与页面结构已不匹配"
+                     f"（平台改版）。请把这段诊断反馈到 issue")
+    elif ids:
+        lines.append(f"  ⚠ 页面上引用过 {len(ids)} 个作品 id（{ids[:3]}），"
+                     f"却没有一条 chapter-manage 链接 —— 可能平台换了卡片结构，"
+                     f"或这本书不在「我的小说」页。请把这段诊断反馈到 issue")
+    if state.get("short_story"):
+        lines.append("  · 页面里有「短故事」分区：若这本书建在短故事下，"
+                     "它不会出现在「我的小说」页")
+    hint = state.get("empty_hint") or []
+    if hint:
+        lines.append(f"  · 页面自带的空态文案: {'、'.join(hint)}")
+    lines.append(f"  · 正文长度 {state.get('body_len', 0)}，"
+                 f"chapter-manage 链接 {cards} 条")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # JS: 从章节管理页提取最新一条发布时间（仅当前页，不翻页）
 # ---------------------------------------------------------------------------
@@ -4095,19 +4194,26 @@ async def cmd_books():
             await close_browser_safely(browser)
             return
         await settle_page(page)
-        list_timed_out = False
-        try:
-            await page.wait_for_selector('a[href*="chapter-manage/"]', timeout=5000)
-        except PWTimeout:
-            list_timed_out = True
+        ready, state = await wait_book_list_ready(page)
 
         books = await page.evaluate(BOOKS_JS)
 
         logger.info("")
-        if not books and list_timed_out:
-            logger.error("作品列表加载超时（多为系统繁忙或网络缓慢），登录状态未必有问题，请稍后重试")
-        elif not books:
-            logger.error("未找到作品，请检查登录状态 (重新运行 login)")
+        if not books:
+            # 原来这里只分两种情况，并且第二种直接让用户"重新运行 login"——
+            # 而 issue #4 的用户明明登着录、书也建好了。空结果的原因不止一个，
+            # 先把页面证据摊开，再给对应的那一句建议。
+            for line in describe_book_page(state, books).split("\n"):
+                logger.error(line)
+            if not ready:
+                logger.error("→ 页面没在 15 秒内加载完，稍后重试；"
+                             "反复出现请把上面这段诊断发到 issue")
+            elif state.get("ids"):
+                logger.error("→ 这更像工具的选择器跟不上平台改版，"
+                             "请把上面这段诊断发到 issue")
+            else:
+                logger.error("→ 若这个账号确实有作品，请确认它建在"
+                             "「我的小说」而不是「短故事」下")
         else:
             logger.info(f"找到 {len(books)} 部作品:")
             logger.info("-" * 60)

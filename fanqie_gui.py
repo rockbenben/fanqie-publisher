@@ -16,6 +16,7 @@ import subprocess
 import unicodedata
 import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
@@ -30,6 +31,7 @@ try:
         parse_chapter_spec, filter_by_chapter_spec, parse_time_spec,
         parse_datetime, TIMER_INPUT_FORMATS,
         fetch_chapter_items, audit_chapter_positions, MOVE_WINDOW_H, chapter_title_num,
+        wait_book_list_ready, describe_book_page,
         DISPLAY_PENDING as MOVE_PENDING, DISPLAY_PUBLISHED as MOVE_PUBLISHED,
         fetch_draft_list, compress_chapter_nums,
         volume_count,
@@ -213,6 +215,9 @@ class _SharedBrowser:
         # 各自 start() 一套 playwright+chromium，只有最后赋值的被记录，另一套
         # 子进程成为孤儿、连 _on_close 都关不到——进程/内存泄漏。
         self._lock = asyncio.Lock()
+        # 已确认内核缺失：让「一键装内核」一个会话只弹一次，而不是每个
+        # 失败的功能各弹一次
+        self.missing_browser = False
 
     async def ensure(self):
         """确保浏览器运行中，返回 context。"""
@@ -220,9 +225,19 @@ class _SharedBrowser:
             if self._browser and self._browser.is_connected():
                 return self._context
             await self._teardown()
-            self._pw = await async_playwright().start()
-            self._browser, self._context = await create_context(
-                self._pw, headless=True)
+            try:
+                self._pw = await async_playwright().start()
+                self._browser, self._context = await create_context(
+                    self._pw, headless=True)
+            except Exception as e:
+                # launch() 失败 = 内核没装或损坏。这个错会以完全相同的
+                # 形式从每个用到浏览器的功能里冒出来，而原先只有登录路径
+                # 做了识别：用户跳过登录直接点「刷新作品列表」，连着看到几次
+                # 英文原文，也不知道该干什么（rockbenben/fanqie-publisher#4）。
+                # 在这里置一次位，由上层弹一次中文引导 + 一键安装。
+                if looks_like_missing_browser(e):
+                    self.missing_browser = True
+                raise
             return self._context
 
     async def refresh(self):
@@ -252,6 +267,18 @@ class _SharedBrowser:
 # ---------------------------------------------------------------------------
 # 主 GUI
 # ---------------------------------------------------------------------------
+def looks_like_missing_browser(error) -> bool:
+        """判断错误是否为"Playwright 浏览器内核未安装/损坏"。
+
+        首次安装未跑 `playwright install chromium`、或升级后浏览器没同步时，
+        launch() 会抛此类错误，是新用户"点登录没反应"的最常见根因。
+        """
+        s = str(error).lower()
+        return ("executable doesn't exist" in s
+                or "playwright install" in s
+                or "please run the following command" in s)
+
+
 def _dlg_alive(w):
     """控件是否还存在。destroy() 之后再问 winfo_exists() 会抛 TclError。
 
@@ -1695,7 +1722,7 @@ class FanqieGUI:
         async def task():
             page = None
             try:
-                ctx = await self._shared.ensure()
+                ctx = await self._ensure_browser()
                 page = await ctx.new_page()
                 if self._fetch_gen != gen:
                     return
@@ -1932,7 +1959,7 @@ class FanqieGUI:
         async def task():
             page = None
             try:
-                ctx = await self._shared.ensure()
+                ctx = await self._ensure_browser()
                 page = await ctx.new_page()
                 if self._fetch_gen != gen:
                     return
@@ -2267,6 +2294,28 @@ class FanqieGUI:
         wh = win.winfo_height()
         win.geometry(f"+{sw - ww - 40}+{sh - wh - 80}")
 
+    async def _ensure_browser(self):
+        """拿共享浏览器；内核缺失时先给一次中文引导，再把异常原样抛回去。
+
+        守卫只存在这一处：所有浏览器入口的第一句都是这句。逐个 except 去贴
+        判断迟早会漏 —— 三处的 except 结构还不一样，有一处甚至没有 `as e`。
+        """
+        try:
+            return await self._shared.ensure()
+        except Exception as e:
+            # messagebox 不能在 worker 上弹，_after 切回主线程；
+            # 引导是模态的，等用户答完再继续往上抛，调用方照常走自己的错误分支。
+            self._after(0, self._guard_missing_browser, e)
+            raise
+
+    def _guard_missing_browser(self, error):
+        """内核缺失时给中文引导；同一会话只弹一次。"""
+        if not (getattr(self._shared, "missing_browser", False)
+                or looks_like_missing_browser(error)):
+            return
+        self._shared.missing_browser = False    # 清掉，保证只弹一次
+        self._prompt_install_browser()
+
     def _login_done(self, error):
         self._login_in_progress = False
         self.btn_login.configure(state="normal")
@@ -2280,7 +2329,7 @@ class FanqieGUI:
             self._log(f"登录失败: {error}")
             # 错误必须显眼：登录是新用户的第一步，只往日志里塞一行很容易被忽略，
             # 表现成"点了没反应"。缺浏览器内核是最常见原因，单独给出可一键修复的引导。
-            if self._looks_like_missing_browser(error):
+            if looks_like_missing_browser(error):
                 self._prompt_install_browser()
             else:
                 messagebox.showerror(
@@ -2298,18 +2347,6 @@ class FanqieGUI:
             # 刷新共享浏览器以加载新的登录状态
             self.worker.submit(self._shared.refresh())
             self._after(300, self._on_refresh_books)
-
-    @staticmethod
-    def _looks_like_missing_browser(error) -> bool:
-        """判断错误是否为"Playwright 浏览器内核未安装/损坏"。
-
-        首次安装未跑 `playwright install chromium`、或升级后浏览器没同步时，
-        launch() 会抛此类错误，是新用户"点登录没反应"的最常见根因。
-        """
-        s = str(error).lower()
-        return ("executable doesn't exist" in s
-                or "playwright install" in s
-                or "please run the following command" in s)
 
     def _prompt_install_browser(self):
         """缺浏览器内核时弹窗引导：可一键自动下载，或给出手动命令。"""
@@ -2380,7 +2417,7 @@ class FanqieGUI:
         async def task():
             page = None
             try:
-                ctx = await self._shared.ensure()
+                ctx = await self._ensure_browser()
                 page = await ctx.new_page()
                 # domcontentloaded 比 networkidle 可靠: 平台埋点/轮询会拖死 networkidle
                 # 致使 goto 超时被误判为会话失效。
@@ -2390,15 +2427,31 @@ class FanqieGUI:
                         page, BOOK_MANAGE_URL, wait_until="domcontentloaded"):
                     self._after(0, self._books_fetched, [], "__SESSION_EXPIRED__")
                     return
-                list_timed_out = False
-                try:
-                    await page.wait_for_selector('a[href*="chapter-manage/"]', timeout=10000)
-                except PWTimeout:
-                    list_timed_out = True
+                # 判据换成「页面渲染完了」，而不是「等某条业务链接出现」：后者把
+                # 「这账号一本都没抓到」和「页面还没渲染完」混成同一件事，用户
+                # 就会被反复告知"系统繁忙"却永远出不来（GitHub issue #4）。
+                ready, state = await wait_book_list_ready(page)
                 books = await page.evaluate(BOOKS_JS)
-                if not books and list_timed_out:
-                    # 列表迟迟没渲染出来：是加载问题不是登录问题，别误导用户去重新登录
-                    self._after(0, self._books_fetched, [], "__PAGE_TIMEOUT__")
+                if not books:
+                    # 空结果先取证再说：诊断 + 现场截图写进日志，下一个报同样
+                    # 问题的人不用再靠猜。以前这两样都没有，只能问三轮。
+                    diag = describe_book_page(state, books)
+                    shot = await self._shot(page, "booklist_empty")
+                    if shot:
+                        diag += f"\n  截图: {shot}"
+                    if not ready:
+                        self._after(0, self._books_fetched, [],
+                                    "__PAGE_TIMEOUT__", diag)
+                        return
+                    # 本工具的选择器命中了链接、却没产出条目 → 解析坏了；
+                    # 或者页面上引用过作品 id 却没有 chapter-manage 链接 →
+                    # 结构变了、或书不在「我的小说」页。两种都说明"这个账号
+                    # 没有作品"站不住，不能再把人往建书页上引。
+                    # 传 __EMPTY__ 走取证提示；两个旁证都没有才传空错误码，
+                    # 落回原有的"还没有作品"引导。
+                    suspect = bool(state.get("cards")) or bool(state.get("ids"))
+                    self._after(0, self._books_fetched, [],
+                                "__EMPTY__" if suspect else "", diag)
                     return
                 await save_auth(ctx)
                 self._after(0, self._books_fetched, books, None)
@@ -2417,12 +2470,46 @@ class FanqieGUI:
 
         self.worker.submit(task())
 
-    def _books_fetched(self, books, error):
+    def _shot(self, page, tag):
+        """失败现场截图，落到 error_<tag>_<时间戳>.png（.gitignore 已排除）。
+
+        以前没有任何失败截图：用户只能截自己那一屏 GUI，看不到浏览器里平台
+        到底渲染成了什么样，定位全靠猜。空列表/超时这两条路径尤其需要。
+        """
+        try:
+            path = SCRIPT_DIR / f"error_{tag}_{int(time.time())}.png"
+            page.screenshot(path=str(path))
+            return str(path)
+        except Exception as e:
+            logger.debug(f"失败现场截图未保存: {e}")
+            return ""
+
+    def _books_fetched(self, books, error, diag=""):
         self._books_loading = False
         self.btn_books.configure(state="normal")
+        if diag:
+            self._log("—— 作品列表页取证 ——")
+            for line in diag.split("\n"):
+                self._log("  " + line)
         if error == "__PAGE_TIMEOUT__":
-            self._log("获取失败: 作品列表长时间未加载出来（多为系统繁忙或网络缓慢，"
+            self._log("获取失败: 作品列表在 15 秒内没加载完（多为系统繁忙或网络缓慢，"
                       "例如有其他自动化程序占用资源）。登录状态未必有问题，请稍后重试。")
+            return
+        if error == "__EMPTY__":
+            # 空结果有两种，后果完全不同：真的没作品 → 该去建书；页面上明明有
+            # 作品 id 却没抓到 → 工具跟不上平台改版，该报 issue。issue #4 的用户
+            # 明明登着录、书也建好了，却被反复告知"系统繁忙"，差别就在这里。
+            self._log("获取失败: 页面已渲染完成却没抓到作品。上面的取证显示"
+                      "页面上其实有内容，这不是「账号没有作品」，多半是选择器"
+                      "跟不上平台改版——请把这段日志发到 issue。")
+            messagebox.showwarning(
+                "作品列表抓不到",
+                "页面已经加载完成，但没有抓到任何作品。\n\n"
+                "这不一定是「这个账号没有作品」，可能是：\n"
+                "  · 这本书建在「短故事」分区，不在「我的小说」页\n"
+                "  · 平台改了页面结构，工具的选择器跟不上\n\n"
+                "日志面板里有取证信息（页面上出现过几个作品 id、页面自带的"
+                "空态文案、现场截图），请一并反馈到 issue，谢谢。")
             return
         if error == "__SESSION_EXPIRED__":
             self._log("获取失败: 登录状态可能已失效")
