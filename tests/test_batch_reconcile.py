@@ -4,6 +4,8 @@
 背景: 2026-07-24 748 章定时发布，日志记"成功 736"，平台上却少 151 章，
 三周后人工枚举才发现——那时早已超过手机 App 的 3 天移动窗口，全部永久错位。
 对账就是把"日志说的"和"平台真有的"当场怼一遍。
+体检除了排位置错位，也查一类工具修不了、但必须让用户知道的故障：
+某一章审核被拒，把后面整批卡在审核里。
 """
 import sys
 from pathlib import Path
@@ -11,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fanqie_upload import (  # noqa: E402
     find_missing_after_batch, audit_chapter_positions, chapter_title_num,
+    find_review_block,
     volume_count, global_position, VOLUME_INDEX_STRIDE,
     verify_content_matches_book,
     DISPLAY_PUBLISHED, DISPLAY_PENDING,
@@ -19,11 +22,12 @@ from fanqie_upload import (  # noqa: E402
 FAILED = []
 
 
-def check(label, cond):
+def check(label, cond, detail=""):
+    """detail 只在失败时附在后面 —— 失败信息里没有实际值，等于让人猜。"""
     if cond:
         print(f"  [PASS] {label}")
     else:
-        print(f"  [FAIL] {label}")
+        print(f"  [FAIL] {label}" + (f"  <- {detail!r}" if detail else ""))
         FAILED.append(label)
 
 
@@ -143,6 +147,62 @@ across = [item(1, "第1章"), dict(item(10001, "第2章"), pos=2),
           dict(item(20001, "第3章"), pos=3)]
 check("跨卷都算存在", find_missing_after_batch(across, [1, 2, 3]) == [])
 check("真缺的仍报出", find_missing_after_batch(across, [1, 2, 3, 4]) == [4])
+
+print("== 审核被拒、把后面整批卡在审核中 ==")
+# 实测（2026-10-10）：位置 4783 状态 7（审核不通过），4784~5196 共 413 章
+# 状态 4（平台理由「审核中暂不支持修改」），一路卡到全书末尾。
+# 平台按位置顺序审——被拒那一章不解决，后面这批永远不会自己过审。
+#
+# 这里判的是**模式**（异常章 + 紧跟一大片"审核中"），不是"状态 7 是什么意思"：
+# 状态码没有官方文档，硬编码含义换个平台版本就成错的。
+REVIEW = "审核中暂不支持修改"
+
+
+def rv(pos, ds, reason="", title=None):
+    it = item(pos, title or f"第{pos}章", ds=ds, tt=NOW + 50 * H)
+    it["cant_modify_reason"] = reason
+    return it
+
+
+blocked = ([rv(i, DISPLAY_PUBLISHED) for i in range(1, 5)]
+           + [rv(5, 7, "", "第5章 被拒的")]
+           + [rv(p, 4, REVIEW, f"第{p}章") for p in range(6, 6 + 413)])
+blk = find_review_block(blocked)
+check("识别出被拒章", blk is not None)
+check("报出被拒章的位置", blk and blk["index"] == 5, blk)
+check("报出被卡住的章数", blk and blk["blocked"] == 413, blk)
+check("报出卡住区段的右端点（用于说明'一路卡到哪'）",
+      blk and blk["blocked_to"] == 5 + 413, blk)
+check("带回章名（用户要拿它去平台改）", blk and "被拒" in blk["title"], blk)
+check("audit_chapter_positions 把它带出来",
+      audit_chapter_positions(blocked, now_ts=NOW)["review_block"] is not None)
+
+print("-- 边界：不该报的都不报 --")
+few = ([rv(i, DISPLAY_PUBLISHED) for i in range(1, 5)]
+       + [rv(p, 4, REVIEW, f"第{p}章") for p in range(5, 11)])          # 6 章 < 阈值
+check("6 章审核中 → 不是卡队列", find_review_block(few) is None)
+
+normal = [rv(i, DISPLAY_PENDING if i > 3 else DISPLAY_PUBLISHED) for i in range(1, 60)]
+check("全书正常 → 不报", find_review_block(normal) is None)
+check("audit 的 review_block 为 None 时不炸",
+      audit_chapter_positions(normal, now_ts=NOW)["review_block"] is None)
+
+tail = [rv(i, DISPLAY_PUBLISHED) for i in range(1, 5)] + [rv(5, 7, "", "第5章")]
+check("被拒章后面没有审核中 → 不报（那不是卡队列）", find_review_block(tail) is None)
+
+mixed = ([rv(i, DISPLAY_PUBLISHED) for i in range(1, 5)] + [rv(5, 7, "", "第5章")]
+         + [rv(p, 4, REVIEW, f"第{p}章") for p in range(6, 20)]
+         + [rv(20, DISPLAY_PENDING)]                       # 打断
+         + [rv(p, 4, REVIEW, f"第{p}章") for p in range(21, 60)])
+b2 = find_review_block(mixed)
+check("只数紧邻的那一段（14 章），不把后面第二段也算进去",
+      b2 and b2["blocked"] == 14, b2)
+
+reviewing_only = ([rv(i, DISPLAY_PUBLISHED) for i in range(1, 5)]
+                  + [rv(p, 4, REVIEW, f"第{p}章") for p in range(5, 40)])
+check("前面没有异常章（只是恰好在审）→ 不报", find_review_block(reviewing_only) is None)
+
+print("== 分卷计数 ==")
 
 print("== 分卷计数 ==")
 check("无分卷信息按 1 卷", volume_count({}) == 1)

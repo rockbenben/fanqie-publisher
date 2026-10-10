@@ -232,7 +232,7 @@ async def run_publish(page, book_id, nums, schedule, num2path, sig_urls, *,
         if not done:
             print(f"    ✗ {err} —— 中止整批", flush=True)
             return abort(i, err or "未知失败")
-        # 逐章确认新章真的落地了 —— 漏一章就是永久缺口，不能只信提交信号
+        # 逐章确认新章真的落地了 —— 漏一章就是位置层面的永久缺口，不能只信提交信号
         if not await fu.confirm_chapter_on_platform(page, sig_urls, num):
             print(f"    ✗ 平台上查不到 第{num}章（提交说成功了）—— 中止整批",
                   flush=True)
@@ -298,7 +298,7 @@ async def main_async(args):
                 # 中段缺口本工具不碰（发上去只会吊在书尾），提醒去用 remap
                 print(f"⚠ 平台中段还缺 {len(gaps)} 章（如 第"
                       + "、第".join(str(n) for n in gaps[:5])
-                      + "章…）——这些**不能**靠发布补回原位，"
+                      + "章…）——这些不能靠发布补回原位，"
                         "请用 tools/remap/remap.py 处理", flush=True)
             if fu.book_mismatch_abort(items, num2path):
                 return True
@@ -464,7 +464,7 @@ def demo():
     assert nums6 == [5, 6], nums6
     # --- 铁律: 发布路径必须逐章确认，且确认不到必须中止 ---
     # 与 remap（改内容）正相反: 那边 item 已存在，回读误判只是白丢一批；
-    # 这边漏判一章 = 平台上根本没有这章，而新建只能追加到书尾，永久缺口。
+    # 这边漏判一章 = 平台上根本没有这章，而新建只能追加到书尾，位置层面永久缺口。
     import inspect as _insp, re as _re
     _src = _insp.getsource(run_publish)
     assert "fu.confirm_chapter_on_platform" in _src, "发布路径必须逐章确认"

@@ -265,18 +265,22 @@ class _SharedBrowser:
 
 
 # ---------------------------------------------------------------------------
-# 主 GUI
+# 主 GUI（其下先是两个模块级小辅助 looks_like_missing_browser / _dlg_alive，再是 FanqieGUI 类）
 # ---------------------------------------------------------------------------
 def looks_like_missing_browser(error) -> bool:
-        """判断错误是否为"Playwright 浏览器内核未安装/损坏"。
+    """判断错误是否为"Playwright 浏览器内核未安装/损坏"。
 
-        首次安装未跑 `playwright install chromium`、或升级后浏览器没同步时，
-        launch() 会抛此类错误，是新用户"点登录没反应"的最常见根因。
-        """
-        s = str(error).lower()
-        return ("executable doesn't exist" in s
-                or "playwright install" in s
-                or "please run the following command" in s)
+    首次安装未跑 `playwright install chromium`、或升级后浏览器没同步时，
+    launch() 会抛此类错误。它是所有「点下去没反应」里最常见、也最容易自己修的
+    一种：识别它就能给出可一键执行的修复，而不是让人对着报错猜。
+
+    放模块级而不是 FanqieGUI 的静态方法：_SharedBrowser（在 GUI 之外、无权
+    访问 GUI）也要用它给 ensure() 的失败置位。
+    """
+    s = str(error).lower()
+    return ("executable doesn't exist" in s
+            or "playwright install" in s
+            or "please run the following command" in s)
 
 
 def _dlg_alive(w):
@@ -2493,23 +2497,26 @@ class FanqieGUI:
                 self._log("  " + line)
         if error == "__PAGE_TIMEOUT__":
             self._log("获取失败: 作品列表在 15 秒内没加载完（多为系统繁忙或网络缓慢，"
-                      "例如有其他自动化程序占用资源）。登录状态未必有问题，请稍后重试。")
+                      "例如有其他自动化程序占用资源）。登录状态未必有问题，请稍后"
+                      "重试；上面的取证会写明页面到底停在哪一步。")
             return
         if error == "__EMPTY__":
-            # 空结果有两种，后果完全不同：真的没作品 → 该去建书；页面上明明有
-            # 作品 id 却没抓到 → 工具跟不上平台改版，该报 issue。issue #4 的用户
-            # 明明登着录、书也建好了，却被反复告知"系统繁忙"，差别就在这里。
+            # 这里只判「页面上到底有没有书的痕迹」（有 id / 有章节管理链接），
+            # 不判定是哪一种原因。取证行已经写清了：页面上出现过几个 id、有没有
+            # chapter-manage 链接、平台自己的空态文案是什么。issue #4 的用户明明
+            # 登着录、书也建好了，却被反复告知"系统繁忙"——差别就在不替人下结论。
             self._log("获取失败: 页面已渲染完成却没抓到作品。上面的取证显示"
-                      "页面上其实有内容，这不是「账号没有作品」，多半是选择器"
-                      "跟不上平台改版——请把这段日志发到 issue。")
+                      "页面上其实有内容，所以这不是「这个账号没有作品」——"
+                      "具体是哪一种，看上面那几行取证。")
             messagebox.showwarning(
                 "作品列表抓不到",
                 "页面已经加载完成，但没有抓到任何作品。\n\n"
-                "这不一定是「这个账号没有作品」，可能是：\n"
+                "这不一定是「这个账号没有作品」。常见两种：\r\n"
                 "  · 这本书建在「短故事」分区，不在「我的小说」页\n"
                 "  · 平台改了页面结构，工具的选择器跟不上\n\n"
-                "日志面板里有取证信息（页面上出现过几个作品 id、页面自带的"
-                "空态文案、现场截图），请一并反馈到 issue，谢谢。")
+                "日志里的「—— 作品列表页取证 ——」那段写明了是哪种"
+                "（页面自带的空态文案、出现过几个作品 id、有没有章节管理链接、"
+                "现场截图）。请把它一并反馈到 issue，谢谢。")
             return
         if error == "__SESSION_EXPIRED__":
             self._log("获取失败: 登录状态可能已失效")
@@ -4165,7 +4172,7 @@ class FanqieGUI:
                 args += ["--limit", n]
             got["value"] = (
                 args,
-                ("把已发布的位置 i 改回装第 i 章（内容改写，位置不动）。"
+                ("已发布的章改成『位置 i 装第 i 章』——只改内容，位置不动。"
                  if pub.get() else
                  "把未公开的待发布章按位置重装内容（位置 i 装第 i 章），排期不变。"),
             )
@@ -4199,6 +4206,27 @@ class FanqieGUI:
             d = ""
         fallback = (self._cfg.get("chapters_dir") or "").strip()
         return d or fallback or str(SCRIPT_DIR / "chapters")
+
+    @staticmethod
+    def _exec_summary(out, desc):
+        """预览之后的确认框文案：只放做决定要用的那几行。
+
+        完整输出已经在预览面板里，确认框再倒一遍 12 行原始输出只会让人以为
+        这是个命令行工具——而它其实全程都在 GUI 里点。从输出里摘「要改多少 /
+        有多少要等第二轮 / 代价」，其余交给预览面板。
+        """
+        m = re.search(r"将改写\s*(\d+)\s*个\s*item", out)
+        n = int(m.group(1)) if m else 0
+        rows = [f"将改写 {n} 个章节"]
+        # 撞名的那些会自动再走一趟，不用用户操心，但说清楚免得以为漏了
+        d = re.search(r"本趟会撞名[^:：]*[:：]\s*\[([^\]]*)\]", out)
+        if d:
+            rows.append(f"· 其中 {len(d.group(1).split(','))} 个章号还没腾出来，"
+                        f"会自动再走一趟，不用管")
+        if desc:
+            rows.append(f"· {desc}")
+        rows.append("· 完整计划见下方预览面板")
+        return "\r\n".join(rows)
 
     def _run_cli_tool(self, name, title, desc, extra=()):
         """remap / keep_ahead 共用：先跑 dry-run 预览，确认后再 --run。
@@ -4247,16 +4275,18 @@ class FanqieGUI:
                     or "没有可排的章" in out or "没有需要改写" in out):
                 self._notify("info", title, "没有需要处理的章节，详见预览面板。")
                 return
-            tail = "\n".join(out.strip().splitlines()[-12:])
-            if not self._ask_yes_no(
-                    title, "%s\n\n预览结果：\n%s\n\n确认执行吗？" % (desc, tail)):
+            if not self._ask_yes_no(title, self._exec_summary(out, desc)):
                 return
             run_cli(["--run"], after_run)
 
         def after_run(out):
             self._set_uploading(False)
             self._set_preview(out.strip() or "(无输出)")
-            self._notify("info", title + "完成", "详见预览面板。")
+            m2 = re.search(r"成功\s*(\d+)\s*失败\s*(\d+)", out)
+            got = (f"已改写 {m2.group(1)} 个章节"
+                   if m2 else "已完成，") if m2 and m2.group(1) != "0" else None
+            self._notify("info", title + "完成",
+                         (got + "，详见预览面板。" if got else "详见预览面板。"))
 
         self._set_preview("正在预览「%s」…" % title)
         run_cli([], after_preview)
@@ -4333,109 +4363,93 @@ class FanqieGUI:
         # 不同，拿上一本的区间去填等于写错书。
         self._last_audit = {"at": datetime.now(), "book_id": self._current_book_id(),
                             "pend_bad": list(pend_bad), "pub_bad": pub_bad}
-        lines = ["缺口体检", "=" * 60]
+        blk = rep.get("review_block")
+        lines = []
+        if blk:
+            # 放最前面，并加醒目分隔：这是唯一一条「工具修不了、不处理就一直卡着」
+            # 的故障，混在 A/B/C 后面会被当成背景噪音。
+            to = (f"（一直排到位置 {blk['blocked_to']}）"
+                  if blk.get("blocked_to") else "")
+            lines += ["!" * 60,
+                      f"⚠ 审核卡住了：位置 {blk['index']} 这一章没过审核，"
+                      f"后面 {blk['blocked']} 章全卡在审核中{to}",
+                      f"   被卡的那章：位置 {blk['index']}「{blk['title'][:24]}」",
+                      "   怎么办：去番茄后台改掉这一章重新提交；或用「修改内容」"
+                      "模式重发它",
+                      f"   ⚠ 它不会自己过审：平台按位置顺序审，这一章不解决，"
+                      f"后面这 {blk['blocked']} 章就一直卡着不发布",
+                      "!" * 60, ""]
+        lines += ["缺口体检", "=" * 60]
+        # 整份报告的组织方式：三段各自只回答四件事——坏在哪 / 改多少 /
+        # 怎么点 / 代价，一行一样。取证信息（页面旁证、命令行写法、原理推导）
+        # 只在可疑时才展开：那是排查用的，正常读报告的人不需要，
+        # 也不该被十几行淹没。
         if volume_count(volumes or {}) > 1:
             # 已跨卷合并；位置按全书连续计（卷序号*10000+卷内位置 → 累加偏移）
             lines.append(f"本作品 {volume_count(volumes)} 卷，已跨卷合并，"
                          f"位置按全书连续计。")
             lines.append("")
-        lines.append(f"A 未公开段位置与章号不符：{len(pend_bad)} 个")
+        pend_lo = min(pend_bad) if pend_bad else 0
+        pend_hi = max(pend_bad) if pend_bad else 0
+        lines.append(f"A 未公开段位置与章号不符：{len(pend_bad)} 个"
+                     + (f"（位置 {self._compress_nums(pend_bad)}）" if pend_bad else ""))
         if pend_bad:
-            lines.append(f"   位置: {self._compress_nums(pend_bad)}"
-                         f"（全书位置，多卷已折算；不是章号）")
-            lines.append("   → 点「章节重排…」→ 保持『未公开段』"
-                         f"→ 点「填入 {min(pend_bad)}-{max(pend_bad)}」"
-                         "（或只跑 python tools/remap/remap.py --run）")
-            first = min(pend_bad)
+            lines.append(f"   修：点「章节重排…」保持『未公开段』，"
+                         f"区间已自动填好 {pend_lo}-{pend_hi}")
             # pend_bad 存的是全书位置（pos）；多卷下原始 index 带卷偏移，
             # 拿 index 查会查空，缓冲告警就静默消失了
             tt = next((int(x.get("timer_time") or 0) for x in items
-                       if x.get("pos", x["index"]) == first), 0)
-            if tt:
-                left_h = (tt - datetime.now().timestamp()) / 3600
-                warn = "⚠ " if left_h < MOVE_WINDOW_H else ""
-                lines.append(
-                    f"   {warn}缓冲：位置 {first} 将于 "
-                    f"{datetime.fromtimestamp(tt):%Y-%m-%d %H:%M} 发出，"
-                    f"还剩 {left_h:.1f} 小时（{left_h / 24:.1f} 天）")
-                if left_h < MOVE_WINDOW_H:
-                        # 这句以前写的是"否则错位章发出后只能去 App 申请移动"，现在不成立了：
-                    # 发出之后照样能靠「章节重排」改写内容把顺序修回来，只是
-                    # 成本从"App 里移一章"变成"重写整段内容 + 重新过审"。
-                    lines.append("   ⚠ 缓冲已跌破 3 天：今天必须补跑。拖到发出后"
-                                 "仍能修，但要改写整段内容，成本高得多")
-        else:
-            lines.append("   → 未公开段全部就位")
+                       if x.get("pos", x["index"]) == pend_lo), 0)
+            left_h = (tt - datetime.now().timestamp()) / 3600 if tt else None
+            if left_h is not None and left_h < MOVE_WINDOW_H:
+                lines.append(f"   ⚠ 位置 {pend_lo} 只剩 {left_h / 24:.1f} 天就发出，"
+                             f"缓冲已不足 3 天 —— 今天就得补跑")
         lines.append("")
-        # 标题原来只说"还能在 App 里申请移动"，读起来像 C 段已经没救了。
-        # 两条路都在，只是成本不同：App 移动 = 只动这一章的位置；改写内容 =
-        # 能把整段错位一起修好，但要走重审。
         lines.append(f"B 已公开、发布 3 天内（App 里还能移动位置）："
                      f"{len(rep['in_window'])} 章")
         for r in rep["in_window"]:
-            lines.append(f"   第{r['num']}章（现在位置 {r['index']}）"
-                         f"发布于 {datetime.fromtimestamp(r['pub_at']):%m-%d %H:%M}，"
+            lines.append(f"   第{r['num']}章（现在位置 {r['index']}），"
                          f"窗口还剩 {r['left_h']:.1f} 小时")
         if rep["in_window"]:
-            lines.append("   → 最省事的做法：手机 App 申请调整 → 通过后"
-                         "选中该章 → 移动到正确位置（只动这一章的位置）")
-            lines.append("     窗口一关就落进 C 段——那时仍能修，但要改写整段内容，成本高得多")
+            lines.append("   修：手机 App 申请调整 → 通过后选中该章 → 移动位置"
+                         "（只动这一章，不用重写内容）")
         lines.append("")
         exp = rep["expired"]
         n_bad = len(pub_bad)
-        # 首行要说人话：倒挂章可能一个都没有（只是整段均匀偏移时），那时打
-        # "0 章倒挂" 紧接着又让人改一堆章，读起来是自相矛盾的。
-        if exp:
-            lines.append(f"C 已公开段顺序错位：{len(exp)} 章倒挂（位置再也动不了）")
-        elif n_bad:
-            lines.append(f"C 已公开段顺序错位：{n_bad} 章（位置再也动不了）")
+        lo, hi = (min(pub_bad), max(pub_bad)) if n_bad else (0, 0)
+        if n_bad:
+            # 倒挂的章（位置在某章之后却装更小的章号）可能一个都没有——
+            # 整段均匀偏移时就是这样。所以首行报的是**要改的章数**，不是倒挂数：
+            # 两者差两个数量级，只报倒挂会让人以为「修 3 章就完事」。
+            lines.append(f"C 已公开段顺序错位：{n_bad} 章（位置 {lo}-{hi}）")
+            if exp:
+                view = self._reader_view_around(items, exp[0]["index"], span=2)
+                if view:
+                    lines.append("   读者目录现在看到：… " + " → ".join(view) + " …")
+                # 点名是哪几章顺序断裂。只给「其中 3 章」这个数字的话，用户还得
+                # 自己回目录里找那 3 章。它紧跟上面那串，因为它就是那串的解释。
+                _bad = "、".join(f"第{r['num']}章(在{r['index']})" for r in exp[:5])
+                _more = f"…共{len(exp)}章" if len(exp) > 5 else ""
+                _pron = "它们" if len(exp) > 1 else "它"
+                _tail = (f"；其余 {n_bad - len(exp)} 章是被{_pron}带偏的，"
+                         f"内容同样要换") if n_bad > len(exp) else ""
+                lines.append(f"   顺序断裂的是 {len(exp)} 章：{_bad}{_more}{_tail}")
+            lines.append(f"   修：点「章节重排…」选『已公开段』，"
+                         f"区间已自动填好 {lo}-{hi}")
+            cost = "要重写线上内容并重新过审，读者可能收到更新"
+            cost += ("；章数多会撞提交上限，分批跑" if n_bad >= 30 else "")
+            lines.append("   代价：" + cost)
+            # 以下两条只在可疑时才输出：正常错位不需要看这些
+            span_n = hi - lo + 1
+            if span_n != n_bad:
+                lines.append(f"   注：区间里另有 {span_n - n_bad} 章本来就对，"
+                             f"会自动跳过")
+            if rep["in_window"]:
+                lines.append(f"   注：B 段那 {len(rep['in_window'])} 章窗口一关"
+                             f"就落进 C 段，本次改写也会覆盖它们")
+
         else:
             lines.append("C 已公开段：正常")
-        if exp:
-            lines.append("   " + "、".join(
-                f"第{r['num']}章(位置{r['index']})" for r in exp))
-            view = self._reader_view_around(items, exp[0]["index"], span=2)
-            if view:
-                lines.append("   读者目录现在看到：… " + " → ".join(view) + " …")
-        # 倒挂章只是「症状」，真正要改的是被它们顶偏的整段。只报 len(exp) 会让人
-        # 以为修 3 章就完事，实际是几百章——差两个数量级，必须在这里讲清楚。
-        if n_bad:
-            lo, hi = min(pub_bad), max(pub_bad)
-            span_n = hi - lo + 1
-            lines.append("")
-            if exp:
-                lines.append(f"   → 能修（内容层面），但要改的不止这 {len(exp)} 章：")
-                lines.append(f"     那 {len(exp)} 章被顶到书尾后，整段跟着偏移了")
-            else:
-                # 没有倒插章就没有「被顶到书尾」这回事，别硬套故事
-                lines.append("   → 能修（内容层面）：")
-            # 错位段可能不连续（一段修好后隔几年又错一段），min-max 会把中间
-            # 已经就位的章节圈进区间。那些位置会自动跳过、不会误改，但不说清楚
-            # 的话，「位置 A-B 共 N 章」读起来像是这 A-B 都要重写一遍。
-            gap = (f"（区间里另有 {span_n - n_bad} 章本来就对，会自动跳过）"
-                   if span_n != n_bad else "")
-            lines.append(f"     位置 {lo}-{hi}，其中 {n_bad} 章「位置 ≠ 章号」{gap}")
-            lines.append(f"     修法：把位置 i 改回装第 i 章（重写内容，位置不动）。"
-                         f"改完这段是连续的 {lo}…{hi}")
-            lines.append(f"     怎么做：点「章节重排…」→ 选『已公开段』"
-                         f"→ 点「填入 {lo}-{hi}」→ 查看改写计划")
-            lines.append(f"     命令行：python tools/remap/remap.py"
-                         f" --include-published --range {lo}-{hi}")
-            # 区间两端都不能少：少一端，被顶偏的那几章要的章号就还占在区间外，
-            # 工具会判成「会造成重名」直接跳过 —— 计划看着能跑，实际这段修不成。
-            lines.append(f"     ⚠ 区间要完整覆盖 {lo}-{hi}，两端都不能少。缺一端的话，"
-                         f"工具会把要章号却腾不出位置的那几个跳过，这段修不成")
-            if rep["in_window"]:
-                lines.append(f"     · B 段那 {len(rep['in_window'])} 章还在 3 天窗口内，"
-                             f"窗口一关就落进 C 段；先按 B 段的指引处理，"
-                             f"本次改写也会覆盖它们")
-            lines.append(f"     · {n_bad} 章量不小，大概率要撞每日/每月提交"
-                         "上限，分批跑几天" if n_bad >= 30
-                      else f"     · {n_bad} 章，一次应该跑得完")
-            lines.append("     · 已发布内容要重新过审，读者可能收到更新；"
-                         "审核通过后才在读者端生效")
-        else:
-            lines.append("   → 没有「位置 ≠ 章号」的内容错位，不用改")
         self._set_preview("\n".join(lines))
         if rep["in_window"]:
             self._notify(

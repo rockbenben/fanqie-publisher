@@ -69,6 +69,7 @@
 """
 import argparse
 import calendar
+import re
 import sys
 import time
 from datetime import datetime
@@ -128,7 +129,11 @@ def compute_remap(items, *, now_ts=None, safety_minutes=SAFETY_MINUTES,
                 skipped.append((i, f"发布不足 {safety_minutes} 分钟，平台可能仍在收尾"))
                 continue
         elif ds != fu.DISPLAY_PENDING:
-            skipped.append((i, f"状态 {ds} 非待发布"))
+            # 已知的那两个状态码给中文说法，别让用户对着数字猜
+            _why = {4: "审核中，等审完再改",
+                    7: "审核不通过 —— 它后面的章全卡在审核里，先改这一章"}.get(
+                        ds, f"状态 {ds} 非待发布")
+            skipped.append((i, _why))
             continue
         _n = fu.chapter_title_num(it["title"])
         if _n == i:
@@ -245,6 +250,29 @@ def fmt(ts):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "—"
 
 
+def _apply_range(plan, skipped, args):
+    """按 --only / --range 收窄 plan 与 skipped，返回 (plan, skipped, 错误信息)。
+
+    skipped 必须一起筛：它来自全书的 compute_remap，不筛就会把范围外的
+    「跳过 index 4783: 状态 4 非待发布」混进本次报告里——用户限定了
+    480-694，看到的却是 4783~4792 的理由，纯噪音还会让人以为漏了什么。
+    """
+    if args.only is not None:
+        return ([e for e in plan if e["index"] == args.only],
+                [s for s in skipped if s[0] == args.only], None)
+    if args.range:
+        raw = args.range.replace(" ", "")
+        m = re.fullmatch(r"(\d+)-(\d+)", raw)
+        if not m:
+            return plan, skipped, args.range
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if lo > hi:
+            return plan, skipped, f"{lo}-{hi}（起点比终点大）"
+        return ([e for e in plan if lo <= e["index"] <= hi],
+                [s for s in skipped if lo <= s[0] <= hi], None)
+    return plan, skipped, None
+
+
 def print_plan(items, plan, skipped, num2path):
     pub = [x for x in items if x["display_status"] == fu.DISPLAY_PUBLISHED]
     pend = [x for x in items if x["display_status"] == fu.DISPLAY_PENDING]
@@ -258,7 +286,7 @@ def print_plan(items, plan, skipped, num2path):
     print(f"需改写 {len(plan)} 个"
           + (f"，跳过 {len(skipped)} 个" if skipped else ""), flush=True)
     if n_pub_rw:
-        print(f"⚠ 其中 {n_pub_rw} 个是**已发布**章：内容会被改写、重新过审，"
+        print(f"⚠ 其中 {n_pub_rw} 个是已发布章：内容会被改写、重新过审，"
               f"读者可能收到更新。--run 之前请把这份计划看仔细。", flush=True)
     for i, why in skipped[:10]:
         print(f"  跳过 index {i}: {why}", flush=True)
@@ -266,12 +294,16 @@ def print_plan(items, plan, skipped, num2path):
     if missing:
         print(f"⚠ 本地缺文件、无法改: {missing[:20]}"
               f"{' …' if len(missing) > 20 else ''}", flush=True)
+    def _sched(e):
+        """已发布章不排期，挂一列「定时 —」只是噪音（而且会让人以为漏改了什么）。"""
+        return "" if e.get("published") else f"   定时 {fmt(e['timer'])}"
+
     for e in plan[:5]:
         print(f"  index {e['index']:>5} 现「{e['now_title'][:20]}」"
-              f" → 第{e['want_num']}章   定时 {fmt(e['timer'])}", flush=True)
+              f" → 第{e['want_num']}章{_sched(e)}", flush=True)
     if len(plan) > 5:
-        print(f"  … 共 {len(plan)} 个，末个 index {plan[-1]['index']} "
-              f"定时 {fmt(plan[-1]['timer'])}", flush=True)
+        print(f"  … 共 {len(plan)} 个，末个 index {plan[-1]['index']}"
+              f"{_sched(plan[-1])}", flush=True)
 
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -334,8 +366,29 @@ def monthly_limit_outlook(days_left_in_month, margin_d):
                    f"余量 {margin_d:.1f} 天，够撑到下月重置")
 
 
+def _print_review_block(blk):
+    """审核被拒卡住后续时，先于所有其它结论报出来。
+
+    它是唯一一条「工具改不了、但不处理就一直卡着」的故障，所以放最前面，
+    而且给到能立刻动手的位置和章号——只说"有章审核不通过"等于没说。
+    """
+    if not blk:
+        return
+    to = f"（一直排到位置 {blk['blocked_to']}）" if blk.get("blocked_to") else ""
+    print("\n" + "=" * 60, flush=True)
+    print(f"⚠ 审核卡住了：位置 {blk['index']} 这一章没过审核，"
+          f"后面 {blk['blocked']} 章全卡在审核中{to}", flush=True)
+    print(f"   被卡住的那章：位置 {blk['index']}「{blk['title'][:24]}」", flush=True)
+    print("   怎么办：去番茄后台把这一章改掉重新提交；或用本工具的「修改内容」"
+          "模式重发它。", flush=True)
+    print(f"   ⚠ 它不会自己过审：平台按位置顺序审，这一章不解决，后面这 "
+          f"{blk['blocked']} 章就一直卡着不发布。", flush=True)
+    print("=" * 60 + "\n", flush=True)
+
+
 def print_audit(rep, plan, include_published=False):
     """体检报告 + 缓冲告警（缓冲=第一个还没改对的 item 距离被发出去还有多久）。"""
+    _print_review_block(rep.get("review_block"))
     print("\n—— 缺口体检 ——", flush=True)
     print(f"A 未公开段位置不符: {len(rep['pending_bad'])} 个 → 本工具 --run 自动改",
           flush=True)
@@ -356,22 +409,13 @@ def print_audit(rep, plan, include_published=False):
             print(f"  第{r['num']}章（现在位置 {r['index']}）发布于 {fmt(r['pub_at'])}"
                   f"，窗口还剩 {r['left_h']:.1f} 小时", flush=True)
     if rep["expired"]:
-        # 开着 --include-published 时，打"无解"是自相矛盾：这一段正是本次要改的。
+        # 只报一行：位置动不了（App 窗口已关），但内容能改写。改写计划和上面逐条
+        # 列出的目标已经说清范围了，这里再展开一遍只会和 GUI 的体检报告打架。
         if include_published:
-            print(f"C 已公开、超 3 天移动窗口: {len(rep['expired'])} 章 —— "
-                  + "、".join(f"第{r['num']}章(位置{r['index']})"
-                              for r in rep["expired"])
-                  + "\n  位置永远动不了（App 窗口已关），但内容可以改写："
-                    "本次就是把位置 i 改回装第 i 章", flush=True)
-            # 倒挂只是症状。真正的工程量在被顶偏的整段上，两者差两个数量级；
-            # 只报倒挂数会让人以为"修 3 章就完事"。
-            if plan:
-                lo = min(e["index"] for e in plan)
-                hi = max(e["index"] for e in plan)
-                print(f"  要改的远不止这 {len(rep['expired'])} 章：位置 "
-                      f"{lo}-{hi} 共 {len(plan)} 章「位置 ≠ 章号」——"
-                      f"那 {len(rep['expired'])} 章被顶到书尾后整段跟着偏移了",
-                      flush=True)
+            lo = min((e["index"] for e in plan), default=0)
+            hi = max((e["index"] for e in plan), default=0)
+            print(f"C 已公开段顺序错位：{len(plan)} 章（位置 {lo}-{hi}）"
+                  f"，位置不可动、内容可改写", flush=True)
         else:
             print(f"C 已公开、超窗口无解: {len(rep['expired'])} 章 —— "
                   + "、".join(f"第{r['num']}章(位置{r['index']})"
@@ -497,6 +541,15 @@ async def main_async(args):
             plan, skipped = compute_remap(
                 items, safety_minutes=args.safety_minutes,
                 include_published=args.include_published)
+            # 范围筛选必须提到打印之前。compute_remap 是在**全书**上跑的，
+            # --range 480-694 若留到后面才筛，打印出来的「需改写 N 个」和
+            # 「跳过 index 4783: 状态 4 非待发布」都是全书口径 —— 用户限定了
+            # 480-694，却看到 4783~4792 的跳过理由，跟本次操作毫无关系。
+            plan, skipped, bad_range = _apply_range(plan, skipped, args)
+            if bad_range:
+                print(f"位置区间格式不对: {bad_range}", flush=True)
+                print("  应为「起始-结束」，例如 480-694", flush=True)
+                return True
             print_plan(items, plan, skipped, num2path)
             rep = fu.audit_chapter_positions(items)
             print_audit(rep, plan, args.include_published)
@@ -510,12 +563,8 @@ async def main_async(args):
             if fu.book_mismatch_abort(items, num2path):
                 return True
 
+            # 范围已经在 _apply_range 里作用于 plan，这里直接用。
             entries = plan
-            if args.only is not None:
-                entries = [e for e in entries if e["index"] == args.only]
-            elif args.range:
-                a, b = (int(x) for x in args.range.split("-"))
-                entries = [e for e in entries if a <= e["index"] <= b]
             # 同名冲突在这里解决，且必须在 --limit 之前：截断出来的子集会把
             # 「本来会腾出章号」的位置切掉，剩下的一律被判永久重名、整批不写。
             holder = build_chapter_holder(items)

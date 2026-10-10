@@ -1875,9 +1875,14 @@ async def wait_book_list_ready(page, *, timeout_s=15, poll_ms=500):
 
 
 def describe_book_page(state, books=()):
-    """空结果时把"页面实际长什么样"讲清楚。返回给人看的多行文本。
+    """把「页面实际长什么样」讲清楚，返回给人看的多行文本。
 
-    只说页面上**能证实**的事，不猜原因——猜出来的原因会把人带偏。
+    主要用于空结果：这时没有现成结论，只能从页面上取证。只说页面上**能证实**
+    的事，不猜原因——猜出来的原因会把人带偏（「可能是系统繁忙」这种话只会让人
+    一直点刷新）。
+
+    books 非空时返回一行正常状态：调用方不该在抓到书时调它，但真调了也不能
+    反过来报「一条都没抓到」——那是一句彻头彻尾的假话，比没有诊断更坏。
     """
     state = state or {}
     cards = state.get("cards", 0)
@@ -2803,12 +2808,53 @@ def volume_count(volumes):
         return 1
 
 
+# 卡队列的最小规模：一章审核中不算异常，十章以上才说明是"被前面某章卡住"
+# 而不是恰好同时有十章在审。
+_REVIEW_BLOCK_MIN = 10
+
+
+def find_review_block(items):
+    """找出被拒、导致后面整批卡在审核中的那一章。
+
+    返回 None，或 {"index","title","status","blocked"}：
+      index   被拒章的位置（全书位置）
+      title   它的标题
+      status  它的 display_status（没官方文档，只作为排查线索给出）
+      blocked 被它卡住的后续章数
+
+    判据：某一章 display_status 既不是已发布也不是待发布，且 cant_modify_reason
+    里没有「审核中」，而**紧接其后**连续 N 章 reason 含「审核中」
+    （N >= _REVIEW_BLOCK_MIN）。实测见文件头。
+    """
+    rows = sorted(items, key=lambda x: x.get("pos", x["index"]))
+    for i, it in enumerate(rows):
+        st = it["display_status"]
+        if st in (DISPLAY_PUBLISHED, DISPLAY_PENDING):
+            continue
+        reason = (it.get("cant_modify_reason") or "").strip()
+        if "审核中" in reason:
+            continue                      # 它自己在审，不是被拒的那章
+        n, last = 0, None
+        for nx in rows[i + 1:]:
+            if "审核中" in (nx.get("cant_modify_reason") or ""):
+                n += 1
+                last = nx.get("pos", nx["index"])
+                continue
+            break                         # 连续段结束
+        if n >= _REVIEW_BLOCK_MIN:
+            return {"index": it.get("pos", it["index"]), "title": it["title"],
+                    "status": st, "blocked": n, "blocked_to": last}
+    return None
+
+
 def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
     """缺口体检: 按「谁能修」把问题分三段。
 
     A pending_bad 未公开段位置与章号不符 → 可用 tools/remap 自动改写内容。
     B in_window  已公开、发布在 window_h 内、且排在了它该在的位置之后
                  → 只能手机 App 申请+审批+逐章移动，很贵，必须在窗口内知道。
+    blocked      某一章审核被拒、后面整批卡在审核中（平台侧结论，工具改不了，
+                 但不告诉用户就会一直卡下去，见 find_review_block）
     C expired    已公开、超窗口 → App 移动窗口已经关掉了。
                  **但不是无解**：内容改写得动（tools/remap --include-published），
                  把位置 i 改回装第 i 章即可 —— 只是内容层面的修正，位置本身
@@ -2845,7 +2891,8 @@ def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
             # 不参与主线编号，拿 pos 去比必然不等 —— 判成错位会让 remap 把它
             # 排进改写计划，标题和正文被第pos章的内容覆盖。
             pend_bad.append(pos)
-    return {"pending_bad": pend_bad, "in_window": in_window, "expired": expired}
+    return {"pending_bad": pend_bad, "in_window": in_window,
+            "expired": expired, "review_block": find_review_block(items)}
 
 
 # ---------------------------------------------------------------------------
@@ -3176,7 +3223,7 @@ async def reconcile_drafts_after_batch(page, book_id, claimed_nums, fail_list):
 
     **草稿只做批末对账，不做逐章确认**——判据仍是"失败可不可逆":
     草稿丢了重传即可、不影响正文顺序，为一次确认失败中止整批得不偿失；
-    而定时/立即发布漏一章是永久缺口，才值得逐章确认+失败即停。
+    而定时/立即发布漏一章是位置层面的永久缺口，才值得逐章确认+失败即停。
 
     这里补的是一个真盲区: 原本只能靠"草稿ID 被复用"**推断**上一章被覆盖，
     读不到草稿ID 时只能提示"请到草稿箱核对"。改成拿平台真实草稿列表比对，
