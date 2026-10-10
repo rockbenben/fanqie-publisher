@@ -2365,10 +2365,15 @@ def compute_schedule(
 # 2026-08-20 实测: 番茄的目录顺序 = 章节 item 在卷内的位置（接口 chapter_list
 # 的 index），既不是标题里的「第N章」（接口里根本没有章节号字段，编辑器那个框
 # 只是拼进标题文本），也不是定时发布时间。新建章一律追加到全书末尾，网页端没有
-# 任何插入/排序入口。已发布章只能在手机 App 里「申请→审批→单章选中→移动位置」，
-# 且**只对发布 3 天内的章有效**，超期即永久错位。
+# 任何插入/排序入口。已发布章的**位置**只能在手机 App 里「申请→审批→单章选中
+# →移动位置」，且**只对发布 3 天内的章有效**，超期位置就永远动不了。
 # ---------------------------------------------------------------------------
-DISPLAY_PUBLISHED = 1      # display_status: 已公开，网页端动不了
+# DISPLAY_PUBLISHED 的章**内容是改得动的**——网页端的「编辑」按钮照常渲染，
+# 可编辑与否平台只看一个 cant_modify_reason 字段（完结作品/审核中之类），跟
+# display_status 无关。动不了的是**位置**，而位置一发布就永远改不了，只在
+# 发布 3 天内能在手机 App 申请移动。所以「跳过已发布章」是 remap 的默认保守
+# 策略（改线上内容代价大），不是平台限制——见 tools/remap --include-published。
+DISPLAY_PUBLISHED = 1      # display_status: 已公开
 DISPLAY_PENDING = 10       # display_status: 待发布，可改内容
 MOVE_WINDOW_H = 72         # App 里能申请移动的窗口（3 天）
 
@@ -2705,7 +2710,10 @@ def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
     A pending_bad 未公开段位置与章号不符 → 可用 tools/remap 自动改写内容。
     B in_window  已公开、发布在 window_h 内、且排在了它该在的位置之后
                  → 只能手机 App 申请+审批+逐章移动，很贵，必须在窗口内知道。
-    C expired    已公开、超窗口 → 永久错位，只能登记在案。
+    C expired    已公开、超窗口 → App 移动窗口已经关掉了。
+                 **但不是无解**：内容改写得动（tools/remap --include-published），
+                 把位置 i 改回装第 i 章即可 —— 只是内容层面的修正，位置本身
+                 永远动不了。所以 --include-published 跑完后 C 段会清空。
 
     "排在了该在的位置之后"判据: 该 item 的章号 < 它前面所有位置出现过的最大
     章号。均匀后移（前面漏章导致整段偏移）不算——那只是缺号，阅读顺序仍单调；
@@ -3105,7 +3113,7 @@ async def reconcile_after_batch(page, book_id, claimed_nums, fail_list):
 
     为什么必须有: 提交判定再严也只是页面/接口层面的信号。2026-07-24 那次
     748 章定时发布，日志记"成功 736"，平台上却少 151 章——直到三周后人工
-    只读枚举才发现，那时早已超过手机 App 的 3 天移动窗口，全部永久错位。
+    只读枚举才发现，那时早已超过手机 App 的 3 天移动窗口，全部落进错位段。
     发完立刻对一次账，漏章当天就暴露，窗口还剩 72 小时、要手动移的是 1 章。
 
     漏掉的章写入 fail_list，由 log_fail_list 压进可直接补传的章节号。
@@ -3125,8 +3133,9 @@ async def reconcile_after_batch(page, book_id, claimed_nums, fail_list):
         logger.error(f"⚠ 对账发现 {len(missing)} 章日志记成功但平台上没有: "
                      f"{'、'.join(f'第{n}章' for n in missing[:20])}"
                      f"{' …' if len(missing) > 20 else ''}")
-        logger.error("  这些章需要重发；番茄新建章只会追加到全书末尾，"
-                     "所以越早补越好（已公开章的顺序只能在手机 App 里申请移动，限 3 天）")
+        logger.error("  这些章需要重发；番茄新建章只会追加到全书末尾，所以越早补越好"
+                     "（已发布章的**位置**只能在手机 App 里申请移动，限 3 天；"
+                     "错过窗口仍可用 tools/remap --include-published 改写内容补正）")
         for n in missing:
             fail_list.append((f"第{n}章 ", "对账: 日志记成功但平台上不存在"))
     else:
@@ -5179,13 +5188,19 @@ def main():
     )
 
     # remap: 章节重排（把未公开段的错位内容整体前移，消掉中段缺口）
-    rm = sub.add_parser("remap", help="章节重排：修未公开段的位置错位")
+    rm = sub.add_parser("remap",
+                        help="章节重排：按位置重装内容（位置 i 装第 i 章），消掉中段缺口"
+                             "（--include-published 可连已发布段一起修）")
     rm.add_argument("--book-id", help=_H_BOOK_ID)
     rm.add_argument("--content-dir", help=_H_CONTENT_DIR)
     rm.add_argument("--run", action="store_true", help="真的写入（不加只预览）")
     rm.add_argument("--only", type=int, help="只改指定位置（全书位置）")
     rm.add_argument("--range", help="只改位置区间，如 709-800")
     rm.add_argument("--limit", type=int, help="本次最多改多少个")
+    rm.add_argument("--include-published", action="store_true",
+                    help="把已公开的章也纳入改写（修已发布段的顺序错位）。"
+                         "平台允许改已发布章，但内容会重新过审、读者可能收到"
+                         "更新 —— 务必先看 dry-run")
     rm.add_argument("--safety-minutes", type=int, default=60,
                     help="跳过多少分钟内就要发布的章（默认 60）")
     rm.add_argument("--daily", action="store_true",

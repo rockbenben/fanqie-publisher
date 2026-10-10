@@ -29,7 +29,7 @@ try:
         deduplicate_titles, compute_schedule, validate_times,
         parse_chapter_spec, filter_by_chapter_spec, parse_time_spec,
         parse_datetime, TIMER_INPUT_FORMATS,
-        fetch_chapter_items, audit_chapter_positions, MOVE_WINDOW_H,
+        fetch_chapter_items, audit_chapter_positions, MOVE_WINDOW_H, chapter_title_num,
         DISPLAY_PENDING as MOVE_PENDING, DISPLAY_PUBLISHED as MOVE_PUBLISHED,
         fetch_draft_list, compress_chapter_nums,
         volume_count,
@@ -252,6 +252,18 @@ class _SharedBrowser:
 # ---------------------------------------------------------------------------
 # 主 GUI
 # ---------------------------------------------------------------------------
+def _dlg_alive(w):
+    """控件是否还存在。destroy() 之后再问 winfo_exists() 会抛 TclError。
+
+    Enter 这种"可能连着触发两次"的事件要用它挡一下：按钮的绑定先于 Toplevel
+    的绑定执行，它已经拆了窗口，后面那次就必须安静地什么都不做。
+    """
+    try:
+        return bool(w.winfo_exists())
+    except tk.TclError:
+        return False
+
+
 class FanqieGUI:
 
     def __init__(self):
@@ -294,6 +306,9 @@ class FanqieGUI:
         self.uploading = False
         self._closing = False
         self._cancel_requested = False
+        # 上一次「检查缺口」的结论，供「章节重排…」预填区间用。
+        # 带上 book_id：换书后位置含义完全不同，拿上一本的区间去填会写错书。
+        self._last_audit = None
         self._log_handler = None
         # --- 缓存 ---
         # 失效时机: 切换账号 / 刷新作品列表 / 上传完成 → _invalidate_caches("all")
@@ -589,8 +604,8 @@ class FanqieGUI:
         self.btn_audit.pack(side="left", padx=(8, 0))
         self._attach_tooltip(
             self.btn_audit,
-            "体检章节位置：未公开段可自动重排，已公开段只能在手机 App 里"
-            "申请移动（限发布 3 天内），超期则永久错位")
+            "体检章节位置：未公开段可自动重排；已公开段超 3 天移动不了位置，"
+            "但还能靠「章节重排」改写内容把顺序修正回来")
         # 两项维护操作直接摆出来，不再收进「工具 ▾」下拉。
         # 为两个条目做一个菜单，等于多一次点击、还把它们藏起来；而藏起来的代价
         # 不只是麻烦——「检查缺口」报出未公开段错位之后，紧挨着的下一步正是
@@ -603,8 +618,9 @@ class FanqieGUI:
         self.btn_remap.pack(side="left", padx=(8, 0))
         self._attach_tooltip(
             self.btn_remap,
-            "把未公开的待发布章按位置重装内容，消掉中段缺口。\n"
-            "先预览计划，确认后才真改；排期不变。")
+            "按位置重新装内容（位置 i 装第 i 章），消掉中段缺口。\n"
+            "先预览计划，确认后才真改；排期不变。\n"
+            "点开可选择是否连已发布的章一起改、以及限定位置区间。")
         self.btn_clean = ttk.Button(
             frm, text="清空草稿箱…", command=self._on_tool_clean_drafts)
         self.btn_clean.pack(side="left", padx=(8, 0))
@@ -3669,6 +3685,32 @@ class FanqieGUI:
         """
         return _load_tool_module(name)
 
+    def _reader_view_around(self, items, pos, span=2):
+        """位置 pos 前后各 span 个位置，读者在目录里实际看到的章号。
+
+        报告「读者看到什么」比报告「哪些 item 错位」有用得多——前者才是作者在意的
+        后果（读到第694章之后突然接第480章），后者只是内部状态。倒挂章往往只有
+        几章，但底下被顶偏的可能是几百章，光看倒挂数完全看不出工作量。
+        """
+        by_pos = {x.get("pos", x["index"]): x for x in items}
+        out = []
+        for p in range(pos - span, pos + span + 1):
+            it = by_pos.get(p)
+            n = chapter_title_num(it["title"]) if it is not None else None
+            out.append(f"第{n}章" if n is not None else "（无章号）")
+        return out
+
+    def _current_book_id(self):
+        """当前选中作品的 book_id；没选返回 None。不弹窗、不做登录检查。
+
+        与 _tool_precheck 分开：后者带一串前置检查和提示框，只适合「准备执行」
+        的入口。这里只是读一眼当前选中项，供体检结论按书隔离这类场合使用。
+        """
+        idx = self.cmb_book.current()
+        if idx < 0 or not self.books:
+            return None
+        return self.books[idx]["bookId"]
+
     def _tool_precheck(self):
         """工具类操作的共同前置：没在跑任务、已登录、选了作品。返回 book_id 或 None。"""
         if self.uploading or self._login_in_progress:
@@ -3890,10 +3932,172 @@ class FanqieGUI:
 
     # --- 章节重排 / 续排发布（复用 CLI，先预览再执行）-----------------------
     def _on_tool_remap(self):
-        self._run_cli_tool(
-            "remap", "章节重排",
-            "把未公开的待发布章按位置重装内容（位置 i 装第 i 章），排期不变。"
-            "已公开的一律不碰。")
+        opts = self._ask_remap_options()
+        if opts is None:
+            return
+        extra, desc = opts
+        self._run_cli_tool("remap", "章节重排", desc, extra=extra)
+
+    def _ask_remap_options(self):
+        """点「章节重排…」先问清范围。返回 (CLI 额外参数, 确认框说明)；取消 None。
+
+        为什么不在底栏加勾选框: 「把已发布的章一起改」是有后果的开关，天天杵在
+        「开始上传」旁边迟早被误点；而没有这一步就只能去敲命令行，GUI 用户根本
+        够不着这两个参数。选项一次问完，后面的 dry-run → 确认 → 写入照旧。
+        """
+        got = {}
+        audit = self._last_audit if getattr(self, "_last_audit", None) else {}
+        # 换过书就别用旧结论：位置是每本书各自从 1 数起的，拿上一本的区间填进来
+        # 会指向完全无关的章节。
+        if audit.get("book_id") != self._current_book_id():
+            audit = {}
+        pend_bad = audit.get("pend_bad") or []
+        pub_bad = audit.get("pub_bad") or []
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("章节重排")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=16)
+        frm.pack(fill="both", expand=True)
+        pad = dict(padx=8, pady=5)
+
+        # 默认一律选安全的未公开段。已发布段虽然体检里常常才是真正出问题的那段，
+        # 但默认勾上一个"会重写线上内容"的选项是坏习惯——这里给足信息 + 一键填入，
+        # 让人自己按，而不是替他按。
+        pub = tk.BooleanVar(value=False)
+        rng = tk.StringVar(value="")
+        lim = tk.StringVar(value="")
+
+        # 控件只建一次。place() 只负责摆放 —— 它被 pub 的 trace 每次切换都调一遍，
+        # 在里面 new 控件的话点几下单选框就会把整行摞成两层。
+        lb_range = ttk.Label(frm, text="修哪一段", font=("", 10, "bold"))
+        rb_pending = ttk.Radiobutton(
+            frm, text="未公开段（日常用这个）", variable=pub, value=False)
+        rb_published = ttk.Radiobutton(
+            frm, text="已公开段", variable=pub, value=True)
+        lb_rng = ttk.Label(frm, text="位置区间")
+        en_rng = ttk.Entry(frm, textvariable=rng, width=14)
+        bt_fill = ttk.Button(frm, text="按体检结论填入")
+        lb_rng_hint = ttk.Label(frm, text="全书位置，不是章号；留空=全部")
+        lb_lim = ttk.Label(frm, text="本次最多")
+        en_lim = ttk.Entry(frm, textvariable=lim, width=14)
+        lb_lim_hint = ttk.Label(frm, text="留空=不限；先跑一批看效果")
+        head = ttk.Label(frm, text="", foreground="#5a5a5a", justify="left")
+        warn = ttk.Label(frm, foreground="#c0392b", wraplength=500,
+                         justify="left", text="")
+        # 错误提示走 StringVar + textvariable：Label 没有 set()。写成 Label 再
+        # err.set(...) 会在校验分支里抛 AttributeError —— 而异常恰好又发生在
+        # 放行之前，于是"看起来拦住了"，实际上一行提示都没显示过。
+        err = tk.StringVar(value="")
+        err_lb = ttk.Label(frm, foreground="#c0392b", justify="left",
+                           textvariable=err)
+        row = {}
+
+        def _seg():
+            """当前选项对应的错位位置列表。"""
+            return pub_bad if pub.get() else pend_bad
+
+        def _fmt(pos):
+            return f"{min(pos)}-{max(pos)}" if pos else ""
+
+        def place():
+            """只重新摆放 + 刷新文案，绝不新建控件（见上面那句）。"""
+            seg = _seg()
+            lb_range.grid(row=0, column=0, sticky="w", **pad)
+            rb_pending.grid(row=1, column=1, sticky="w", **pad)
+            rb_published.grid(row=2, column=1, sticky="w", **pad)
+            # 这两行本身就是"现在到底有什么问题"的答案，比任何解释性文案都准。
+            # 两段都列出来，免得以为另一段没事其实有。
+            def _line(lbl, pos):
+                return (f"{lbl}错位 {len(pos)} 个"
+                        + (f"（位置 {_fmt(pos)}）" if pos else "，没有可改的"))
+            head.configure(
+                text=(f"上次检查缺口（{audit['at']:%m-%d %H:%M}）：\n"
+                      f"   {_line('未公开段', pend_bad)}\n"
+                      f"   {_line('已公开段', pub_bad)}")
+                if (pend_bad or pub_bad) else "")
+            head.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+            bt_fill.configure(
+                state="normal" if seg else "disabled",
+                text=(f"填入 {_fmt(seg)}" if seg else "体检没查到可改的"))
+            lb_rng.grid(row=4, column=0, sticky="w", **pad)
+            en_rng.grid(row=4, column=1, sticky="w", **pad)
+            bt_fill.grid(row=4, column=2, sticky="w", **pad)
+            lb_rng_hint.grid(row=5, column=1, columnspan=2, sticky="w", **pad)
+            lb_lim.grid(row=6, column=0, sticky="w", **pad)
+            en_lim.grid(row=6, column=1, sticky="w", **pad)
+            lb_lim_hint.grid(row=7, column=1, columnspan=2, sticky="w", **pad)
+            n_txt = f"{len(seg)}" if seg else "全部（区间留空）"
+            if pub.get():
+                warn.configure(text=(
+                    "⚠ 已发布的内容会被整章替换、重新送审，读者可能收到更新；"
+                    "要等审核通过才在读者端生效。\n"
+                    f"   体检查到这一段要改 {n_txt} 个位置。"))
+            else:
+                warn.configure(text=(
+                    "待发布章只改内容、排期不动，读者暂时看不到影响。\n"
+                    f"   体检查到这一段要改 {n_txt} 个位置。"))
+            warn.grid(row=8, column=0, columnspan=3, sticky="w", **pad)
+            err_lb.grid(row=9, column=0, columnspan=3, sticky="w", **pad)
+            row["ok"].grid(row=10, column=2, sticky="e", **pad)
+            row["cancel"].grid(row=10, column=3, sticky="w", **pad)
+
+        def on_fill():
+            seg = _seg()
+            if seg:
+                rng.set(_fmt(seg))
+                err.set("")
+
+        def on_ok():
+            # Enter 既绑在这里、又绑在按钮上；按钮那条先执行完会把 dlg 拆掉，
+            # 事件再冒上来时若不挡一下就是对已销毁控件操作，Tcl 直接报错。
+            if not _dlg_alive(dlg):
+                return
+            r = (rng.get() or "").strip().replace(" ", "")
+            if r and not re.fullmatch(r"\d+-\d+", r):
+                # 内联报错而不是弹框：弹框会把焦点踢出对话框，输错一次得重新
+                # 找一遍刚才填到哪儿了。
+                err.set("位置区间请填「起始-结束」，例如 480-694；留空表示全部。")
+                return
+            a, b = r.split("-") if r else ("", "")
+            if r and int(a) > int(b):
+                err.set(f"区间起止颠倒了：起点 {a} 比终点 {b} 大。")
+                return
+            n = (lim.get() or "").strip()
+            if n and not n.isdigit():
+                err.set("「本次最多」请填一个正整数，例如 60；留空表示不限。")
+                return
+            if n and int(n) <= 0:
+                err.set("「本次最多」要大于 0；留空表示不限。")
+                return
+            args = ["--include-published"] if pub.get() else []
+            if r:
+                args += ["--range", r]
+            if n:
+                args += ["--limit", n]
+            got["value"] = (
+                args,
+                ("把已发布的位置 i 改回装第 i 章（内容改写，位置不动）。"
+                 if pub.get() else
+                 "把未公开的待发布章按位置重装内容（位置 i 装第 i 章），排期不变。"),
+            )
+            dlg.destroy()
+
+        def on_cancel():
+            got["value"] = None
+            dlg.destroy()
+
+        row["ok"] = ttk.Button(frm, text="查看改写计划", command=on_ok)
+        row["cancel"] = ttk.Button(frm, text="取消", command=on_cancel)
+        bt_fill.configure(command=on_fill)
+        pub.trace_add("write", lambda *_: place())
+        place()
+        dlg.bind("<Return>", lambda _e: on_ok())
+        dlg.bind("<Escape>", lambda _e: on_cancel())
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        self.root.wait_window(dlg)
+        return got.get("value")
 
     def _chapters_dir_for_tools(self):
         """取界面上当前的章节目录，不读 config 缓存。
@@ -3909,8 +4113,11 @@ class FanqieGUI:
         fallback = (self._cfg.get("chapters_dir") or "").strip()
         return d or fallback or str(SCRIPT_DIR / "chapters")
 
-    def _run_cli_tool(self, name, title, desc):
+    def _run_cli_tool(self, name, title, desc, extra=()):
         """remap / keep_ahead 共用：先跑 dry-run 预览，确认后再 --run。
+
+        extra 是这次任务特有的 CLI 参数（如 --include-published --range）。
+        预览和真写入都要带上 —— 两边参数不一致的话，预览就预览了个假的。
 
         直接调 CLI 而不是 import: 这两个工具是长任务、自带浏览器会话，
         独立进程跑不会和 GUI 的事件循环/浏览器抢资源，输出也天然可展示。
@@ -3927,6 +4134,7 @@ class FanqieGUI:
         # AI 申报漏传就成了界面上看不见的合规不一致。
         if self.use_ai_var.get():
             base.append("--use-ai")
+        base.extend(extra)
 
         def run_cli(extra, on_done):
             def work():
@@ -3972,7 +4180,8 @@ class FanqieGUI:
         A 未公开段位置与章号不符 → 跑 tools/remap/remap.py --run 自动改写。
         B 已公开、发布 3 天内、顺序倒挂 → 只能手机 App 申请+审批+逐章移动，
           所以要在窗口内尽早知道，并显示每章还剩几小时。
-        C 已公开、超 3 天 → 永久错位，只登记不吵。
+        C 已公开、超 3 天 → App 移动窗口关了，位置动不了；但内容改写得动，
+          走「章节重排 → 连已发布的章一起改」把位置 i 改回装第 i 章即可。
         纯只读，不改平台任何东西。
         """
         if self.uploading or self._login_in_progress:
@@ -4026,6 +4235,17 @@ class FanqieGUI:
         """把体检结果渲染到预览面板（主线程）。"""
         rep = audit_chapter_positions(items)
         pend_bad = rep["pending_bad"]
+        # 已公开段里「位置 ≠ 章号」的整段。它才是 --include-published 要改的范围，
+        # 比 rep["expired"] 全（expired 只挑倒挂的，漏掉均匀偏移的那一大片）。
+        pub_bad = sorted(
+            x.get("pos", x["index"]) for x in items
+            if x["display_status"] == MOVE_PUBLISHED
+            and chapter_title_num(x["title"]) is not None
+            and chapter_title_num(x["title"]) != x.get("pos", x["index"]))
+        # 存给「章节重排…」的选项对话框预填。带上 book_id：换书后位置含义完全
+        # 不同，拿上一本的区间去填等于写错书。
+        self._last_audit = {"at": datetime.now(), "book_id": self._current_book_id(),
+                            "pend_bad": list(pend_bad), "pub_bad": pub_bad}
         lines = ["缺口体检", "=" * 60]
         if volume_count(volumes or {}) > 1:
             # 已跨卷合并；位置按全书连续计（卷序号*10000+卷内位置 → 累加偏移）
@@ -4036,8 +4256,9 @@ class FanqieGUI:
         if pend_bad:
             lines.append(f"   位置: {self._compress_nums(pend_bad)}"
                          f"（全书位置，多卷已折算；不是章号）")
-            lines.append("   → 跑 python tools/remap/remap.py --run 自动改写"
-                         "（只动未公开章，排期不变）")
+            lines.append("   → 点「章节重排…」→ 保持『未公开段』"
+                         f"→ 点「填入 {min(pend_bad)}-{max(pend_bad)}」"
+                         "（或只跑 python tools/remap/remap.py --run）")
             first = min(pend_bad)
             # pend_bad 存的是全书位置（pos）；多卷下原始 index 带卷偏移，
             # 拿 index 查会查空，缓冲告警就静默消失了
@@ -4051,29 +4272,98 @@ class FanqieGUI:
                     f"{datetime.fromtimestamp(tt):%Y-%m-%d %H:%M} 发出，"
                     f"还剩 {left_h:.1f} 小时（{left_h / 24:.1f} 天）")
                 if left_h < MOVE_WINDOW_H:
-                    lines.append("   ⚠ 缓冲已跌破 3 天移动窗口：今天必须补跑，"
-                                 "否则错位章发出后只能去 App 申请移动")
+                        # 这句以前写的是"否则错位章发出后只能去 App 申请移动"，现在不成立了：
+                    # 发出之后照样能靠「章节重排」改写内容把顺序修回来，只是
+                    # 成本从"App 里移一章"变成"重写整段内容 + 重新过审"。
+                    lines.append("   ⚠ 缓冲已跌破 3 天：今天必须补跑。拖到发出后"
+                                 "仍能修，但要改写整段内容，成本高得多")
         else:
             lines.append("   → 未公开段全部就位")
         lines.append("")
-        lines.append(f"B 已公开、还能在 App 申请移动：{len(rep['in_window'])} 章")
+        # 标题原来只说"还能在 App 里申请移动"，读起来像 C 段已经没救了。
+        # 两条路都在，只是成本不同：App 移动 = 只动这一章的位置；改写内容 =
+        # 能把整段错位一起修好，但要走重审。
+        lines.append(f"B 已公开、发布 3 天内（App 里还能移动位置）："
+                     f"{len(rep['in_window'])} 章")
         for r in rep["in_window"]:
             lines.append(f"   第{r['num']}章（现在位置 {r['index']}）"
                          f"发布于 {datetime.fromtimestamp(r['pub_at']):%m-%d %H:%M}，"
                          f"窗口还剩 {r['left_h']:.1f} 小时")
         if rep["in_window"]:
-            lines.append("   → 手机 App：申请调整 → 通过后选中该章 → 移动到正确位置")
+            lines.append("   → 最省事的做法：手机 App 申请调整 → 通过后"
+                         "选中该章 → 移动到正确位置（只动这一章的位置）")
+            lines.append("     窗口一关就落进 C 段——那时仍能修，但要改写整段内容，成本高得多")
         lines.append("")
-        lines.append(f"C 已公开、超 3 天永久错位：{len(rep['expired'])} 章")
-        if rep["expired"]:
+        exp = rep["expired"]
+        n_bad = len(pub_bad)
+        # 首行要说人话：倒挂章可能一个都没有（只是整段均匀偏移时），那时打
+        # "0 章倒挂" 紧接着又让人改一堆章，读起来是自相矛盾的。
+        if exp:
+            lines.append(f"C 已公开段顺序错位：{len(exp)} 章倒挂（位置再也动不了）")
+        elif n_bad:
+            lines.append(f"C 已公开段顺序错位：{n_bad} 章（位置再也动不了）")
+        else:
+            lines.append("C 已公开段：正常")
+        if exp:
             lines.append("   " + "、".join(
-                f"第{r['num']}章(位置{r['index']})" for r in rep["expired"]))
+                f"第{r['num']}章(位置{r['index']})" for r in exp))
+            view = self._reader_view_around(items, exp[0]["index"], span=2)
+            if view:
+                lines.append("   读者目录现在看到：… " + " → ".join(view) + " …")
+        # 倒挂章只是「症状」，真正要改的是被它们顶偏的整段。只报 len(exp) 会让人
+        # 以为修 3 章就完事，实际是几百章——差两个数量级，必须在这里讲清楚。
+        if n_bad:
+            lo, hi = min(pub_bad), max(pub_bad)
+            span_n = hi - lo + 1
+            lines.append("")
+            if exp:
+                lines.append(f"   → 能修（内容层面），但要改的不止这 {len(exp)} 章：")
+                lines.append(f"     那 {len(exp)} 章被顶到书尾后，整段跟着偏移了")
+            else:
+                # 没有倒插章就没有「被顶到书尾」这回事，别硬套故事
+                lines.append("   → 能修（内容层面）：")
+            # 错位段可能不连续（一段修好后隔几年又错一段），min-max 会把中间
+            # 已经就位的章节圈进区间。那些位置会自动跳过、不会误改，但不说清楚
+            # 的话，「位置 A-B 共 N 章」读起来像是这 A-B 都要重写一遍。
+            gap = (f"（区间里另有 {span_n - n_bad} 章本来就对，会自动跳过）"
+                   if span_n != n_bad else "")
+            lines.append(f"     位置 {lo}-{hi}，其中 {n_bad} 章「位置 ≠ 章号」{gap}")
+            lines.append(f"     修法：把位置 i 改回装第 i 章（重写内容，位置不动）。"
+                         f"改完这段是连续的 {lo}…{hi}")
+            lines.append(f"     怎么做：点「章节重排…」→ 选『已公开段』"
+                         f"→ 点「填入 {lo}-{hi}」→ 查看改写计划")
+            lines.append(f"     命令行：python tools/remap/remap.py"
+                         f" --include-published --range {lo}-{hi}")
+            # 区间两端都不能少：少一端，被顶偏的那几章要的章号就还占在区间外，
+            # 工具会判成「会造成重名」直接跳过 —— 计划看着能跑，实际这段修不成。
+            lines.append(f"     ⚠ 区间要完整覆盖 {lo}-{hi}，两端都不能少。缺一端的话，"
+                         f"工具会把要章号却腾不出位置的那几个跳过，这段修不成")
+            if rep["in_window"]:
+                lines.append(f"     · B 段那 {len(rep['in_window'])} 章还在 3 天窗口内，"
+                             f"窗口一关就落进 C 段；先按 B 段的指引处理，"
+                             f"本次改写也会覆盖它们")
+            lines.append(f"     · {n_bad} 章量不小，大概率要撞每日/每月提交"
+                         "上限，分批跑几天" if n_bad >= 30
+                      else f"     · {n_bad} 章，一次应该跑得完")
+            lines.append("     · 已发布内容要重新过审，读者可能收到更新；"
+                         "审核通过后才在读者端生效")
+        else:
+            lines.append("   → 没有「位置 ≠ 章号」的内容错位，不用改")
         self._set_preview("\n".join(lines))
         if rep["in_window"]:
             self._notify(
                 "warning", "有章节还能救",
                 f"{len(rep['in_window'])} 章已公开但顺序错位，还在 3 天移动窗口内。"
                 f"详见预览面板，尽快去手机 App 申请移动。")
+        elif pub_bad:
+            # 弹窗比面板短，只说工作量差两个数量级这件事 + 去哪儿点。细节留面板。
+            self._notify(
+                "info", "体检完成",
+                f"未公开段待重排 {len(pend_bad)} 个。\n"
+                f"已公开段有 {len(pub_bad)} 章位置与章号不符"
+                f"（位置 {min(pub_bad)}-{max(pub_bad)}），"
+                f"可以在「章节重排…」里选『已公开段』改回来。\n"
+                f"详见预览面板。")
         else:
             self._notify(
                 "info", "体检完成",
