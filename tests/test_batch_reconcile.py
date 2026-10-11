@@ -6,6 +6,8 @@
 对账就是把"日志说的"和"平台真有的"当场怼一遍。
 体检除了排位置错位，也查一类工具修不了、但必须让用户知道的故障：
 某一章审核被拒，把后面整批卡在审核里。
+检测下沉在 fetch_chapter_items 里——它的每个调用点本来就在抓同一份全书
+状态，放在数据源就不用逐处记得调，新增调用点也不会漏。
 """
 import sys
 from pathlib import Path
@@ -13,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fanqie_upload import (  # noqa: E402
     find_missing_after_batch, audit_chapter_positions, chapter_title_num,
-    find_review_block,
+    find_review_block, last_review_block,
     volume_count, global_position, VOLUME_INDEX_STRIDE,
     verify_content_matches_book,
     DISPLAY_PUBLISHED, DISPLAY_PENDING,
@@ -202,7 +204,20 @@ reviewing_only = ([rv(i, DISPLAY_PUBLISHED) for i in range(1, 5)]
                   + [rv(p, 4, REVIEW, f"第{p}章") for p in range(5, 40)])
 check("前面没有异常章（只是恰好在审）→ 不报", find_review_block(reviewing_only) is None)
 
-print("== 分卷计数 ==")
+print("== 检测下沉在数据源里：抓完就顺手查，不靠调用点记得调 ==")
+# find_review_block 的判据在上一节验过了；这里验的是它该在数据源里被自动
+# 用上 —— 检测纯 CPU，抓完 5196 章 0.5 毫秒，放在 fetch_chapter_items 里等于
+# 白捡，7 个调用点全都免费获得。
+import time as _time
+check("没检过时 last_review_block() 是 None", last_review_block() is None)
+check("正常书检出 None", find_review_block(normal) is None)
+_big = blocked * 8
+_t = _time.perf_counter()
+for _ in range(50):
+    find_review_block(_big)
+_per = (_time.perf_counter() - _t) / 50
+print(f"     {len(_big)} 个 item 单次 {_per * 1000:.3f} ms")
+check(f"检测本身 < 10ms（实际 {_per * 1000:.3f}ms）", _per < 0.01, _per)
 
 print("== 分卷计数 ==")
 check("无分卷信息按 1 卷", volume_count({}) == 1)

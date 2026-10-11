@@ -31,7 +31,7 @@ try:
         parse_chapter_spec, filter_by_chapter_spec, parse_time_spec,
         parse_datetime, TIMER_INPUT_FORMATS,
         fetch_chapter_items, audit_chapter_positions, MOVE_WINDOW_H, chapter_title_num,
-        wait_book_list_ready, describe_book_page,
+        wait_book_list_ready, describe_book_page, last_review_block,
         DISPLAY_PENDING as MOVE_PENDING, DISPLAY_PUBLISHED as MOVE_PUBLISHED,
         fetch_draft_list, compress_chapter_nums,
         volume_count,
@@ -633,10 +633,9 @@ class FanqieGUI:
         self.btn_audit = ttk.Button(
             frm, text="检查缺口", command=self._on_audit_gaps)
         self.btn_audit.pack(side="left", padx=(8, 0))
-        self._attach_tooltip(
-            self.btn_audit,
-            "体检章节位置：未公开段可自动重排；已公开段超 3 天移动不了位置，"
-            "但还能靠「章节重排」改写内容把顺序修正回来")
+        # 传函数而非字符串：文字随检测结果变，悬停那一刻现取，不用反复 bind
+        self._attach_tooltip(self.btn_audit, self._audit_tip)
+        self._refresh_audit_badge()      # 上次的检测结论先摆出来
         # 两项维护操作直接摆出来，不再收进「工具 ▾」下拉。
         # 为两个条目做一个菜单，等于多一次点击、还把它们藏起来；而藏起来的代价
         # 不只是麻烦——「检查缺口」报出未公开段错位之后，紧挨着的下一步正是
@@ -4291,6 +4290,36 @@ class FanqieGUI:
         self._set_preview("正在预览「%s」…" % title)
         run_cli([], after_preview)
 
+    def _audit_badge(self):
+        """最近一次检测到的审核卡队列（可能来自上一次运行），没有就 None。"""
+        return self._gui_state.get("review_block") or None
+
+    def _audit_tip(self):
+        blk = self._audit_badge()
+        if not blk:
+            return ("体检章节位置：未公开段可自动重排；已公开段超 3 天移动不了"
+                    "位置，但还能靠「章节重排」改写内容把顺序修正回来")
+        at = (blk.get("at") or "")[5:16].replace("T", " ")
+        return (f"上次检测（{at}）发现审核卡队列：位置 {blk.get('index')}「"
+                f"{(blk.get('title') or '')[:20]}」没过审核，后面 "
+                f"{blk.get('blocked')} 章卡在审核中，不会自己过审。\n"
+                f"用「修改内容」模式改掉那一章就能解（工具里就能改）；"
+                f"点开体检看详情。")
+
+    def _refresh_audit_badge(self):
+        """有卡队列就在按钮上加个 ⚠，把"上次查出来还没解决"摆到眼前。"""
+        self.btn_audit.configure(
+            text="检查缺口 ⚠" if self._audit_badge() else "检查缺口")
+
+    def _note_review_block(self):
+        """抓完章节后把数据源顺手检出的结论记下来，并刷新按钮。"""
+        blk = last_review_block()
+        if blk:
+            self._gui_state["review_block"] = dict(
+                blk, at=datetime.now().isoformat(timespec="seconds"))
+            self._save_gui_state()
+        self._refresh_audit_badge()
+
     def _on_audit_gaps(self):
         """缺口体检：抓平台真实状态，按「谁能修」分三段报告。
 
@@ -4364,6 +4393,7 @@ class FanqieGUI:
         self._last_audit = {"at": datetime.now(), "book_id": self._current_book_id(),
                             "pend_bad": list(pend_bad), "pub_bad": pub_bad}
         blk = rep.get("review_block")
+        self._note_review_block()       # 数据源已顺手检过，这里只存 + 刷按钮
         lines = []
         if blk:
             # 放最前面，并加醒目分隔：这是唯一一条「工具修不了、不处理就一直卡着」
@@ -4374,8 +4404,8 @@ class FanqieGUI:
                       f"⚠ 审核卡住了：位置 {blk['index']} 这一章没过审核，"
                       f"后面 {blk['blocked']} 章全卡在审核中{to}",
                       f"   被卡的那章：位置 {blk['index']}「{blk['title'][:24]}」",
-                      "   怎么办：去番茄后台改掉这一章重新提交；或用「修改内容」"
-                      "模式重发它",
+                      "   怎么办：用「修改内容」模式把这一章改掉重新提交"
+                      "（工具里就能改），改完重新送审，后面这批跟着过",
                       f"   ⚠ 它不会自己过审：平台按位置顺序审，这一章不解决，"
                       f"后面这 {blk['blocked']} 章就一直卡着不发布",
                       "!" * 60, ""]

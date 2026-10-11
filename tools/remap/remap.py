@@ -379,8 +379,8 @@ def _print_review_block(blk):
     print(f"⚠ 审核卡住了：位置 {blk['index']} 这一章没过审核，"
           f"后面 {blk['blocked']} 章全卡在审核中{to}", flush=True)
     print(f"   被卡住的那章：位置 {blk['index']}「{blk['title'][:24]}」", flush=True)
-    print("   怎么办：去番茄后台把这一章改掉重新提交；或用本工具的「修改内容」"
-          "模式重发它。", flush=True)
+    print("   怎么办：用「修改内容」模式把这一章改掉重新提交（工具里就能改，"
+          "它的编辑器是可用的）；改完重新送审，后面这批就跟着过。", flush=True)
     print(f"   ⚠ 它不会自己过审：平台按位置顺序审，这一章不解决，后面这 "
           f"{blk['blocked']} 章就一直卡着不发布。", flush=True)
     print("=" * 60 + "\n", flush=True)

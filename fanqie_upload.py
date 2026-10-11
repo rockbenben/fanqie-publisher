@@ -2596,8 +2596,19 @@ _FETCH_ITEMS_JS = r"""async (u) => {
 # 齐 DOM 那几列的原料，下面把它翻译成与 _EXTRACT_ALL_JS 完全相同的行结构，
 # 调用方一个字都不用改。
 # ---------------------------------------------------------------------------
-# display_status -> DOM 那一列的中文。只有这两个值在真实书上出现过。
-_DISPLAY_STATUS_TEXT = {DISPLAY_PUBLISHED: "已发布", DISPLAY_PENDING: "待发布"}
+# display_status -> DOM 那一列的中文。
+# 1 / 10 之外的两个是**实测反推**的，平台没有公开文档：
+#   4 = 审核中     依据：它的 cant_modify_reason 原话「审核中暂不支持修改」
+#   7 = 审核不通过 依据：它后面紧跟一大片 4，且它自己的编辑器能进、
+#                      平台页面写着「审核不通过，请在右侧面板查看原因，
+#                      修改后再提交」
+# 填进来主要是为了让人看得懂；能不能改另看 cant_modify_reason。
+_DISPLAY_STATUS_TEXT = {
+    DISPLAY_PUBLISHED: "已发布",
+    DISPLAY_PENDING: "待发布",
+    4: "审核中",
+    7: "审核不通过",
+}
 
 # 章节管理页「编辑」按钮的链接形状（2026-08-27 与 DOM 实测逐条比对一致）
 _EDIT_URL_TPL = "/main/writer/{book_id}/publish/{item_id}/?enter_from=modifychapter"
@@ -2621,10 +2632,13 @@ def api_items_to_rows(items, book_id):
         reason = (it.get("cant_modify_reason") or "").strip()
         status = _DISPLAY_STATUS_TEXT.get(ds)
         if status is None:
-            # 没见过的 display_status（审核中/已拒绝之类，手头没有样本）。别猜成
-            # 「已发布」——那会把它拉进各种名单。用平台自己的说法当状态文本，
-            # 修改模式的 "审核中" in status 才有机会命中；同时不给编辑链接。
-            status, editable = (reason or f"未知状态{ds}"), False
+            # 认不出的状态码 ≠ 不能改。平台给不给编辑入口，看的是
+            # cant_modify_reason 有没有内容，不看我们认不认识那个码。
+            # 审核不通过（实测 status=7）恰恰 reason 为空、编辑器能进（平台
+            # 页面写着「审核不通过，请…修改后再提交」），而那一章正是解
+            # 「审核卡队列」唯一能动的地方 —— 按老逻辑一刀切跳过，等于把
+            # 出路也堵死了：后面几百章永远卡在审核里。
+            status, editable = (reason or f"未知状态{ds}"), (not reason)
         else:
             # cant_modify_reason 非空时平台**根本不渲染「编辑」按钮**（2026-08-28
             # 在完结作品上实测: DOM 的 editUrl 是 None，理由是"完结作品不可修改"）。
@@ -2676,6 +2690,20 @@ _SIGNED_CHAPTER_LIST_JS = r"""() => {
 
 
 VOLUME_INDEX_STRIDE = 10000    # index = 卷序号(0起) * 10000 + 卷内位置
+
+
+# 最近一次 fetch_chapter_items 检出的「审核卡队列」，没查到为 None。
+# 放在数据源里而不是各调用点：调用点本来就抓这份数据，谁多花一次请求都一样；
+# 而集中在一处，下回新增调用点不会又漏掉这个检查。
+_last_review_block = None
+
+
+def last_review_block():
+    """最近一次抓章节时检出的审核卡队列；没检过或没查到返回 None。
+
+    判断标准见 find_review_block。
+    """
+    return _last_review_block
 
 
 def global_position(index, offsets):
@@ -2790,6 +2818,23 @@ async def fetch_chapter_items(page, book_id):
             raise RuntimeError(
                 "抓到带卷偏移的 index 但没取到卷列表——多卷作品按单卷算会全错，"
                 "请重试（多为 volume_list 请求未捕获）")
+        # 顺手检一次审核卡队列：这份数据刚抓到，检测是纯 CPU 的（实测
+        # 5196 章 0.7 毫秒）。命中就警告 —— 这类故障不会自己好，而用户正要
+        # 往队列里加章时正是最该知道的时刻。
+        global _last_review_block
+        try:
+            _last_review_block = find_review_block(items)
+        except Exception as _e:                     # 纯诊断，失败绝不影响主流程
+            logger.debug(f"审核卡队列检测失败（忽略）: {_e}")
+            _last_review_block = None
+        if _last_review_block:
+            _b = _last_review_block
+            logger.warning(
+                f"⚠ 审核卡住了：位置 {_b['index']} 这一章没过审核，后面 "
+                f"{_b['blocked']} 章全卡在审核中"
+                + (f"（一直排到位置 {_b['blocked_to']}）" if _b.get("blocked_to") else "")
+                + f"。被卡的是「{_b['title'][:24]}」——平台按位置顺序审，"
+                  f"它不会自己过审，得先改这一章重新提交。")
         return items, ch_url, vols
     finally:
         try:
@@ -4002,7 +4047,9 @@ async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
 
         edit_url = plat_ch.get("editUrl")
         if not edit_url:
-            logger.error("无法获取编辑链接，跳过（可能审核中或平台未提供编辑入口）")
+            logger.error(f"无法获取编辑链接，跳过——这一章当前是「{plat_ch.get('status') or '未知状态'}」。"
+                         "审核中的章要等审完；审核不通过的章可以改，"
+                         "用「修改内容」模式指定它的章号就能改")
             skipped += 1
             _progress(i + 1, total)
             continue

@@ -99,9 +99,13 @@ def main():
           rows[0]["status"] == "已发布", rows[0]["status"])
     check("未知状态 -> 用平台自己的说法当状态（'审核中' in status 才有机会命中）",
           rows[1]["status"] == "审核中", rows[1]["status"])
-    check("未知状态 -> 一律不给编辑链接（宁可漏改，不可乱改）",
-          rows[1]["editUrl"] is None and rows[2]["editUrl"] is None,
-          f"{rows[1]['editUrl']} {rows[2]['editUrl']}")
+    # 「不可乱改」的保障是"平台明说了不能改"（reason 非空），不是"我们认不认识
+    # 这个状态码"。实测审核不通过（status=7, reason 为空）的编辑器能进，而那一章
+    # 恰恰是解审核卡队列唯一能动的地方 —— 按认不认识来判，等于把出路堵死。
+    check("未知状态 + 平台明说不可改 -> 不给编辑链接（不可乱改的真正保障）",
+          rows[1]["editUrl"] is None, rows[1]["editUrl"])
+    check("未知状态 + 平台没给理由 -> 给编辑链接（平台没禁止）",
+          bool(rows[2]["editUrl"]), rows[2]["editUrl"])
     check("未知状态且平台没给理由 -> 状态文本仍可辨认，不伪装成已发布",
           rows[2]["status"] == "未知状态99", rows[2]["status"])
     check("未知状态不冒充待发布（否则会被拉进改排期名单）",
@@ -173,6 +177,30 @@ def main():
             raise RuntimeError("页面已销毁")
     check("evaluate 抛异常 -> 退回 DOM 而不是炸掉整个抓取",
           run(BoomPage(None, None, None)) is None)
+
+    print("== 可编辑性看 cant_modify_reason，不看认不认识状态码 ==")
+    _ed = fu.api_items_to_rows([
+        item(item_id="A", title="第7章 被拒", display_status=7),      # reason 空
+        item(item_id="B", title="第4章 在审", display_status=4,
+             cant_modify_reason="审核中暂不支持修改"),
+        item(item_id="C", title="第9章 完结", display_status=98,
+             cant_modify_reason="完结作品不可修改"),
+        item(item_id="D", title="第5章 未知", display_status=42),     # reason 空
+    ], BOOK)[0]
+    _by = {r["chapterNum"]: r for r in _ed}
+    check("审核不通过(reason空) -> 有编辑链接", bool(_by[7]["editUrl"]), _by[7])
+    check("审核不通过 -> 显示「审核不通过」",
+          _by[7]["status"] == "审核不通过", _by[7]["status"])
+    check("审核不通过 -> 不含「审核中」（不会被修改模式误跳过）",
+          "审核中" not in _by[7]["status"], _by[7]["status"])
+    check("审核中(reason非空) -> 无编辑链接", not _by[4]["editUrl"], _by[4])
+    check("审核中 -> 显示「审核中」",
+          _by[4]["status"] == "审核中", _by[4]["status"])
+    check("审核中 -> 含「审核中」（修改模式会正确跳过）",
+          "审核中" in _by[4]["status"], _by[4]["status"])
+    check("平台明说不可改的未知状态 -> 无编辑链接", not _by[9]["editUrl"], _by[9])
+    check("未知状态 + reason空 -> 按 reason 判，给编辑链接",
+          bool(_by[5]["editUrl"]), _by[5])
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
