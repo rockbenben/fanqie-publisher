@@ -1001,7 +1001,7 @@ class FanqieGUI:
             row_timer2, text="未启动", foreground=CLR_INK_SOFT)
         self.lbl_timer_status.pack(side="left")
         ttk.Label(row_timer2, style="Cap.TLabel",
-                  text="· 到点自动执行一次当前操作").pack(
+                  text="· 到点自动执行一次").pack(
                       side="left", padx=(6, 0))
 
         # --- 5. 章节预览 / 运行日志（选项卡） ---
@@ -3381,11 +3381,18 @@ class FanqieGUI:
             # 否则到点 _on_upload 只发起抓取就 return，这次定时白等
             if self._needs_chapter_list() and not self._ensure_platform_chapters():
                 logger.info("[定时] 平台章节列表缺失，触发前补抓…")
-        # 目标时刻就在上方输入框里，状态行只报倒计时——重复写一遍日期会把这行
-        # 撑到装不下、末尾被裁
+        # 目标时刻就在上方输入框里，状态行不再重复日期（会把这行撑到装不下）。
+        # 但要说清「到点跑的是哪个操作」：定时是无人值守跑的，确认框在那条路上
+        # 自动放行，而操作模式随时可以在右边一格单选里改掉 —— 只报倒计时，用户
+        # 无从知道armed 的到底是「定时发布 12 章」还是「修改内容 5291 章」。
+        # 每秒刷新一次，所以改完模式这行立刻跟着变。
+        mode_names = {"schedule": "定时发布", "publish": "立即发布",
+                      "draft": "存草稿", "edit": "修改内容",
+                      "reschedule": "修改排期"}
+        what = mode_names.get(self.mode_var.get(), "")
         prefix = "🔄 已刷新目录 ｜ " if self._timer_prerefresh_done else ""
         self.lbl_timer_status.configure(
-            text=f"⏰ {prefix}倒计时 {self._fmt_hms(remaining)}",
+            text=f"⏰ {prefix}倒计时 {self._fmt_hms(remaining)} → {what}",
             foreground=CLR_SCHED_TX)
         self._timer_after_id = self.root.after(1000, self._timer_tick)
 
@@ -3682,8 +3689,10 @@ class FanqieGUI:
 
         nums = sorted(m[2] for m in matched if isinstance(m[2], int))
         rng = f"（第 {nums[0]}–{nums[-1]} 章）" if nums else ""
+        # 重过审是这一步唯一的不可逆代价，确认框原来不说：改完读者端不会立刻
+        # 变，而「章节重排」那条同样的改写是写明了代价的，两处口径得一致。
         msg = (f"即将用本地文件替换「{book_name}」中 {count} 章的正文{rng}。\n"
-               f"章节的发布时间不受影响。")
+               f"发布时间不受影响；已公开的章改完要重新过审，读者可能收到更新。")
         if not self._ask_yes_no("确认修改", msg):
             return
 
