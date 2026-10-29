@@ -19,7 +19,7 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
-from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -814,21 +814,17 @@ class FanqieGUI:
             rb.pack(side="left", padx=(0, 12))
             self._mode_radios.append(rb)
 
-        # 发布选项（所有非草稿模式可见）
+        # 发布选项（两行）。三个勾选 + 排期参数原先挤在两行里，窗口宽度低于
+        # ~1300px 就装不下：实测 1000px 时「排到 N 天后」整组消失、
+        # 「后台静默运行」被压到只剩勾选框（1366×768 笔记本开 125% 缩放
+        # 得到的就是这个宽度）。现在每行最多两个勾选 + 一组排期参数。
         self._row_opts = row_opts = ttk.Frame(frm_mode)
+        self._row_opts2 = row_opts2 = ttk.Frame(frm_mode)
         self.use_ai_var = tk.BooleanVar(value=bool(self._cfg.get("use_ai", False)))
         self.chk_use_ai = ttk.Checkbutton(
             row_opts, text="稿件使用了 AI 创作", variable=self.use_ai_var)
         self.chk_use_ai.pack(side="left", padx=6)
         self.use_ai_var.trace_add("write", lambda *_: self._schedule_config_save())
-
-        # 无头模式：不弹浏览器窗口，后台静默跑。与 CLI 的 --headless / config
-        # 的 headless 同一个开关（写回 config.json，两边一致）。
-        self.headless_var = tk.BooleanVar(value=bool(self._cfg.get("headless", False)))
-        self.chk_headless = ttk.Checkbutton(
-            row_opts, text="后台静默运行", variable=self.headless_var)
-        self.chk_headless.pack(side="left", padx=6)
-        self.headless_var.trace_add("write", lambda *_: self._schedule_config_save())
 
         # 自动接续队列：起始时刻和章号范围都不用自己算——接在平台队列末尾之后
         # 开始排，只发平台最大章号之后的章。勾上后起始日期输入框置灰。
@@ -841,13 +837,23 @@ class FanqieGUI:
         self.chk_autocont.pack(side="left", padx=6)
         self._attach_tooltip(self.chk_autocont, "不用自己填起始日期、也不用挑哪几章：\n工具去平台看已经排到哪一刻，先填满那天剩下的时间点，\n再逐日往后排，并且只发平台上还没有的章。\n\n→ 攒了一批新稿，想直接接在现有排期后面时用。\n→ 要自己定日期、或只补某几章，就别勾。")
         self.autocont_var.trace_add("write", lambda *_: self._schedule_config_save())
-        # 「排到 N 天后」的控件放在下面的排期参数行（r1）里，不放这一行：
-        # 它本来就和「每天章数」同类，而这一行在 1280 宽以下已经装不下第 6 个控件
-        # （实测「后台静默运行」被压到只剩勾选框、文字全裁掉）。
+
+        # 无头模式：不弹浏览器窗口，后台静默跑。与 CLI 的 --headless / config
+        # 的 headless 同一个开关（写回 config.json，两边一致）。挂第二行：
+        # 它是所有模式共用的开关，所以第二行也一直显示。
+        self.headless_var = tk.BooleanVar(value=bool(self._cfg.get("headless", False)))
+        self.chk_headless = ttk.Checkbutton(
+            row_opts2, text="后台静默运行", variable=self.headless_var)
+        self.chk_headless.pack(side="left", padx=6)
+        self.headless_var.trace_add("write", lambda *_: self._schedule_config_save())
+        # 「排到 N 天后」和「接着上次往后排」是同一件事的两个旋钮，跟静默运行
+        # 并排放在第二行（原先挂在起始日期行尾，窄窗口下第一个被挤掉）。
         self.days_ahead_var = tk.StringVar(
             value=str(self._cfg.get("days_ahead") or ""))
 
-        # 上次发布信息（所有模式可见）
+        # 上次发布信息（所有模式可见）。留在右栏：撑高这块的是左栏
+        # （作品与章节 + 定时执行 两张卡），右栏本来就有富余，挪去左栏
+        # 反而白吃掉章节预览的一行高度。
         self.lbl_last_publish = ttk.Label(
             frm_mode, text="队列排到：选好作品后自动获取", foreground=CLR_INK_SOFT)
         self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
@@ -876,7 +882,7 @@ class FanqieGUI:
 
         # Row 1: 日期 + 每天章数
         r1 = ttk.Frame(self.sched_frame)
-        r1.pack(fill="x", padx=6, pady=2)
+        r1.pack(fill="x", padx=6, pady=1)
         ttk.Label(r1, text="起始日期:").pack(side="left")
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         self.date_var = tk.StringVar(value=tomorrow)
@@ -893,12 +899,14 @@ class FanqieGUI:
         # 「排到」：留空=把本地剩下的全排上去；填 N=只排到「今天+N 天」。
         # 只排近几天便于改稿（排到几个月后的章想改剧情就得去平台一章章改），
         # 同时仍留着断更保护。与 CLI 的 --days-ahead 对应。仅定时发布模式显示。
-        self.lbl_days_ahead = ttk.Label(r1, text="排到:")
-        self.ent_days_ahead = ttk.Entry(r1, textvariable=self.days_ahead_var,
+        # 挂在选项第二行（挨着「后台静默运行」），不挂起始日期行：起始日期行
+        # 已经有两组控件，窄窗口下第一个被挤掉的就是它。
+        self.lbl_days_ahead = ttk.Label(row_opts2, text="排到:")
+        self.ent_days_ahead = ttk.Entry(row_opts2, textvariable=self.days_ahead_var,
                                         width=3)
         self.lbl_days_ahead.pack(side="left", padx=(14, 0))
         self.ent_days_ahead.pack(side="left", padx=4)
-        self.lbl_days_ahead_unit = ttk.Label(r1, text="天后")
+        self.lbl_days_ahead_unit = ttk.Label(row_opts2, text="天后")
         self.lbl_days_ahead_unit.pack(side="left")
         for _w in (self.lbl_days_ahead, self.ent_days_ahead,
                    self.lbl_days_ahead_unit):
@@ -908,7 +916,7 @@ class FanqieGUI:
 
         # Row 2: 时间（支持多个时间，逗号分隔）
         r2 = ttk.Frame(self.sched_frame)
-        r2.pack(fill="x", padx=6, pady=2)
+        r2.pack(fill="x", padx=6, pady=1)
         ttk.Label(r2, text="发布时间:").pack(side="left")
         self.time_var = tk.StringVar(value=self._cfg.get("default_time", "08:00"))
         ttk.Entry(r2, textvariable=self.time_var, width=22).pack(
@@ -1274,10 +1282,7 @@ class FanqieGUI:
         lbl_doc.bind("<Button-1>", lambda _: webbrowser.open(GH_URL))
         ttk.Button(btn_row, text="开始使用", command=win.destroy).pack(
             side="right")
-        win.update_idletasks()
-        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        ww, wh = win.winfo_width(), win.winfo_height()
-        win.geometry(f"+{(sw - ww) // 2}+{(sh - wh) // 3}")
+        self._place_over_parent(win)
 
     # -----------------------------------------------------------------------
     # 多账号管理
@@ -1393,25 +1398,31 @@ class FanqieGUI:
         for _w in ("lbl_days_ahead", "ent_days_ahead", "lbl_days_ahead_unit"):
             getattr(self, _w).pack_forget()
         self._row_opts.pack_forget()
+        self._row_opts2.pack_forget()
 
         # --- 2. 按模式显示组件（注意 pack 顺序决定布局顺序） ---
-        #   lbl_last_publish:   all modes
+        #   _row_opts:   勾选行一 —— AI 申报(schedule/publish/edit) +
+        #                接着上次往后排(schedule)
+        #   _row_opts2:  勾选行二 —— 后台静默运行(所有模式，无头对每种操作都
+        #                生效) + 排到 N 天后(schedule)
         #   _volume_frame:      edit, reschedule (仅多卷时；勾选"合并所有卷"时隐藏分卷下拉)
         #   sched_frame:        schedule, reschedule
         #   _resched_filter_row: all modes
-        #   chk_use_ai:         schedule, publish, edit
-        #   chk_headless:       all modes（无头对每种操作都生效，所以常驻；
-        #                       与 chk_use_ai 一起 forget/repack 才能保住左右顺序）
+        #   lbl_last_publish:   all modes
         has_vols = bool(self.cmb_volume["values"])
-        self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 4))
+        self._row_opts.pack(fill="x", padx=6, pady=(0, 2))
+        self._row_opts2.pack(fill="x", padx=6, pady=(0, 2))
+        # 无头开关排第二行行首：它所有模式都在，后面才是只在定时发布出现的
+        # 「排到 N 天后」，顺序反过来会让这一行看起来像排期参数的一部分。
+        self.chk_headless.pack(side="left", padx=6)
+        self.lbl_last_publish.pack(fill="x", padx=12, pady=(0, 2))
         if mode in ("edit", "reschedule") and has_vols:
             # 勾选"合并所有卷"时隐藏分卷下拉，只保留复选框
             self._pack_volume_picker()
             self._volume_frame.pack(fill="x", padx=6, pady=(0, 4))
         if mode in ("schedule", "reschedule"):
-            self.sched_frame.pack(fill="x", padx=6, pady=4)
-        self._resched_filter_row.pack(fill="x", padx=6, pady=(0, 4))
-        self._row_opts.pack(fill="x", padx=6, pady=(0, 4), before=self.lbl_last_publish)
+            self.sched_frame.pack(fill="x", padx=6, pady=2)
+        self._resched_filter_row.pack(fill="x", padx=6, pady=(0, 2))
         if mode in ("schedule", "publish", "edit"):
             self.chk_use_ai.pack(side="left", padx=6)
         if mode == "schedule":
@@ -1424,7 +1435,6 @@ class FanqieGUI:
         #    时启动后勾是勾上的、输入框却还可编辑；
         # ② 从定时发布切到修改排期时必须把灰取掉（那边没有自动接续）。
         self._sync_autocont_state()
-        self.chk_headless.pack(side="left", padx=6)
 
         # --- 3. 上传按钮文字和状态 ---
         btn_text = {"edit": "开始修改", "reschedule": "开始修改"}.get(
@@ -1845,7 +1855,7 @@ class FanqieGUI:
             self._hide_volumes()
 
     def _show_volumes(self, volumes):
-        """填充卷选项，在 edit/reschedule 模式下显示（紧跟 lbl_last_publish 之后）。"""
+        """填充卷选项，在 edit/reschedule 模式下显示（紧跟勾选行之后）。"""
         # DOM 漂移时卷条目可能缺 text，用 .get 容错而非 KeyError
         texts = [v.get("text", "") if isinstance(v, dict) else str(v)
                  for v in volumes]
@@ -2135,23 +2145,81 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     # 登录
     # -----------------------------------------------------------------------
+    def _place_over_parent(self, win):
+        """把弹窗摆在主窗口正中，而不是 Tk 默认的屏幕左上角。
+
+        Tk 新建的 Toplevel 落在屏幕 (0,0) 附近，而主窗口通常开在屏幕中间
+        （实测「章节重排…」在 0,0、主窗口在 1231,438）：点完按钮看不到任何
+        变化，人只会以为没点上、或者程序没反应。
+        """
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_width()) // 2)
+        y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_height()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.lift()
+
     def _prompt_account_name(self):
-        """弹"账号名称"对话框并校验，返回合法名称；取消/名称非法/放弃覆盖时返回 None。"""
+        """弹"账号名称"对话框并校验，返回合法名称；取消/放弃覆盖时返回 None。"""
         current_acct = self._gui_state.get("current_account", "")
-        raw = simpledialog.askstring(
-            "账号名称",
-            "给这个账号起一个本地名称（如 作家A）：\n"
-            "· 仅用于在本工具里区分多个账号，不是番茄笔名\n"
-            "· 点「确定」后会打开浏览器，请在浏览器里登录番茄账号",
-            parent=self.root,
-            initialvalue=current_acct,
-        )
-        if not raw or not raw.strip():
-            return None
-        name = self._sanitize_account_name(raw)
+        got = {}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("账号名称")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        frm = ttk.Frame(dlg, padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="给这个账号起一个本地名称（如 作家A）：",
+                  justify="left").pack(anchor="w")
+        name_var = tk.StringVar(value=current_acct)
+        ent = ttk.Entry(frm, textvariable=name_var, width=36)
+        ent.pack(fill="x", pady=(6, 0))
+        # 提示走 StringVar：输错时留在原地改，别让人关掉重开再找一遍输入框
+        err = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=err, foreground=CLR_WARN,
+                  justify="left").pack(anchor="w", pady=(4, 0))
+        ttk.Label(frm, style="Cap.TLabel", justify="left",
+                  text="· 只是本工具里区分多个账号用的标签，不是番茄笔名\n"
+                       "· 点「确定」后会打开浏览器，请在浏览器里登录番茄账号"
+                  ).pack(anchor="w", pady=(8, 0))
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(14, 0))
+
+        def on_ok():
+            if not _dlg_alive(dlg):
+                return
+            raw = (name_var.get() or "").strip()
+            if not raw:
+                err.set("请填一个名称（例如 作家A），只在本工具里用来区分账号。")
+                return
+            cleaned = self._sanitize_account_name(raw)
+            if not cleaned:
+                err.set("名称里不能有 \\ / : * ? \" < > | 这些字符，换一个。")
+                return
+            got["value"] = cleaned
+            dlg.destroy()
+
+        def on_cancel():
+            got["value"] = None
+            dlg.destroy()
+
+        ttk.Button(btns, text="确定", style="Primary.TButton",
+                   command=on_ok).pack(side="left")
+        ttk.Button(btns, text="取消", command=on_cancel).pack(
+            side="left", padx=(8, 0))
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        dlg.bind("<Return>", lambda _e: on_ok())
+        dlg.bind("<Escape>", lambda _e: on_cancel())
+        self._place_over_parent(dlg)
+        ent.focus_set()
+        self.root.wait_window(dlg)
+        name = got.get("value")
         if not name:
-            messagebox.showerror("名称无效",
-                                 "账号名称包含非法字符或为保留名，请重新输入。")
             return None
         # L2: 已存在同名账号时提示确认
         named_path = SCRIPT_DIR / f".auth_{name}.json"
@@ -2167,7 +2235,7 @@ class FanqieGUI:
         if self._login_in_progress:
             messagebox.showinfo("登录进行中", "先完成或取消当前登录，再开始新的登录。")
             return
-        # 必须在弹"账号名称"对话框【之前】就占住登录态：simpledialog 的 wait_window
+        # 必须在弹"账号名称"对话框【之前】就占住登录态：那个对话框用 wait_window
         # 会继续泵 Tk after 事件，定时器 _timer_tick 会在对话框开着时触发——若此刻
         # _login_in_progress 仍为 False，忙碌闸门放行，会并发起一个定时上传任务
         # （两个浏览器同开 + 争用 AUTH_FILE，登录保存的会话可能盖掉上传在用的账号）。
@@ -2613,6 +2681,16 @@ class FanqieGUI:
             self.lbl_filter_info.configure(text="")
         self._apply_date_filter()
 
+    def _show_progress_total(self, total: int):
+        """把右下角的「已完成/总数」重置成 0/total。
+
+        扫描失败或目录为空时必须一起归零：预览已经改口说「没有文件」，
+        计数还停在上一批（实测 0/297），两句自相矛盾，用户不知道信哪个。
+        """
+        self.progress["maximum"] = max(total, 1)
+        self.progress["value"] = 0
+        self.lbl_progress.configure(text=f"0/{total}")
+
     def _reload_chapters(self):
         """从磁盘重新扫描并解析章节文件。仅在目录变更/用户点刷新时调用。"""
         self._all_files = []
@@ -2620,10 +2698,12 @@ class FanqieGUI:
         dir_path = self.dir_var.get()
         if not dir_path:
             self.files, self.parsed_chapters, self._word_counts = [], [], []
+            self._show_progress_total(0)
             return
         p = Path(dir_path)
         if not p.is_dir():
             self.files, self.parsed_chapters, self._word_counts = [], [], []
+            self._show_progress_total(0)
             self._set_preview("这个文件夹不在了。点「选择文件夹」重新指定。")
             return
 
@@ -2631,10 +2711,12 @@ class FanqieGUI:
             self._all_files = get_md_files(p)
         except OSError as e:
             self.files, self.parsed_chapters, self._word_counts = [], [], []
+            self._show_progress_total(0)
             self._set_preview(f"无法读取目录: {e}")
             return
         if not self._all_files:
             self.files, self.parsed_chapters, self._word_counts = [], [], []
+            self._show_progress_total(0)
             self._set_preview("目录及子文件夹里没有 .md / .txt 文件。\n"
                               "把章节文件放进来后点 ↻ 重新扫描，或换一个文件夹。")
             return
@@ -2645,6 +2727,7 @@ class FanqieGUI:
         self._all_files, self._all_parsed = parse_md_files(self._all_files)
         if not self._all_files:
             self.files, self.parsed_chapters, self._word_counts = [], [], []
+            self._show_progress_total(0)
             self._set_preview("目录里的文件都读不出来。\n"
                               "常见原因：云盘文件还没下载到本地，或没有读取权限。")
             return
@@ -2697,9 +2780,7 @@ class FanqieGUI:
                         "没有符合筛选条件的文件\n"
                         "调整日期，或取消勾选「按修改日期筛选」。")
                 # 底部计数还停在筛选前的数字，与预览里的"没有文件"自相矛盾
-                self.progress["maximum"] = 1
-                self.progress["value"] = 0
-                self.lbl_progress.configure(text="0/0")
+                self._show_progress_total(0)
                 return
             self.lbl_filter_info.configure(
                 text=f"筛选: {len(self.files)}/{total} 个文件",
@@ -2714,6 +2795,44 @@ class FanqieGUI:
             len(strip_md_formatting(c)) for _, _, c in self.parsed_chapters]
 
         self._refresh_preview()
+
+    def _schedule_param_warnings(self) -> list[str]:
+        """排期输入框里已经填了、但不会被算进排期的值（空列表 = 没问题）。
+
+        这些值过去是静默处理的：日期写错 → 整块排期不显示；时间里的
+        「25:00」→ 被 validate_times 丢掉，一天少一个时段；「排到」填
+        「一周」→ 当成留空 = 不限。三处都不吭声，用户要么点「开始上传」
+        才被弹窗拦下，要么直接带着和自己填的不一样的排期发出去。
+        上传前的预览面板是唯一的复核地方，所以问题写在这儿。
+        """
+        warns = []
+        date_str = (self.date_var.get() or "").strip()
+        if date_str:
+            try:
+                datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                warns.append(f"起始日期「{date_str}」无效，应为 YYYY-MM-DD")
+        raw_time = (self.time_var.get() or "").strip()
+        if raw_time:
+            tokens = [t.strip() for t in
+                      re.split(r"[,;、]",
+                               unicodedata.normalize("NFKC", raw_time))]
+            # 逐条问 validate_times 本人：判据只有一份，不会这里说有效那里被丢
+            dropped = [t for t in tokens if t and not validate_times(t)]
+            if dropped:
+                warns.append("发布时间「" + "、".join(dropped)
+                             + "」无效，应为 HH:MM")
+        raw_days = (self.days_ahead_var.get() or "").strip()
+        # 只在「排到」这一栏真的摆在界面上时才说它：修改排期模式下它不显示，
+        # 提示一个看不见的输入框只会让人去找那个不存在的东西。
+        if raw_days and not raw_days.isdigit() and self.ent_days_ahead.winfo_ismapped():
+            warns.append("「排到…天后」要填整数天数，留空=不限")
+        try:
+            if self.perday_var.get() < 1:
+                warns.append("「每天章数」要大于 0")
+        except tk.TclError:
+            warns.append("「每天章数」要填 1-20 的整数")
+        return warns
 
     def _refresh_preview(self):
         """仅重新计算排期和刷新预览文本，不重新读取文件。"""
@@ -2839,6 +2958,9 @@ class FanqieGUI:
             eff = max(per_day, len(validate_times(time_str)) or 1)
             summary += (f" | 每天{eff}章 | 排期: {schedule[0][0]} {schedule[0][1]}"
                         f" ~ {schedule[-1][0]}")
+        if mode == "schedule":
+            summary += "".join(f"\n⚠ {w}"
+                               for w in self._schedule_param_warnings())
 
         self._set_preview(summary + "\n" + "-" * 60 + "\n" + "\n".join(lines))
         self.progress["maximum"] = max(kept_count, 1)
@@ -3047,6 +3169,7 @@ class FanqieGUI:
             first_day = schedule[0][0]
             eff = sum(1 for d, _ in schedule if d == first_day)
             summary += f" | 每天{eff}章 | 排期: {schedule[0][0]} ~ {schedule[-1][0]}"
+        summary += "".join(f"\n⚠ {w}" for w in self._schedule_param_warnings())
 
         self._set_preview(summary + "\n" + "-" * 60 + "\n" + "\n".join(lines))
         self.progress["maximum"] = max(count, 1)
@@ -4111,9 +4234,15 @@ class FanqieGUI:
                       f"   {_line('已公开段', pub_bad)}")
                 if (pend_bad or pub_bad) else "")
             head.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+            # 按钮要说清「当前这一段」有没有东西。原来固定写「体检没查到可改的」，
+            # 而体检报告刚说完另一段有 215 个 —— 那句当场就是假话。
+            _other = pub_bad if not pub.get() else pend_bad
+            _other_name = "已公开段" if not pub.get() else "未公开段"
             bt_fill.configure(
                 state="normal" if seg else "disabled",
-                text=(f"填入 {_fmt(seg)}" if seg else "体检没查到可改的"))
+                text=(f"填入 {_fmt(seg)}" if seg
+                      else (f"『{_other_name}』有 {len(_other)} 个" if _other
+                            else "体检没查到可改的")))
             lb_rng.grid(row=4, column=0, sticky="w", **pad)
             en_rng.grid(row=4, column=1, sticky="w", **pad)
             bt_fill.grid(row=4, column=2, sticky="w", **pad)
@@ -4121,16 +4250,13 @@ class FanqieGUI:
             lb_lim.grid(row=6, column=0, sticky="w", **pad)
             en_lim.grid(row=6, column=1, sticky="w", **pad)
             lb_lim_hint.grid(row=7, column=1, columnspan=2, sticky="w", **pad)
-            n_txt = f"{len(seg)}" if seg else "全部（区间留空）"
-            if pub.get():
-                warn.configure(text=(
-                    "⚠ 已发布的内容会被整章替换、重新送审，读者可能收到更新；"
-                    "要等审核通过才在读者端生效。\n"
-                    f"   体检查到这一段要改 {n_txt} 个位置。"))
-            else:
-                warn.configure(text=(
-                    "待发布章只改内容、排期不动，读者暂时看不到影响。\n"
-                    f"   体检查到这一段要改 {n_txt} 个位置。"))
+            cost = (f"   体检查到这一段要改 {len(seg)} 个位置。" if seg
+                    else "   这一段体检没查到错位。")
+            warn.configure(
+                text=(("⚠ 已发布的内容会被整章替换、重新送审，读者可能收到更新；"
+                       "要等审核通过才在读者端生效。\n" if pub.get()
+                       else "待发布章只改内容、排期不动，读者暂时看不到影响。\n")
+                      + cost))
             warn.grid(row=8, column=0, columnspan=3, sticky="w", **pad)
             err_lb.grid(row=9, column=0, columnspan=3, sticky="w", **pad)
             row["ok"].grid(row=10, column=2, sticky="e", **pad)
@@ -4186,6 +4312,8 @@ class FanqieGUI:
         bt_fill.configure(command=on_fill)
         pub.trace_add("write", lambda *_: place())
         place()
+        self._place_over_parent(dlg)
+        dlg.focus_force()
         dlg.bind("<Return>", lambda _e: on_ok())
         dlg.bind("<Escape>", lambda _e: on_cancel())
         dlg.protocol("WM_DELETE_WINDOW", on_cancel)
@@ -4425,7 +4553,7 @@ class FanqieGUI:
                      + (f"（位置 {self._compress_nums(pend_bad)}）" if pend_bad else ""))
         if pend_bad:
             lines.append(f"   修：点「章节重排…」保持『未公开段』，"
-                         f"区间已自动填好 {pend_lo}-{pend_hi}")
+                         f"再点「填入 {pend_lo}-{pend_hi}」")
             # pend_bad 存的是全书位置（pos）；多卷下原始 index 带卷偏移，
             # 拿 index 查会查空，缓冲告警就静默消失了
             tt = next((int(x.get("timer_time") or 0) for x in items
@@ -4465,7 +4593,7 @@ class FanqieGUI:
                          f"内容同样要换") if n_bad > len(exp) else ""
                 lines.append(f"   顺序断裂的是 {len(exp)} 章：{_bad}{_more}{_tail}")
             lines.append(f"   修：点「章节重排…」选『已公开段』，"
-                         f"区间已自动填好 {lo}-{hi}")
+                         f"再点「填入 {lo}-{hi}」")
             cost = "要重写线上内容并重新过审，读者可能收到更新"
             cost += ("；章数多会撞提交上限，分批跑" if n_bad >= 30 else "")
             lines.append("   代价：" + cost)
