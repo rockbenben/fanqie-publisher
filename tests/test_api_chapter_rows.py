@@ -99,13 +99,17 @@ def main():
           rows[0]["status"] == "已发布", rows[0]["status"])
     check("未知状态 -> 用平台自己的说法当状态（'审核中' in status 才有机会命中）",
           rows[1]["status"] == "审核中", rows[1]["status"])
-    # 「不可乱改」的保障是"平台明说了不能改"（reason 非空），不是"我们认不认识
-    # 这个状态码"。实测审核不通过（status=7, reason 为空）的编辑器能进，而那一章
-    # 恰恰是解审核卡队列唯一能动的地方 —— 按认不认识来判，等于把出路堵死。
+    # 「不可乱改」的保障是"平台明说了不能改"（reason 非空）。实测审核不通过
+    # （status=7, reason 为空）的编辑器能进，而那一章恰恰是解审核卡队列唯一
+    # 能动的地方 —— 所以 status=7 必须可改。
+    # 现在 7 已经是个**认得的码**（_DISPLAY_STATUS_TEXT 里有它），走「认得的
+    # 码」那条分支照样可改，不必再把没见过的码一起放开：那个码平台会拿它
+    # 做什么我们不知道，凭「reason 为空」就合成编辑链接，等于把写权限开到
+    # 一个没人验证过的状态上（改内容要重过审，读者会收到更新）。
     check("未知状态 + 平台明说不可改 -> 不给编辑链接（不可乱改的真正保障）",
           rows[1]["editUrl"] is None, rows[1]["editUrl"])
-    check("未知状态 + 平台没给理由 -> 给编辑链接（平台没禁止）",
-          bool(rows[2]["editUrl"]), rows[2]["editUrl"])
+    check("未知状态 + 平台没给理由 -> 也不给编辑链接（没验证过的码不去动）",
+          rows[2]["editUrl"] is None, rows[2]["editUrl"])
     check("未知状态且平台没给理由 -> 状态文本仍可辨认，不伪装成已发布",
           rows[2]["status"] == "未知状态99", rows[2]["status"])
     check("未知状态不冒充待发布（否则会被拉进改排期名单）",
@@ -178,7 +182,7 @@ def main():
     check("evaluate 抛异常 -> 退回 DOM 而不是炸掉整个抓取",
           run(BoomPage(None, None, None)) is None)
 
-    print("== 可编辑性看 cant_modify_reason，不看认不认识状态码 ==")
+    print("== 可编辑性：认得的码看 cant_modify_reason，没认得的码一律不动 ==")
     _ed = fu.api_items_to_rows([
         item(item_id="A", title="第7章 被拒", display_status=7),      # reason 空
         item(item_id="B", title="第4章 在审", display_status=4,
@@ -198,9 +202,26 @@ def main():
           _by[4]["status"] == "审核中", _by[4]["status"])
     check("审核中 -> 含「审核中」（修改模式会正确跳过）",
           "审核中" in _by[4]["status"], _by[4]["status"])
+    # 审核中 + 平台没给理由：仍然**不能**改。改前 4 是个没人认得的码，
+    # 一律不可编辑；现在它是认得的码了，不能跟着「reason 为空 → 可改」
+    # 一起放开——那一章正在审，工具不该去动它（改内容要重过审，读者会
+    # 收到更新）。放开那条路的只有审核不通过（7）。
+    _ed4 = fu.api_items_to_rows([
+        item(item_id="E", title="第4章 在审", display_status=4),
+    ], BOOK)[0]
+    check("审核中(reason为空) -> 仍无编辑链接（正在审的不碰）",
+          not _ed4[0]["editUrl"], _ed4[0])
+    # 布尔值也是 int 的子类：display_status=true 会被当成 1（已发布），
+    # 于是拿到编辑入口。平台的数值字段发来布尔值时，一律当「认不出的码」。
+    for _bad in (True, False):
+        _edb = fu.api_items_to_rows([
+            item(item_id="F", title="第6章 布尔", display_status=_bad),
+        ], BOOK)[0]
+        check(f"display_status={_bad!r}（布尔） -> 无编辑链接",
+              not _edb[0]["editUrl"], _edb[0])
     check("平台明说不可改的未知状态 -> 无编辑链接", not _by[9]["editUrl"], _by[9])
-    check("未知状态 + reason空 -> 按 reason 判，给编辑链接",
-          bool(_by[5]["editUrl"]), _by[5])
+    check("未知状态 + reason空 -> 不给编辑链接（没验证过的状态码不去动）",
+          not _by[5]["editUrl"], _by[5])
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

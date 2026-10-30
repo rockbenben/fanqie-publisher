@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fanqie_upload import (  # noqa: E402
     find_missing_after_batch, audit_chapter_positions, chapter_title_num,
-    find_review_block, last_review_block,
+    find_review_block,
     volume_count, global_position, VOLUME_INDEX_STRIDE,
     verify_content_matches_book,
     DISPLAY_PUBLISHED, DISPLAY_PENDING,
@@ -169,6 +169,16 @@ def rv(pos, ds, reason="", title=None):
 blocked = ([rv(i, DISPLAY_PUBLISHED) for i in range(1, 5)]
            + [rv(5, 7, "", "第5章 被拒的")]
            + [rv(p, 4, REVIEW, f"第{p}章") for p in range(6, 6 + 413)])
+
+
+def _safe_find(items):
+    """find_review_block 遇到残缺 item 不该把异常抛给调用方。"""
+    try:
+        find_review_block(items)
+        return True
+    except Exception as _e:
+        print(f"     抛出异常: {type(_e).__name__}: {_e}")
+        return False
 blk = find_review_block(blocked)
 check("识别出被拒章", blk is not None)
 check("报出被拒章的位置", blk and blk["index"] == 5, blk)
@@ -206,18 +216,130 @@ check("前面没有异常章（只是恰好在审）→ 不报", find_review_blo
 
 print("== 检测下沉在数据源里：抓完就顺手查，不靠调用点记得调 ==")
 # find_review_block 的判据在上一节验过了；这里验的是它该在数据源里被自动
-# 用上 —— 检测纯 CPU，抓完 5196 章 0.5 毫秒，放在 fetch_chapter_items 里等于
-# 白捡，7 个调用点全都免费获得。
+# 用上 —— 检测纯 CPU，3344 个 item 单次 0.5 毫秒，放在 fetch_chapter_items 里
+# 等于白捡，8 个调用点全都免费获得。
+# 结论不再存进模块级全局变量（那是「界面上的旧徽标撤不掉」的根源）：
+# 调用方要结论就自己拿 items 调 find_review_block，判据只有这一份。
 import time as _time
-check("没检过时 last_review_block() 是 None", last_review_block() is None)
-check("正常书检出 None", find_review_block(normal) is None)
+import asyncio as _aio2
+import logging as _logging
+import fanqie_upload as _fu
+
+
+class _Req:
+    def __init__(self, url):
+        self.url = url
+
+
+class _FakeChapPage:
+    """够 fetch_chapter_items 跑完的最小页面替身。
+
+    只被这一节用：目的是让真的 fetch_chapter_items 跑一遍，验「检测真的在
+    数据源里」，而不是让这一节自己调 find_review_block（那样就绕开了它要
+    验的东西）。
+    """
+
+    def __init__(self, its):
+        self.its = its
+        self.url = "about:blank"
+        self._handlers = []
+
+    def on(self, event, cb):
+        self._handlers.append((event, cb))
+
+    def remove_listener(self, event, cb):
+        self._handlers = [(e, c) for e, c in self._handlers if c is not cb]
+
+    async def goto(self, url, **kw):
+        self.url = url
+        for e, cb in list(self._handlers):
+            if e == "request":
+                cb(_Req("https://x/api/chapter/chapter_list?volume_id=0&page_index=0"))
+
+    async def wait_for_url(self, pat, timeout=None):
+        return None
+
+    async def wait_for_timeout(self, ms):
+        return None
+
+    async def evaluate(self, js, arg=None):
+        return {"items": [dict(i) for i in self.its], "error": None}
+
+
+class _Capture(_logging.Handler):
+    def __init__(self):
+        super().__init__(level=_logging.WARNING)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def _fetch_and_capture(its):
+    cap = _Capture()
+    lg = _logging.getLogger("fanqie")
+    lg.addHandler(cap)
+    old = lg.level
+    lg.setLevel(_logging.WARNING)
+    try:
+        _aio2.run(_fu.fetch_chapter_items(_FakeChapPage(its), "B1"))
+    finally:
+        lg.removeHandler(cap)
+        lg.setLevel(old)
+    return cap.lines
+
+
+_blocked_its = ([rv(i, DISPLAY_PUBLISHED) for i in range(1, 5)]
+                + [rv(5, 7, "", "第5章 被拒的")]
+                + [rv(p, 4, REVIEW, f"第{p}章") for p in range(6, 21)])
+_warn = _fetch_and_capture(_blocked_its)
+check("抓完有卡队列 → 数据源自己喊出来了（不靠调用点记得调）",
+      any("审核卡住了" in m for m in _warn), str(_warn))
+check("警告里带着被卡的位置和章数",
+      any("位置 5" in m and "15 章" in m for m in _warn), str(_warn))
+_warn_ok = _fetch_and_capture([item(i, f"第{i}章") for i in range(1, 20)])
+check("抓完没有卡队列 → 不喊", not any("审核卡住了" in m for m in _warn_ok),
+      str(_warn_ok))
+
+# 检测本身的开销：纯 CPU，3344 个 item 单次 0.5 毫秒，放在数据源里等于白捡。
+# 阈值给得宽（50ms 是实测的约 100 倍）：这条守的是「别写成 O(n²)」这种
+# 数量级的退化，不是守机器快慢——CI 机器被别的任务占满时 10ms 会假红。
 _big = blocked * 8
 _t = _time.perf_counter()
 for _ in range(50):
     find_review_block(_big)
 _per = (_time.perf_counter() - _t) / 50
 print(f"     {len(_big)} 个 item 单次 {_per * 1000:.3f} ms")
-check(f"检测本身 < 10ms（实际 {_per * 1000:.3f}ms）", _per < 0.01, _per)
+check(f"检测本身 < 50ms（实际 {_per * 1000:.3f}ms）", _per < 0.05, _per)
+
+print("== 平台少给字段时，体检不能整份报废 ==")
+# 检测是**诊断**：它挂了（平台少给一个字段之类）不该让调用方的整份报告
+# 出不来。find_review_block 自己兜住，audit_chapter_positions 也不该直接
+# 下标取平台字段（少一个就 KeyError → 整份「检查缺口」报告都渲染不出来）。
+check("残缺 item → find_review_block 返回 None 而不是抛异常",
+      find_review_block([{"index": 1}]) is None)
+check("残缺 item → find_review_block 不抛",
+      _safe_find([{"index": 1}]))
+try:
+    _rep = audit_chapter_positions([{"index": 1}, {"index": 2}])
+    check("残缺 item → audit_chapter_positions 照样出报告",
+          isinstance(_rep, dict) and "pending_bad" in _rep
+          and "review_block" in _rep, str(_rep)[:120])
+except Exception as _e:
+    check("残缺 item → audit_chapter_positions 照样出报告", False,
+          f"{type(_e).__name__}: {_e}")
+
+# 标题不是字符串（平台给成 None 或数字）时，结论里要能安全地切片：
+# 抓取里的告警要打「被卡的是「标题[:24]」」，标题是 None 就 TypeError，
+# 而那会让整次抓取失败（上传/体检/remap 全断）。
+_bad_title = ([rv(i, DISPLAY_PUBLISHED) for i in range(1, 5)]
+               + [dict(rv(5, 7, "", "第5章"), title=None)]
+               + [rv(p, 4, REVIEW, f"第{p}章") for p in range(6, 21)])
+_blk = find_review_block(_bad_title)
+check("标题是 None → 结论里的标题是空串（不会 TypeError）",
+      _blk is not None and _blk.get("title") == "", str(_blk))
+check("标题是 None → 照样认得出卡队列",
+      _blk is not None and _blk.get("index") == 5, str(_blk))
 
 print("== 分卷计数 ==")
 check("无分卷信息按 1 卷", volume_count({}) == 1)

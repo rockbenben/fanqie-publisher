@@ -6,9 +6,11 @@ cmd_edit / 两个 GUI task 里，被 input() 和 playwright 挡着**从来没有
 直接测过**——策略只能靠 grep 源码标记间接保证。抽成独立函数后，第一次
 可以拿假原语把每条中止路径真正跑一遍。
 
-不变量（每个用例都断言）: success + failed + skipped == total，
-且 fail_list 覆盖所有未成功章节——这正是历史上"汇总对不上、补传清单
-缺章"那族 bug 的判据。
+不变量（每个用例都断言）: 计数对得上账——创建路径 success + failed == total，
+修改路径 success + failed + skipped == total；且 fail_list 覆盖所有**记为失败**
+的章——这正是历史上"汇总对不上、补传清单缺章"那族 bug 的判据。跳过类
+（审核中、拿不到编辑链接）只计 skipped，不进 fail_list：它们没失败，用户
+也不该为它们补传。
 
 运行: python tests/test_batch_executors.py
 """

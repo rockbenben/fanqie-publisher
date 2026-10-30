@@ -39,9 +39,26 @@ def nfkc(s):
 class FakeWidget:
     def __init__(self):
         self.kw = {}
+        self.mapped = False
+        self.packed = []
 
     def configure(self, **kw):
         self.kw.update(kw)
+
+    def winfo_ismapped(self):
+        return self.mapped
+
+    def winfo_manager(self):
+        # Tk：返回当前管理该控件的几何管理器名（pack/grid/place），
+        # 没被任何管理器接管时返回 ""。真实代码用它判「这行是不是被 pack 着」。
+        return "pack" if self.mapped else ""
+
+    def pack(self, **kw):
+        self.mapped = True
+        self.packed.append(kw)
+
+    def pack_forget(self):
+        self.mapped = False
 
 
 class FakeVar:
@@ -58,11 +75,15 @@ class FakeSelf:
     def __init__(self, enabled=True, text="", op="≤"):
         self.cmb_resched_filter_op = FakeWidget()
         self.lbl_resched_filter_info = FakeWidget()
+        # 反馈独占一行（见 fanqie_gui 的 _set_resched_filter_info）：有文字
+        # 才 pack 这行，没文字就收起来不占高度。
+        self._resched_info_row = FakeWidget()
         self.resched_filter_var = FakeVar(enabled)
         self.resched_filter_num_var = FakeVar(text)
         self.resched_filter_op_var = FakeVar(op)
 
     _parse_chapter_spec = staticmethod(FanqieGUI._parse_chapter_spec)
+    _set_resched_filter_info = FanqieGUI._set_resched_filter_info
 
 
 def run_filter(text, items, key, enabled=True, op="≤"):
@@ -126,12 +147,19 @@ def attacks():
     check("R4 非法→全量+红字+不激活",
           not active and kept == items
           and f.lbl_resched_filter_info.kw.get("foreground") == "red")
+    # 格式示例必须整句都在：跟输入框挤在同一行时会被卡片右边缘裁掉
+    # （实测只剩「请输入数字、范围或组合(如」），用户看不到该怎么填。
+    check("R4 非法→提示含完整格式示例",
+          "1,3,5-10" in f.lbl_resched_filter_info.kw.get("text", "")
+          and f._resched_info_row.mapped)
     kept, active, f = run_filter(",", items, k)
     check("R4 单独逗号→全量+红字", not active and kept == items
           and f.lbl_resched_filter_info.kw.get("foreground") == "red")
     kept, active, f = run_filter("1,3", items, k, enabled=False)
     check("R4 未勾选→直通+恢复readonly", not active and kept == items
           and f.cmb_resched_filter_op.kw.get("state") == "readonly")
+    check("R4 未勾选→反馈行收起（不占高度）",
+          not f._resched_info_row.mapped)
     kept, active, f = run_filter("", items, k)
     check("R4 勾选留空→直通", not active and kept == items)
     fake = FakeSelf(True, tk.TclError("var destroyed"))

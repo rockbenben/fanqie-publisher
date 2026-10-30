@@ -28,6 +28,7 @@ MD 文件格式:
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import time
@@ -57,6 +58,17 @@ SCRIPT_DIR = Path(__file__).parent
 AUTH_FILE = SCRIPT_DIR / ".auth_state.json"
 GUI_STATE_FILE = SCRIPT_DIR / ".gui_state.json"
 CONFIG_FILE = SCRIPT_DIR / "config.json"
+
+# 原子写时换名被占用的重试次数。
+# Windows 上 rename 会被实时扫描/索引器短暂挡住（WinError 5 拒绝访问），
+# 实测本机约 10% 的概率、且常常连着失败几下。次数写成一个常量：循环上界
+# 和「最后一次就放弃」的判断必须是同一个数，分开写迟早会对不上。
+RENAME_RETRIES = 6
+# 每次重试之间的退避基数（秒），第 n 次等 RENAME_BACKOFF_S * n。
+# GUI 与命令行共用这一个：两边都走 Windows 换名可能被占的同一条路，步长一旦
+# 分叉就没人知道该改哪个。GUI 那边是在 Tk 主线程上 sleep 的，步子大一点
+# 界面就卡一下，所以取小的那个（10ms）。
+RENAME_BACKOFF_S = 0.01
 
 # 页面路径
 BOOK_MANAGE_URL = f"{BASE_URL}/main/writer/book-manage"
@@ -152,6 +164,26 @@ _EDITOR_VALIDATION_RE = re.compile(
     r"只支持阿拉伯数字|序号[^，。]{0,6}数字"
     r"|至少[^，。]{0,4}\d|字数不足|不能为空"
     r"|请输入(标题|正文|章节|内容)")
+
+# 同样的内容再提交一次，平台给的还是同一条拒绝 → 重试只是白烧次数。
+# 「重复」尤其重要：短退避的重试会把自己打进「提交频繁」，把真正的原因
+# （撞重名）埋掉；限流本身也不是 1/4/10 秒能跨过去的。
+# 字段校验（章节号没写进去/正文字数不足）不在此列：那是编辑器填充的瞬时
+# 状态，重载后重填往往就好了，保持原来的自愈路径。
+_NO_RETRY_RE = re.compile(
+    r"重复"                                  # 同名标题 / 大段落重复
+    r"|频繁"                                # 提交频繁、操作过于频繁
+    r"|审核不通过|违规|敏感")                # 内容层面的终局拒绝
+
+
+def is_retryable_publish_error(err) -> bool:
+    """这次失败再试一次会有不同结果吗？
+
+    判据只看平台文案：内容层面的终局拒绝重试必败，限流类短退避跨不过去；
+    其余（超时、断网、5xx、字段填充没生效、按钮被吞）按可重试处理，
+    保持原来的自愈路径。
+    """
+    return not _NO_RETRY_RE.search(str(err or ""))
 
 
 async def _visible_toast_texts(page) -> dict:
@@ -663,7 +695,7 @@ def record_unprocessed(fail_list, remaining, reason="每日字数上限，未处
 # 重试间隔（秒），第 N 次失败后等第 N 项。原来四处都写死 1~2s，三次重试全挤在
 # 10 秒内，服务端抽一下就是一起撞同一个故障窗（2026-09-04 改期第2782章:
 # "网络不好"→"服务器开小差了"×2，12 秒里三连败，1698 章只这一章没改成）。
-# 次数不动（3 次够，依据见 publish_one_chapter 上方），只把间隔拉开。
+# 次数不动（3 次够，依据见 publish_one_chapter 里「别再抬这个次数」那段），只把间隔拉开。
 _RETRY_BACKOFF_S = (1, 4, 10)
 
 
@@ -672,14 +704,19 @@ def retry_wait_ms(attempt: int) -> int:
     return int(_RETRY_BACKOFF_S[min(attempt, len(_RETRY_BACKOFF_S)) - 1] * 1000)
 
 
-async def after_attempt_failed(page, attempt, max_retries, err, err_tag=None):
+async def after_attempt_failed(page, attempt, max_retries, err, err_tag=None,
+                               *, retryable=True):
     """一次尝试失败后的收尾：还有次数就退避重试，用完了记错并截图。
 
     发布/存草稿/改内容/改排期四条重试路径原来各抄一份，退避一改就得改四处
     （改漏的那处就永远是老间隔）。截图留到最后一次：页面上残留的对话框/toast
     正是诊断要看的东西，中途关掉就没了。
+
+    retryable=False 用于内容/字段类拒绝：同样的内容再提交还是同一条错误，
+    重试只会把自己打进平台限流（真机上 2 次白重试就把「撞重名」变成了
+    「提交频繁」，原始原因反而被埋掉）。
     """
-    if attempt <= max_retries:
+    if retryable and attempt <= max_retries:
         logger.warning(f"第{attempt}次失败: {err}，重试中...")
         await page.wait_for_timeout(retry_wait_ms(attempt))
         return
@@ -998,17 +1035,90 @@ def get_browser_timeout() -> int:
 # ---------------------------------------------------------------------------
 # MD 文件解析
 # ---------------------------------------------------------------------------
-def natural_sort_key(path: Path):
-    """自然排序: 001 < 2 < 10"""
-    return [
-        int(s) if s.isdigit() else s.lower()
-        for s in re.split(r"(\d+)", path.name)
-    ]
-
-
 _CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
                "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
                "十": 10, "百": 100, "千": 1000}
+
+# 中文数字的字表：解析（_cn_to_int）与排序（natural_sort_key）共用同一份，
+# 别处再抄一遍就会两边对不上。
+# 注意：拼正则时插的是**字符本身**，不是带方括号的字符类——把 "[...]" 整个
+# 塞进 "[^...]" 里会在方括号中再套一个方括号，正则的意思整个变了（文本段
+# 匹配不到，排序键只剩数字段，顺序退化成输入序）。
+_CN_NUM_CHARS = "".join(_CN_DIGITS)
+
+# 排序键的分段：文本段与数字段**交替**（偶数位文本、奇数位数字），
+# 数字段可以是阿拉伯数字，也可以是中文数字。
+#
+# 这个形状必须和改前一致（改前是 re.split(r"(\d+)")，切出来的段也是
+# 文本/数字交替）。改形状等于改老用户的发布顺序：改前「001_x.md」的首段
+# 是空文本（'' < 'chapter'），数字开头的名字排在文字开头的前面；换成
+# 「先文本后数字」的形状后，001_序章.md 会排到 chapter-1.md **后面**。
+# 实测同一个目录里混用这两种命名时，整个顺序会翻过来——而目录顺序 =
+# 章节位置 = 发布顺序 = 读者看到的顺序。
+_SORT_TOKEN_RE = re.compile(rf"(\d+|[{_CN_NUM_CHARS}]+)")
+
+# 「第X章（中文数字）」的两条正则。放模块级编译一次：这两个函数是**每个
+# 章节文件**都要跑一遍的，把 f-string 写在函数里等于每个文件都重建一次
+# 模式字符串再让 re 去哈希一遍（实测 5291 个文件多花 0.5ms，不多，但
+# 纯属白费）。
+_CN_CHAPTER_NUM_RE = re.compile(rf"^第([{_CN_NUM_CHARS}]+)[章回节话]")
+_CN_CHAPTER_PREFIX_RE = re.compile(
+    rf"^第[{_CN_NUM_CHARS}]+[章回节话][\s:：_\-]*", re.IGNORECASE)
+
+# 标题前缀的四种写法（见 _strip_chapter_prefix 的例子）。模块级编译一次：
+# 这个函数每个章节文件都要跑一遍，把模式字符串写在函数里等于每个文件重建
+# 一次、再让 re 去哈希一遍。
+_PREFIX_PATTERNS = (
+    re.compile(r"^第\s*\d+\s*[章回节话][\s:：_\-]*", re.IGNORECASE),
+    _CN_CHAPTER_PREFIX_RE,
+    re.compile(r"^\d+[\s:：_\-]+", re.IGNORECASE),
+    re.compile(r"^chapter[\s_\-]*\d+[\s_\-]*", re.IGNORECASE),
+)
+
+
+def natural_sort_key(path: Path):
+    """自然排序: 001 < 2 < 10；中文数字同样按数值排（第一章 < 第二章 < 第十章）。
+
+    原来只把阿拉伯数字当数字切分，中文数字退化成字符比较——「第一章…第十二章」
+    排成 1,7,3,9,2,5…。而番茄的目录顺序 = 章节位置 = 发布顺序，这样发出去
+    读者直接看到乱序，且位置 3 天后就不能再移了。README 的「MD 文件格式」
+    明确写着支持「第X章（中文）」，所以这是照文档用法就会踩的坑。
+
+    一个例外要说清楚：**以中文数字开头**的文件名（"一.md"、"十二.md"）仍
+    按字符比，不按数值。改前中文数字一律当文本，「一.md」「二.md」…
+    「十二.md」排出来是 1,7,3,9,2,5,…（乱的——中文数字按码位比，和上面
+    「第一章…第十二章」那套次序一样）。改成按数值当然更整齐，
+    但那等于把老用户这一批文件的先后整个换掉——而文件顺序就是章节位置，
+    3 天后移不回来。为了不悄悄改掉别人的书，这里保持改前的样子；
+    「第X章」那种带前缀的写法（README 里的例子）按数值排。
+
+    键是 (元素序列, 原名) 两段：
+      元素序列的形状固定为「偶数位文本、奇数位数字」，两个名字比较时永远
+      是文本比文本、数字比数字。这一条改前也是成立的（改前的键同样是
+      re.split 出来的交替段），不是这次新加的保证。
+      末尾挂原名做兜底：元素序列完全相同时（只差大小写，或数值相同但写法
+      不同——「01_x.md」与「1_x.md」、「第01章.md」与「第1章.md」）也能分出
+      先后，排序结果不依赖文件系统的枚举顺序。这类同名对改前是按文件
+      系统枚举顺序排的（本来就不确定），现在是确定的。
+    """
+    parts = _SORT_TOKEN_RE.split(path.name)
+    # 名字**以中文数字开头**（"一.md"、"十二.md"）：改前它整段是文本，现在
+    # 的切法会切成「空文本 + 数字段」，而空文本排在所有文字前面——于是
+    # "一.md" 会跑到 "chapter-1.md" 前面，顺序整个翻过来（实测）。
+    # 把它并回文本段：合并掉的是「空文本 + 数字段 + 文本段」三段里的前两段，
+    # 段数减二，文本/数字的奇偶位不变，比较时仍然不会拿 int 和 str 互比。
+    if (len(parts) >= 3 and parts[0] == "" and parts[1]
+            and all(c in _CN_NUM_CHARS for c in parts[1])):
+        parts = [parts[1] + parts[2]] + parts[3:]
+    key = []
+    for i, s in enumerate(parts):
+        if i % 2 == 0:
+            key.append(s.lower())        # 文本段
+        elif s.isdecimal():
+            key.append(int(s))            # 数字段（阿拉伯）
+        else:
+            key.append(_cn_to_int(s))     # 数字段（中文）
+    return (tuple(key), path.name)
 
 
 def _cn_to_int(cn: str) -> int:
@@ -1055,7 +1165,7 @@ def _extract_chapter_num(text: str) -> str | None:
     if m:
         return str(int(m.group(1)))
     # 3) 第X章/回/节/话 - 中文数字: 第十六章, 第一百二十三回
-    m = re.match(r"^第([零〇一二两三四五六七八九十百千]+)[章回节话]", text)
+    m = _CN_CHAPTER_NUM_RE.match(text)
     if m:
         num = _cn_to_int(m.group(1))
         if num > 0:
@@ -1081,14 +1191,8 @@ def _strip_chapter_prefix(text: str) -> str:
     "Chapter 3 - Hello"  -> "Hello"
     """
     original = text.strip()
-    patterns = [
-        r"^第\s*\d+\s*[章回节话][\s:：_\-]*",     # 第 27 章 / 第27章 / 第27回
-        r"^第[零〇一二两三四五六七八九十百千]+[章回节话][\s:：_\-]*",  # 第十六章 / 第一百二十三回
-        r"^\d+[\s:：_\-]+",                        # 001_xxx / 001:标题 / 001：标题
-        r"^chapter[\s_\-]*\d+[\s_\-]*",            # chapter-3 / Chapter 3 -
-    ]
-    for pat in patterns:
-        cleaned = re.sub(pat, "", original, flags=re.IGNORECASE).strip()
+    for pat in _PREFIX_PATTERNS:
+        cleaned = pat.sub("", original).strip()
         if cleaned and cleaned != original:
             return cleaned
     return original
@@ -1403,8 +1507,45 @@ async def save_auth(context) -> bool:
     tmp = AUTH_FILE.with_suffix(AUTH_FILE.suffix + ".tmp")
     try:
         state = await asyncio.wait_for(context.storage_state(), timeout=30)
-        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(AUTH_FILE)
+        # 这个文件装的是**登录 cookie**，同机别的用户能读走就等于账号被接管。
+        # 用 os.open(..., 0o600) 直接按最终权限创建：write_text 会先按
+        # open() 的默认权限（POSIX 上 0644）建出文件，cookie 有那么一小段
+        # 时间是人人可读的，事后 chmod 只是把窗口关上而已。
+        # Windows 上 0o600 不起作用（靠目录 ACL），但开着也无害。
+        # os.open 的 mode 只在「创建」时生效——上次运行残留的 tmp（老版本
+        # 写的，0644）不会被改，所以先把它删掉，免得新 cookie 写进一个
+        # 宽权限的文件里。
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            # 删不掉残留的 tmp（Windows 上被扫描器占着）：那就先把权限收紧
+            # 再写——别让新 cookie 进一个宽权限的旧文件里。收不紧就干脆
+            # 不保存（登录路径会把这次当成保存失败，用户重新登录一次即可）。
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError as _e2:
+                logger.warning(f"登录状态临时文件删不掉且收不紧权限"
+                               f"（本次不保存登录状态）: {_e2}")
+                return False
+        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(_fd, "w", encoding="utf-8") as _f:
+            _f.write(json.dumps(state, ensure_ascii=False))
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError as _e:
+            # 收不紧要说一声：静默 pass 的话，权限还是宽的而没人知道。
+            logger.warning(f"登录状态文件权限收不紧（不影响本次登录）: {_e}")
+        # Windows 上 rename 可能被实时扫描短暂挡住（WinError 5 拒绝访问），
+        # 实测本机约 10% 的概率、且常连着失败几次。重试即可落盘：内容已经
+        # 完整写进 tmp，每次重试只是重新 rename，不必再取一次 storage_state。
+        for attempt in range(RENAME_RETRIES):
+            try:
+                tmp.replace(AUTH_FILE)
+                break
+            except PermissionError:
+                if attempt == RENAME_RETRIES - 1:
+                    raise
+                await asyncio.sleep(RENAME_BACKOFF_S * (attempt + 1))
         return True
     except Exception as e:
         logger.warning(f"保存登录状态失败(不影响本次结果): {e}")
@@ -2020,7 +2161,10 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
             let status = '';
             for (let ci = 1; ci < cells.length; ci++) {
                 const ct = cells[ci].textContent.trim();
-                if (/待发布|已发布|审核中|草稿|已拒绝/.test(ct)) {
+                // 「审核不通过」也要认：接口那条路认它（DISPLAY_STATUS_TEXT），
+                // DOM 这条路不认的话，同一章在两条路上会得到不同的状态文案
+                // ——修改模式报错时就会印出「未知状态」。
+                if (/待发布|已发布|审核中|审核不通过|草稿|已拒绝/.test(ct)) {
                     status = ct; break;
                 }
             }
@@ -2304,7 +2448,7 @@ def match_chapters(
 
 async def click_next_step(page):
     """点击下一步按钮（进入发布流程）。"""
-    # 精确定位发布按钮（class 含 publish-button），避开 React Tour 引导中的同名按钮
+    # 精确定位「下一步」按钮（class 含 auto-editor-next），避开 React Tour 引导中的同名按钮
     # 点击限时 5s：唯一调用方是 _navigate_to_publish_settings 的轮询状态机，按钮被
     # 未知弹窗遮罩挡住时应快速失败回到轮询识别弹窗，而不是烧满 Playwright 默认 30s
     # （正常点击 <1s，5s 余量充足；超时后状态机下一轮会重试点击）。
@@ -2479,6 +2623,16 @@ def compute_schedule(
 # 策略（改线上内容代价大），不是平台限制——见 tools/remap --include-published。
 DISPLAY_PUBLISHED = 1      # display_status: 已公开
 DISPLAY_PENDING = 10       # display_status: 待发布，可改内容
+# 下面三个是**实测反推**的，平台没有公开文档：
+#   4 = 审核中     依据：它的 cant_modify_reason 原话「审核中暂不支持修改」
+#   5 = 已发布章的修改审核中  依据同上（2026-10-30 实测：改已发布章后该章
+#      变成 5，旧标题/正文仍在线上，审核通过前平台查重仍能看见旧内容）
+#   7 = 审核不通过 依据：它后面紧跟着一大片 4，且它自己的编辑器能进、
+#                      平台页面写着「审核不通过，请在右侧面板查看原因，
+#                      修改后再提交」
+DISPLAY_REVIEWING = 4
+DISPLAY_REVIEWING_PUBLISHED = 5
+DISPLAY_REVIEW_FAILED = 7
 MOVE_WINDOW_H = 72         # App 里能申请移动的窗口（3 天）
 
 
@@ -2597,17 +2751,16 @@ _FETCH_ITEMS_JS = r"""async (u) => {
 # 调用方一个字都不用改。
 # ---------------------------------------------------------------------------
 # display_status -> DOM 那一列的中文。
-# 1 / 10 之外的两个是**实测反推**的，平台没有公开文档：
-#   4 = 审核中     依据：它的 cant_modify_reason 原话「审核中暂不支持修改」
-#   7 = 审核不通过 依据：它后面紧跟一大片 4，且它自己的编辑器能进、
-#                      平台页面写着「审核不通过，请在右侧面板查看原因，
-#                      修改后再提交」
-# 填进来主要是为了让人看得懂；能不能改另看 cant_modify_reason。
+# 4 / 7 这两个码的含义是实测反推的（平台没有公开文档），依据写在上面
+# DISPLAY_REVIEWING / DISPLAY_REVIEW_FAILED 的注释里——只写一份，免得两处
+# 说法漂移。
+# 填进来主要是为了让人看得懂；能不能改另看 cant_modify_reason，外加「审核中」
+# 一律不给编辑入口（见下面 editable 那一支）——只看 reason 会把正在审的章也放开。
 _DISPLAY_STATUS_TEXT = {
     DISPLAY_PUBLISHED: "已发布",
     DISPLAY_PENDING: "待发布",
-    4: "审核中",
-    7: "审核不通过",
+    DISPLAY_REVIEWING: "审核中",
+    DISPLAY_REVIEW_FAILED: "审核不通过",
 }
 
 # 章节管理页「编辑」按钮的链接形状（2026-08-27 与 DOM 实测逐条比对一致）
@@ -2618,7 +2771,8 @@ def api_items_to_rows(items, book_id):
     """chapter_list 接口的 item -> _EXTRACT_ALL_JS 的行结构。
 
     返回 (chapters, last_publish)，与 extract_chapters_from_page 的返回同形:
-      chapters: [{title, chapterNum, editUrl, status, date, time, rowIndex}]
+      chapters: [{title, chapterNum, editUrl, status, date, time, rowIndex,
+                  cant_modify_reason}]
       last_publish: {date, time, chapter} —— 行里最大的那个时刻，同 DOM 版。
 
     date/time 取哪个时间戳: 待发布章看 timer_time（排期时刻，改排期要用它），
@@ -2627,24 +2781,42 @@ def api_items_to_rows(items, book_id):
     """
     rows, last_pub, last_key = [], None, ""
     for i, it in enumerate(items):
-        title = it.get("title") or ""
+        title = it.get("title")
+        if not isinstance(title, str):
+            title = ""           # 平台给了非字符串的标题：别拿它去正则匹配
         ds = it.get("display_status")
-        reason = (it.get("cant_modify_reason") or "").strip()
+        if not isinstance(ds, int) or isinstance(ds, bool):
+            # bool 是 int 的子类：True 会被当成 1（已发布），于是拿到编辑
+            # 入口。平台发来布尔值时当成「认不出的码」，一律不给编辑入口。
+            ds = None            # 认不出的码（数组/对象/布尔）→ 走未知状态那一支
+        reason = it.get("cant_modify_reason")
+        if not isinstance(reason, str):
+            reason = ""
+        reason = reason.strip()
         status = _DISPLAY_STATUS_TEXT.get(ds)
         if status is None:
-            # 认不出的状态码 ≠ 不能改。平台给不给编辑入口，看的是
-            # cant_modify_reason 有没有内容，不看我们认不认识那个码。
-            # 审核不通过（实测 status=7）恰恰 reason 为空、编辑器能进（平台
-            # 页面写着「审核不通过，请…修改后再提交」），而那一章正是解
-            # 「审核卡队列」唯一能动的地方 —— 按老逻辑一刀切跳过，等于把
-            # 出路也堵死了：后面几百章永远卡在审核里。
-            status, editable = (reason or f"未知状态{ds}"), (not reason)
+            # 没见过的 display_status：别猜成「已发布」——那会把它拉进各种
+            # 名单；也不给编辑入口。我们只认得 1/4/7/10 四个码（都写进
+            # _DISPLAY_STATUS_TEXT 了），其余的不知道平台会拿它做什么，
+            # 一律按「别去动它」处理。凭「reason 为空」就当它能改，
+            # 等于把工具的写权限开到一个没人验证过的状态码上——
+            # 改内容要重过审，读者会收到更新，代价由用户承担。
+            # 审核不通过（实测 status=7）不在这一支：它已经是个认得的码，
+            # 走下面那条分支（reason 为空 → 可改），那正是解审核卡队列
+            # 唯一能动的地方。
+            status, editable = (reason or f"未知状态{ds}"), False
         else:
             # cant_modify_reason 非空时平台**根本不渲染「编辑」按钮**（2026-08-28
             # 在完结作品上实测: DOM 的 editUrl 是 None，理由是"完结作品不可修改"）。
             # 这里照办 —— 凭空拼一个编辑链接会让修改模式从"安全跳过"变成
             # "导航过去改一章平台明说不让改的章"。
-            editable = not reason
+            #
+            # 「审核中」是唯一的例外：它在改前是个没人认得的码（不可编辑），
+            # 现在成了认得的码，不能顺手跟着「reason 为空 → 可改」一起放开
+            # ——那一章正在审，工具不该去改它（改内容要重过审，读者会收到更新）。
+            # 放开「reason 为空 → 可改」的只有审核不通过（7）：它是解审核卡队列
+            # 唯一能动的地方。
+            editable = (not reason) and ds != DISPLAY_REVIEWING
         ts = it.get("timer_time") if ds == DISPLAY_PENDING else it.get("create_time")
         try:
             ts = int(ts or 0)
@@ -2664,6 +2836,9 @@ def api_items_to_rows(items, book_id):
             "status": status,
             "date": d, "time": t,
             "rowIndex": i,
+            # 平台明说不能改的理由。带着它，修改模式才能说清「为什么改不了」
+            # —— 只说「审核不通过的章可以改」，碰上带理由的那一种就是死路。
+            "cant_modify_reason": reason,
         })
         if d:
             key = f"{d} {t}"
@@ -2690,20 +2865,6 @@ _SIGNED_CHAPTER_LIST_JS = r"""() => {
 
 
 VOLUME_INDEX_STRIDE = 10000    # index = 卷序号(0起) * 10000 + 卷内位置
-
-
-# 最近一次 fetch_chapter_items 检出的「审核卡队列」，没查到为 None。
-# 放在数据源里而不是各调用点：调用点本来就抓这份数据，谁多花一次请求都一样；
-# 而集中在一处，下回新增调用点不会又漏掉这个检查。
-_last_review_block = None
-
-
-def last_review_block():
-    """最近一次抓章节时检出的审核卡队列；没检过或没查到返回 None。
-
-    判断标准见 find_review_block。
-    """
-    return _last_review_block
 
 
 def global_position(index, offsets):
@@ -2821,19 +2982,18 @@ async def fetch_chapter_items(page, book_id):
         # 顺手检一次审核卡队列：这份数据刚抓到，检测是纯 CPU 的（实测
         # 5196 章 0.7 毫秒）。命中就警告 —— 这类故障不会自己好，而用户正要
         # 往队列里加章时正是最该知道的时刻。
-        global _last_review_block
-        try:
-            _last_review_block = find_review_block(items)
-        except Exception as _e:                     # 纯诊断，失败绝不影响主流程
-            logger.debug(f"审核卡队列检测失败（忽略）: {_e}")
-            _last_review_block = None
-        if _last_review_block:
-            _b = _last_review_block
+        # 结论只在这里用一次（日志），不往外存：以前存进模块级全局变量，
+        # 界面上那个 ⚠ 徽标再去读它，于是「上次查出来的结论」永远撤不掉，
+        # 改成「这次查出来的结论」就没法做（要分清"这次没查"和"这次查了
+        # 但没有"，靠全局变量分不出来）。真要用，调用方自己拿 items 调
+        # find_review_block —— 判据只有这一份。
+        _blk = find_review_block(items)
+        if _blk:
             logger.warning(
-                f"⚠ 审核卡住了：位置 {_b['index']} 这一章没过审核，后面 "
-                f"{_b['blocked']} 章全卡在审核中"
-                + (f"（一直排到位置 {_b['blocked_to']}）" if _b.get("blocked_to") else "")
-                + f"。被卡的是「{_b['title'][:24]}」——平台按位置顺序审，"
+                f"⚠ 审核卡住了：位置 {_blk['index']} 这一章没过审核，后面 "
+                f"{_blk['blocked']} 章全卡在审核中"
+                + (f"（一直排到位置 {_blk['blocked_to']}）" if _blk.get("blocked_to") else "")
+                + f"。被卡的是「{_blk['title'][:24]}」——平台按位置顺序审，"
                   f"它不会自己过审，得先改这一章重新提交。")
         return items, ch_url, vols
     finally:
@@ -2861,33 +3021,66 @@ _REVIEW_BLOCK_MIN = 10
 def find_review_block(items):
     """找出被拒、导致后面整批卡在审核中的那一章。
 
-    返回 None，或 {"index","title","status","blocked"}：
-      index   被拒章的位置（全书位置）
-      title   它的标题
-      status  它的 display_status（没官方文档，只作为排查线索给出）
-      blocked 被它卡住的后续章数
+    返回 None，或 {"index","title","status","blocked","blocked_to"}：
+      index      被拒章的位置（全书位置）
+      title      它的标题
+      status     它的 display_status（没官方文档，只作为排查线索给出）
+      blocked    被它卡住的后续章数
+      blocked_to 一直卡到的那个位置（没记到就是 None）
 
     判据：某一章 display_status 既不是已发布也不是待发布，且 cant_modify_reason
     里没有「审核中」，而**紧接其后**连续 N 章 reason 含「审核中」
-    （N >= _REVIEW_BLOCK_MIN）。实测见文件头。
+    （N >= _REVIEW_BLOCK_MIN）。实测（2026-10-10）：位置 4783 状态 7，
+    4784~5196 共 413 章状态 4，一路卡到全书末尾。
+
+    检测本身是纯诊断：它挂了（平台少给一个字段之类）不该让调用方的整份
+    报告报废——所以这里自己兜住，失败就当「没查出来」。两个调用点原来各
+    写了一份一样的 try/except，现在只有这一份。
     """
-    rows = sorted(items, key=lambda x: x.get("pos", x["index"]))
+    try:
+        return _find_review_block(items)
+    except Exception as _e:
+        # 用 warning 而不是 debug：日志级别是 INFO，debug 根本不落盘——
+        # 检测失败会被彻底静默掉（一次真卡队列就这么被漏掉了，而用户看到的
+        # 是「没有卡队列」）。
+        logger.warning(f"审核卡队列检测失败（本次当成没有）: {_e}")
+        return None
+
+
+def _find_review_block(items):
+    # x.get("pos", x["index"]) 里的默认值是**先算出来**的：x 没有 "index"
+    # 时就算有 "pos" 也会 KeyError（平台少给字段就抛）。用 .get() 逐个拿。
+    def _pos_of(x):
+        v = x.get("pos")
+        return v if isinstance(v, int) else (x.get("index") or 0)
+
+    def _title_of(x):
+        # 标题也可能是 None 或数字：下面要切片（[:24]），非字符串会 TypeError，
+        # 而这会让整次抓取失败（上传/体检/remap 全断）。
+        t = x.get("title")
+        return t if isinstance(t, str) else ""
+
+    rows = sorted(items, key=_pos_of)
     for i, it in enumerate(rows):
-        st = it["display_status"]
+        st = it.get("display_status")
         if st in (DISPLAY_PUBLISHED, DISPLAY_PENDING):
             continue
         reason = (it.get("cant_modify_reason") or "").strip()
         if "审核中" in reason:
             continue                      # 它自己在审，不是被拒的那章
         n, last = 0, None
-        for nx in rows[i + 1:]:
+        # 按下标往后走，不要 rows[i+1:]：切片每次都要复制一遍剩下的列表，
+        # 5291 章全被判成异常时就是 5291 次复制（实测 28.5ms）。下标遍历
+        # 语义完全一样，一次复制都没有。
+        for j in range(i + 1, len(rows)):
+            nx = rows[j]
             if "审核中" in (nx.get("cant_modify_reason") or ""):
                 n += 1
-                last = nx.get("pos", nx["index"])
+                last = _pos_of(nx)
                 continue
             break                         # 连续段结束
         if n >= _REVIEW_BLOCK_MIN:
-            return {"index": it.get("pos", it["index"]), "title": it["title"],
+            return {"index": _pos_of(it), "title": _title_of(it),
                     "status": st, "blocked": n, "blocked_to": last}
     return None
 
@@ -2913,29 +3106,41 @@ def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
     now_ts = int(time.time()) if now_ts is None else now_ts
     pend_bad, in_window, expired = [], [], []
     running_max = 0
+    # 平台给的字段可能缺（JSON 序列化会丢掉 undefined 的键）：下面全部用
+    # .get() 拿，缺了就当没有——体检是**只读诊断**，不该因为平台少给一个
+    # 字段就整份报告都出不来（之前 find_review_block 已经这么兜住了，
+    # 同一个函数里却还留着会抛 KeyError 的写法）。
+    def _pos_of(x):
+        v = x.get("pos")
+        return v if isinstance(v, int) else (x.get("index") or 0)
+
     # 按全书位置排序/比对：多卷作品的 index 带卷序号偏移（见 global_position），
     # 直接拿 index 和「第N章」比会把整卷判成错位。单卷时 pos 缺省等于 index。
-    for it in sorted(items, key=lambda x: x.get("pos", x["index"])):
-        pos = it.get("pos", it["index"])
-        n = chapter_title_num(it["title"])
-        if it["display_status"] == DISPLAY_PUBLISHED:
+    for it in sorted(items, key=_pos_of):
+        pos = _pos_of(it)
+        title = it.get("title") or ""
+        ds = it.get("display_status")
+        n = chapter_title_num(title)
+        if ds == DISPLAY_PUBLISHED:
             if n is not None and n < running_max:
                 try:
                     pub_at = int(it.get("create_time") or 0)
                 except (TypeError, ValueError):
                     pub_at = 0
                 left_h = (pub_at + window_h * 3600 - now_ts) / 3600
-                row = {"index": pos, "num": n, "title": it["title"],
+                row = {"index": pos, "num": n, "title": title,
                        "pub_at": pub_at, "left_h": left_h}
                 (in_window if left_h > 0 else expired).append(row)
             if n is not None:
                 running_max = max(running_max, n)
-        elif (it["display_status"] == DISPLAY_PENDING
-              and n is not None and n != pos):
+        elif (ds == DISPLAY_PENDING and n is not None and n != pos):
             # n is None = 标题里没有「第N章」（楔子/番外/作者的话）。它本来就
             # 不参与主线编号，拿 pos 去比必然不等 —— 判成错位会让 remap 把它
             # 排进改写计划，标题和正文被第pos章的内容覆盖。
             pend_bad.append(pos)
+    # 卡队列是**诊断**：检测挂了（平台少给一个字段之类）不该让整份体检报告
+    # 报废——那会让用户以为体检失败，而其实只是少了一条附加信息。
+    # 兜底在 find_review_block 里面（两个调用点原来各写一份一样的）。
     return {"pending_bad": pend_bad, "in_window": in_window,
             "expired": expired, "review_block": find_review_block(items)}
 
@@ -3025,6 +3230,9 @@ def verify_content_matches_book(items, num2path, *, sample=8):
     return True, f"抽查 {checked} 章，{matched} 章标题吻合"
 
 
+# 每日/每月上限的**区分**用：_DAILY_LIMIT_RE 已经把「每月/本月/单月/月度」也收进去
+# （撞上限一律中止整批），这里只多问一句「这一条到底是按月还是按天」——
+# 因为两者的下一步完全不同（见 is_monthly_limit）。
 _MONTHLY_LIMIT_RE = re.compile(r"(每月|本月|单月|月度)[^，。;；]{0,12}上限")
 
 
@@ -4047,9 +4255,20 @@ async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
 
         edit_url = plat_ch.get("editUrl")
         if not edit_url:
-            logger.error(f"无法获取编辑链接，跳过——这一章当前是「{plat_ch.get('status') or '未知状态'}」。"
-                         "审核中的章要等审完；审核不通过的章可以改，"
-                         "用「修改内容」模式指定它的章号就能改")
+            # 说清「为什么改不了」。原来这句是无条件说「审核不通过的章可以改」，
+            # 但能不能改还看平台有没有给「不可修改」的理由：给了理由的那一种
+            # （比如完结作品）根本没有编辑入口，照原来的说法用户会一直试、
+            # 每次都被跳过，死路一条。
+            _reason = (plat_ch.get("cant_modify_reason") or "").strip()
+            if _reason:
+                logger.error(
+                    f"无法获取编辑链接，跳过——这一章当前是「{plat_ch.get('status') or '未知状态'}」，"
+                    f"平台给的理由是「{_reason}」。")
+            else:
+                logger.error(
+                    f"无法获取编辑链接，跳过——这一章当前是「{plat_ch.get('status') or '未知状态'}」。"
+                    "审核中的章要等审完；审核不通过且平台没给理由的章可以改，"
+                    "用「修改内容」模式指定它的章号就能改。")
             skipped += 1
             _progress(i + 1, total)
             continue
@@ -4080,9 +4299,10 @@ async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
                     failed += _breaker_abort(i)
                     break
         except DailyLimitReached as e:
-            # 每日字数上限 = 平台当日额度已耗尽。继续提交后续章节只会重复
-            # 撞限或触发别的拦截（实测续发产生额外错误），故中止整批；
-            # 本章与所有剩余章节（含批末待二次尝试的）如实记入清单。
+            # 字数额度耗尽（每日或每月，措辞走 limit_label，别一律说成"每日"——
+            # 每月耗尽时"明天接着发"是错的，见 limit_label 的注释）。继续提交
+            # 后续章节只会重复撞限或触发别的拦截（实测续发产生额外错误），
+            # 故中止整批；本章与所有剩余章节（含批末待二次尝试的）如实记入清单。
             lab = limit_label(e)
             logger.warning(f"  达{lab}（{e}），中止整批")
             fail_list.append((f"第{ch_num}章 {title}", str(e)))
@@ -4158,8 +4378,8 @@ async def run_edit_batch(page, matched, *, use_ai=False, max_retries=2,
                     fail_list.append((f"第{ch_num}章 {title}",
                                       err or "标题重复，二次尝试仍失败"))
             except DailyLimitReached as e:
-                # 二次尝试阶段撞每日上限：与主循环一致，中止整批，
-                # 本条与剩余二次条目如实记入清单。
+                # 二次尝试阶段撞字数上限（每日或每月，措辞走 limit_label）：与主循环一致，
+                # 中止整批，本条与剩余二次条目如实记入清单。
                 lab = limit_label(e)
                 logger.warning(f"  达{lab}（{e}），中止二次尝试")
                 fail_list.append((f"第{ch_num}章 {title}", str(e)))
@@ -4552,7 +4772,8 @@ async def edit_one_chapter(
     page, edit_url: str, ch_num: int, title: str, content: str,
     *, use_ai: bool = False, max_retries: int = 2, set_num=None,
 ) -> tuple[bool, str]:
-    """编辑单个已有章节（含重试）。返回 (是否成功, 最后一次错误信息)。
+    """编辑单个已有章节（含重试；内容/限流类终局拒绝不重试）。
+    返回 (是否成功, 最后一次错误信息)。
 
     错误信息供上层写入失败清单（真实原因优于"见日志"），并用于识别
     "重复标题"类可二次尝试的失败。
@@ -4588,8 +4809,11 @@ async def edit_one_chapter(
             raise
         except Exception as e:
             last_err = str(e)
+            retryable = is_retryable_publish_error(last_err)
             await after_attempt_failed(page, attempt, max_retries, e,
-                                       f"edit_{ch_num}")
+                                       f"edit_{ch_num}", retryable=retryable)
+            if not retryable:
+                break
     return False, last_err
 
 
@@ -4716,7 +4940,7 @@ async def _dismiss_resched_dialog(page) -> bool:
     """关掉残留的「修改定时」对话框，并确认它真的关了。
 
     Arco Modal 默认响应 Escape；只在对话框还开着时才按（没弹窗时裸按 Escape
-    会关掉别的东西，见 escape-closes-publish-modal 的教训），按完要等
+    会关掉别的东西，见 publish_scheduled 里「绝不能再按 Escape」那段），按完要等
     「确认修改」按钮消失才算数——键盘操作不验证生效等于没做。
     """
     btn = page.locator("button", has_text="确认修改").first
@@ -4939,7 +5163,8 @@ async def _reschedule_current_volume(
                     await page.wait_for_timeout(500)
                     await _read_back(time_input, time_str, "时间")
 
-                    # 点击"确认修改"，判定结果: 按钮消失=成功；toast 分类失败原因
+                    # 点击"确认修改"，判定结果由 _wait_publish_result 给：接口 code 是权威信号
+                    # （按钮消失本身不算成功，见那里的说明）；toast 分类失败原因
                     await confirm_btn.first.click(no_wait_after=True, timeout=_browser_timeout)
                     await _wait_publish_result(page, confirm_btn.first)
 
@@ -5202,6 +5427,7 @@ def _run_tool_cmd(name, args, *, force_readonly=False):
                            ("daily", False), ("headless", False),
                            ("show_browser", False), ("use_ai", False),
                            ("audit", False), ("force", False),
+                           ("buffer_chapter", None), ("buffer_file", None),
                            ("book_id", None), ("content_dir", None)):
         if not hasattr(args, field):
             setattr(args, field, default)
@@ -5387,7 +5613,7 @@ def main():
         help="修改已有章节 (按章节号匹配, 不可与 --publish/--schedule 同时使用)",
     )
 
-    # remap: 章节重排（把未公开段的错位内容整体前移，消掉中段缺口）
+    # remap: 章节重排（按位置重装内容，消掉中段缺口；默认只动未公开段）
     rm = sub.add_parser("remap",
                         help="章节重排：按位置重装内容（位置 i 装第 i 章），消掉中段缺口"
                              "（--include-published 可连已发布段一起修）")
@@ -5401,6 +5627,12 @@ def main():
                     help="把已公开的章也纳入改写（修已发布段的顺序错位）。"
                          "平台允许改已发布章，但内容会重新过审、读者可能收到"
                          "更新 —— 务必先看 dry-run")
+    rmg = rm.add_mutually_exclusive_group()
+    rmg.add_argument("--buffer-chapter", metavar="N|auto",
+                     help="闭环用本地未发布章节的真实正文做缓冲；"
+                          "auto=取平台末尾之后的最小未发布章号")
+    rmg.add_argument("--buffer-file", metavar="PATH",
+                     help="闭环用指定真实文本文件做缓冲（正文按平台口径≥1000字）")
     rm.add_argument("--safety-minutes", type=int, default=60,
                     help="跳过多少分钟内就要发布的章（默认 60）")
     rm.add_argument("--daily", action="store_true",
