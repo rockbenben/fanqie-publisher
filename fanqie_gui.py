@@ -31,6 +31,7 @@ try:
         parse_chapter_spec, filter_by_chapter_spec, parse_time_spec,
         parse_datetime, TIMER_INPUT_FORMATS,
         fetch_chapter_items, audit_chapter_positions, MOVE_WINDOW_H,
+        AUDIT_CLEAN_LINE, audit_position_counts,
         reader_view_around, review_status_lines, schedule_order_lines,
         queue_state, queue_summary, queue_tail_dt, queue_label_text, rows_to_items,
         schedule_order_conflicts, schedule_repair_plan, slot_timestamp,
@@ -5693,76 +5694,91 @@ class FanqieGUI:
             lines.append(f"本作品 {volume_count(volumes)} 卷，已跨卷合并，"
                          f"位置按全书连续计。")
             lines.append("")
-        pend_lo = min(pend_bad) if pend_bad else 0
-        pend_hi = max(pend_bad) if pend_bad else 0
-        lines.append(f"A 未公开段位置与章号不符：{len(pend_bad)} 个"
-                     + (f"（位置 {self._compress_nums(pend_bad)}）" if pend_bad else ""))
-        if pend_bad:
-            lines.append(f"   修：点「{BTN_REMAP}」保持『未公开段』，"
-                         f"再点「填入 {pend_lo}-{pend_hi}」")
-            # pend_bad 存的是全书位置（pos）；多卷下原始 index 带卷偏移，
-            # 拿 index 查会查空，余量告警就静默消失了
-            tt = next((int(x.get("timer_time") or 0) for x in items
-                       if x.get("pos", x["index"]) == pend_lo), 0)
-            left_h = (tt - datetime.now().timestamp()) / 3600 if tt else None
-            if left_h is not None and left_h < MOVE_WINDOW_H:
-                lines.append(f"   ⚠ 位置 {pend_lo} 只剩 {left_h / 24:.1f} 天就发出，"
-                             f"余量已不足 3 天 —— 今天就得补跑")
-        lines.append("")
-        # B 段只列**真要动**的章：位置不对、确实被挤到后面、且还在 3 天窗口内。
-        # 原来这里用的是「章号 < 前面最大章号」的倒挂集合，于是把位置明明正确
-        # 的章（实测：第1121章在1121）也列进来，还教用户去 App 移动它——
-        # 移动一个位置正确的章没有任何用处（2026-10-31 用户反馈）。
         movable = rep["in_window"]
-        lines.append(f"B 已公开、位置与章号不符、发布 3 天内"
-                     f"（App 里还能移动位置）：{len(movable)} 章")
-        for r in movable:
-            lines.append(f"   第{r['num']}章（现在位置 {r['index']}，"
-                         f"应该在位置 {r['num']}），"
-                         f"窗口还剩 {r['left_h']:.1f} 小时")
-        if movable:
-            lines.append("   修：手机 App 申请调整 → 通过后选中该章 → 移动位置"
-                         "（只动这一章，不用重写内容）")
-        lines.append("")
         n_bad = len(pub_bad)
-        lo, hi = (min(pub_bad), max(pub_bad)) if n_bad else (0, 0)
-        if n_bad:
-            # 首行报的是**要改的章数**（位置与章号对不上的那些），不是倒挂数：
-            # 两者差两个数量级，只报倒挂会让人以为「修 3 章就完事」。
-            lines.append(f"C 已公开段位置与章号不符：{n_bad} 章（位置 {lo}-{hi}）")
-            brk = rep.get("order_break") or {}
-            if brk.get("at"):
-                view = self._reader_view_around(items, brk["at"], span=2)
-                if view:
-                    lines.append("   读者目录现在看到：… " + " → ".join(view) + " …")
-                # 断点只用来解释「顺序从哪儿开始乱的」。被隔断的那 N 章里，
-                # 绝大多数位置本身是对的（实测：第481章在481）——把它们说成
-                # 「顺序断裂的章」就是报假错（2026-10-31 用户反馈）。
-                lines.append(f"   顺序断在位置 {brk['at']}：从那儿往后 "
-                             f"{brk['affected']} 章的顺序被隔断"
-                             f"（它们自己的位置大多是对的，重排会自动跳过）")
-            # 点名要改的是哪几章：位置 + 它现在装的是什么。只给个数字的话，
-            # 用户得自己回目录里一个个找。
-            _bad = "、".join(f"位置{r['index']} 装第{r['num']}章"
-                             for r in misplaced[:5])
-            _more = f"…共{n_bad}章" if n_bad > 5 else ""
-            lines.append(f"   要改的就是这 {n_bad} 章：{_bad}{_more}")
-            lines.append(f"   修：点「{BTN_REMAP}」选『已公开段』，"
-                         f"再点「填入 {lo}-{hi}」")
-            cost = "要重写线上内容并重新过审，读者可能收到更新"
-            cost += ("；章数多会撞提交上限，分批跑" if n_bad >= 30 else "")
-            lines.append("   代价：" + cost)
-            # 以下两条只在可疑时才输出：正常错位不需要看这些
-            span_n = hi - lo + 1
-            if span_n != n_bad:
-                lines.append(f"   注：区间里另有 {span_n - n_bad} 章本来就对，"
-                             f"会自动跳过")
-            if movable:
-                lines.append(f"   注：B 段那 {len(movable)} 章窗口一关"
-                             f"就落进 C 段，本次改写也会覆盖它们")
-
+        # 三段各有多少章，问核心里那一份（GUI 与 CLI 共用）——两边各数一遍的话，
+        # 迟早会数出不一样的数（「面板说 32 章、真改时改了 33 章」）。
+        n_pend, n_mov, n_pub = audit_position_counts(rep)
+        # 位置与章号这一维：三段各答一句「有没有错位、错几章、怎么点」。
+        # 原来三段恒定输出，空段也占一行（「A …：0 个」「B …：0 章」
+        # 「C 已公开段：正常」），像一张填了零的表 —— 用户得自己判断
+        # 「0 是不是好消息」（2026-10-31 用户反馈）。所以：全清时只留一句结论；
+        # 有错位时空段写成一句话（而不是「0 个」），有内容的段照旧带修法。
+        if not (n_pend or n_mov or n_pub):
+            lines.append(AUDIT_CLEAN_LINE)
+            lines.append("")
         else:
-            lines.append("C 已公开段：正常")
+            pend_lo = min(pend_bad) if pend_bad else 0
+            pend_hi = max(pend_bad) if pend_bad else 0
+            if pend_bad:
+                lines.append(f"A 未公开段位置与章号不符：{len(pend_bad)} 个"
+                             f"（位置 {self._compress_nums(pend_bad)}）")
+                lines.append(f"   修：点「{BTN_REMAP}」保持『未公开段』，"
+                             f"再点「填入 {pend_lo}-{pend_hi}」")
+                # pend_bad 存的是全书位置（pos）；多卷下原始 index 带卷偏移，
+                # 拿 index 查会查空，余量告警就静默消失了
+                tt = next((int(x.get("timer_time") or 0) for x in items
+                           if x.get("pos", x["index"]) == pend_lo), 0)
+                left_h = (tt - datetime.now().timestamp()) / 3600 if tt else None
+                if left_h is not None and left_h < MOVE_WINDOW_H:
+                    lines.append(f"   ⚠ 位置 {pend_lo} 只剩 {left_h / 24:.1f} 天就发出，"
+                                 f"余量已不足 3 天 —— 今天就得补跑")
+            else:
+                lines.append("A 未公开段：位置与章号都对得上")
+            lines.append("")
+            # B 段只列**真要动**的章：位置不对、确实被挤到后面、且还在 3 天窗口内。
+            # 原来这里用的是「章号 < 前面最大章号」的倒挂集合，于是把位置明明正确
+            # 的章（实测：第1121章在1121）也列进来，还教用户去 App 移动它——
+            # 移动一个位置正确的章没有任何用处（2026-10-31 用户反馈）。
+            if movable:
+                lines.append(f"B 已公开、位置与章号不符、发布 3 天内"
+                             f"（App 里还能移动位置）：{len(movable)} 章")
+                for r in movable:
+                    lines.append(f"   第{r['num']}章（现在位置 {r['index']}，"
+                                 f"应该在位置 {r['num']}），"
+                                 f"窗口还剩 {r['left_h']:.1f} 小时")
+                lines.append("   修：手机 App 申请调整 → 通过后选中该章 → 移动位置"
+                             "（只动这一章，不用重写内容）")
+            else:
+                lines.append("B 已公开段：没有还能在 3 天内靠 App 移动的错位章")
+            lines.append("")
+            lo, hi = (min(pub_bad), max(pub_bad)) if n_bad else (0, 0)
+            if n_bad:
+                # 首行报的是**要改的章数**（位置与章号对不上的那些），不是倒挂数：
+                # 两者差两个数量级，只报倒挂会让人以为「修 3 章就完事」。
+                lines.append(f"C 已公开段位置与章号不符：{n_bad} 章（位置 {lo}-{hi}）")
+                brk = rep.get("order_break") or {}
+                if brk.get("at"):
+                    view = self._reader_view_around(items, brk["at"], span=2)
+                    if view:
+                        lines.append("   读者目录现在看到：… " + " → ".join(view) + " …")
+                    # 断点只用来解释「顺序从哪儿开始乱的」。被隔断的那 N 章里，
+                    # 绝大多数位置本身是对的（实测：第481章在481）——把它们说成
+                    # 「顺序断裂的章」就是报假错（2026-10-31 用户反馈）。
+                    lines.append(f"   顺序断在位置 {brk['at']}：从那儿往后 "
+                                 f"{brk['affected']} 章的顺序被隔断"
+                                 f"（它们自己的位置大多是对的，重排会自动跳过）")
+                # 点名要改的是哪几章：位置 + 它现在装的是什么。只给个数字的话，
+                # 用户得自己回目录里一个个找。
+                _bad = "、".join(f"位置{r['index']} 装第{r['num']}章"
+                                 for r in misplaced[:5])
+                _more = f"…共{n_bad}章" if n_bad > 5 else ""
+                lines.append(f"   要改的就是这 {n_bad} 章：{_bad}{_more}")
+                lines.append(f"   修：点「{BTN_REMAP}」选『已公开段』，"
+                             f"再点「填入 {lo}-{hi}」")
+                cost = "要重写线上内容并重新过审，读者可能收到更新"
+                cost += ("；章数多会撞提交上限，分批跑" if n_bad >= 30 else "")
+                lines.append("   代价：" + cost)
+                # 以下两条只在可疑时才输出：正常错位不需要看这些
+                span_n = hi - lo + 1
+                if span_n != n_bad:
+                    lines.append(f"   注：区间里另有 {span_n - n_bad} 章本来就对，"
+                                 f"会自动跳过")
+                if movable:
+                    lines.append(f"   注：B 段那 {len(movable)} 章窗口一关"
+                                 f"就落进 C 段，本次改写也会覆盖它们")
+            else:
+                lines.append("C 已公开段：位置与章号都对得上")
         self._set_preview("\n".join(lines))
         _inv_n = len(rep.get("sched_inverted") or [])
         _cla_n = len(rep.get("sched_clash") or {})
@@ -5780,19 +5796,25 @@ class FanqieGUI:
                 "warning", "有章节还能救",
                 f"{len(movable)} 章已公开但位置与章号不符，还在 3 天移动窗口内。"
                 f"详见预览面板，尽快去手机 App 申请移动。")
-        elif pub_bad:
-            # 弹窗比面板短，只说工作量差两个数量级这件事 + 去哪儿点。细节留面板。
-            self._notify(
-                "info", "体检完成",
-                f"未公开段待重排 {len(pend_bad)} 个。\n"
-                f"已公开段有 {len(pub_bad)} 章位置与章号不符"
-                f"（位置 {min(pub_bad)}-{max(pub_bad)}），"
-                f"可以在「{BTN_REMAP}」里选『已公开段』改回来。\n"
-                f"详见预览面板。")
         else:
-            self._notify(
-                "info", "体检完成",
-                f"未公开段待重排 {len(pend_bad)} 个；已公开段没有还能救的错位章。")
+            # 位置维度：有多少说多少。原来的写法恒定把「未公开段待重排 0 个」
+            # 也报一遍，读着像一张填了零的表（2026-10-31 用户反馈）；全清时
+            # 更是「待重排 0 个；已公开段没有还能救的错位章」——「没有还能救的」
+            # 这句暗示本来有一批救不了的，读者会以为漏了消息。
+            _bits = []
+            if pend_bad:
+                _bits.append(f"未公开段有 {len(pend_bad)} 章位置与章号不符，"
+                             f"可以用「{BTN_REMAP}」改回来")
+            if pub_bad:
+                _bits.append(f"已公开段有 {len(pub_bad)} 章位置与章号不符"
+                             f"（位置 {min(pub_bad)}-{max(pub_bad)}），"
+                             f"可以在「{BTN_REMAP}」里选『已公开段』改回来")
+            if not _bits:
+                self._notify("info", "体检完成", AUDIT_CLEAN_LINE)
+            else:
+                # 弹窗比面板短，只说工作量 + 去哪儿点。细节留面板。
+                self._notify("info", "体检完成",
+                             "。\n".join(_bits) + "。\n详见预览面板。")
 
     # 章号压缩用 fanqie_upload 的共用实现（原来这里有一份逐字相同的拷贝）
     _compress_nums = staticmethod(compress_chapter_nums)

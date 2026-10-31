@@ -25,7 +25,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from fanqie_gui import FanqieGUI, BTN_AUDIT  # noqa: E402
+from fanqie_gui import FanqieGUI, BTN_AUDIT, AUDIT_CLEAN_LINE  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -177,12 +177,16 @@ class RenderSelf(Stub):
         self._last_audit = None
         self.preview = ""
         self.notices = []
+        self.notice_msgs = []
 
     def _set_preview(self, text):
         self.preview = text
 
     def _notify(self, level, title, msg=""):
         self.notices.append((level, title))
+        # 消息正文也留着：弹窗上的话本身是要验的（"没有错位"时不该再报
+        # 「待重排 0 个」这种填零的句子）
+        self.notice_msgs.append(msg)
 
 
 def _items(n=6, ds=1, reason=""):
@@ -299,8 +303,32 @@ FanqieGUI._render_audit(rs10, _overshoot_items(), None, "111")
 check("B10 C 段只数位置不对的那一章",
       "C 已公开段位置与章号不符：1 章" in rs10.preview, rs10.preview)
 check("B10 B 段不再叫用户去移动位置正确的章",
-      "B 已公开、位置与章号不符、发布 3 天内（App 里还能移动位置）：0 章"
-      in rs10.preview, rs10.preview)
+      "应该在位置" not in rs10.preview, rs10.preview)
+check("B10 空段不再报成「0 个 / 0 章」",
+      "0 个" not in rs10.preview and "0 章" not in rs10.preview, rs10.preview)
+
+print("[B11 全清时别报三段零值，只给一句结论]")
+# 2026-10-31 用户反馈：全清的报告读着像「一张填了零的表」
+# （A …：0 个 / B …：0 章 / C 已公开段：正常），弹窗还说
+# 「未公开段待重排 0 个；已公开段没有还能救的错位章」——「没有还能救的」
+# 暗示本来有一批救不了的，读者会以为漏了消息。
+rs11 = RenderSelf(BOOKS, selected=0)
+FanqieGUI._render_audit(rs11, _items(6), None, "111")
+check("B11 面板给的是一句结论",
+      AUDIT_CLEAN_LINE in rs11.preview, rs11.preview)
+check("B11 面板里没有「0 个」", "0 个" not in rs11.preview, rs11.preview)
+check("B11 面板里没有「0 章」", "0 章" not in rs11.preview, rs11.preview)
+check("B11 面板里没有「C 已公开段：正常」",
+      "已公开段：正常" not in rs11.preview, rs11.preview)
+check("B11 面板不列 A/B/C 三段",
+      "A 未公开段" not in rs11.preview
+      and "B 已公开" not in rs11.preview
+      and "C 已公开段" not in rs11.preview, rs11.preview)
+_msg = rs11.notice_msgs[-1] if rs11.notice_msgs else ""
+check("B11 弹窗也是一句结论", AUDIT_CLEAN_LINE in _msg, _msg)
+check("B11 弹窗不报「待重排 0 个」", "待重排 0 个" not in _msg, _msg)
+check("B11 弹窗不说「没有还能救的错位章」",
+      "还能救" not in _msg, _msg)
 check("B10 报告里没有「顺序断裂的是 N 章」那种清单",
       "顺序断裂的是" not in rs10.preview, rs10.preview)
 check("B10 顺序断点单独说明，并说清被隔断的章位置是对的",

@@ -3511,6 +3511,26 @@ def reader_view_around(items, pos, span=2):
     return out
 
 
+# 体检报告里「位置与章号这一维没查出问题」时的结论行。GUI 面板、GUI 弹窗、
+# 命令行体检三处共用这一份措辞——三处各写一遍的话，早晚会有一处没跟上。
+# 为什么值得单独提一句：报告原来恒定输出三段零值（「A …：0 个」「B …：0 章」
+# 「C 已公开段：正常」），像一张填了零的表，用户得自己判断「0 是不是好消息」
+# （2026-10-31 用户反馈）。空段不该占位置——没有错位就只说结论。
+AUDIT_CLEAN_LINE = "✓ 没查出问题：位置与章号全部对得上，不需要修。"
+
+
+def audit_position_counts(rep):
+    """位置与章号这一维，三段各有多少章错位。
+
+    返回 (未公开段 A, 已公开·3 天内 B, 已公开·超 3 天 C)。GUI 与 CLI 共用：
+    两边各数一遍的话，迟早会数出不一样的数（那就是「面板说 32 章、真改时
+    改了 33 章」）。
+    """
+    return (len(rep.get("pending_bad") or []),
+            len(rep.get("in_window") or []),
+            len(rep.get("misplaced_pub") or []))
+
+
 def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
     """缺口体检: 按「谁能修」把问题分三段。
 

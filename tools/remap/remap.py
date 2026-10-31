@@ -619,11 +619,17 @@ def print_plan(items, plan, skipped, num2path):
     print(f"平台 item 总数 {len(items)}  已公开 {len(pub)}"
           f"{f'（含 {n_pub_rw} 个要改写）' if n_pub_rw else '（动不了）'}  "
           f"未公开 {len(pend)}（可改）", flush=True)
-    if pend:
+    if pend and plan:
         ps = [x.get("pos", x["index"]) for x in pend]
         print(f"可改范围: 位置 {min(ps)}~{max(ps)}", flush=True)
-    print(f"需改写 {len(plan)} 个"
-          + (f"，跳过 {len(skipped)} 个" if skipped else ""), flush=True)
+    if plan:
+        print(f"需改写 {len(plan)} 个"
+              + (f"，跳过 {len(skipped)} 个" if skipped else ""), flush=True)
+    else:
+        # 空计划不报「需改写 0 个」——那像一张填了零的表，用户得自己判断
+        # 「0 是不是好消息」（2026-10-31 用户反馈）。跳过的章照旧要说。
+        print(f"没有需要改写的章{f"，跳过 {len(skipped)} 个" if skipped else ""}",
+              flush=True)
     if n_pub_rw:
         print(f"⚠ 其中 {n_pub_rw} 个是已发布章：内容会被改写、重新过审，"
               f"读者可能收到更新。--run 之前请把这份计划看仔细。", flush=True)
@@ -752,8 +758,17 @@ def print_audit(rep, plan, include_published=False):
         for _ln in _sched_lines:
             print(_ln, flush=True)
         print("", flush=True)
-    print(f"A 未公开段位置不符: {len(rep['pending_bad'])} 个 → 本工具 --run 自动改",
-          flush=True)
+    _pend, _mov, _mis = fu.audit_position_counts(rep)
+    if not (_pend or _mov or _mis):
+        # 全清：不列三段零值，只给结论（与 GUI 同一份措辞）。
+        # 原来这里恒定输出「A 未公开段位置不符: 0 个」，像一张填了零的表
+        # ——用户得自己判断「0 是不是好消息」（2026-10-31 用户反馈）。
+        print(fu.AUDIT_CLEAN_LINE, flush=True)
+        return
+    if _pend:
+        print(f"A 未公开段位置不符: {_pend} 个 → 本工具 --run 自动改", flush=True)
+    else:
+        print("A 未公开段：位置与章号都对得上", flush=True)
     first = next((e for e in plan if int(e.get("timer") or 0) > 0), None)
     if first:
         left_h = (int(first["timer"]) - time.time()) / 3600
@@ -764,20 +779,21 @@ def print_audit(rep, plan, include_published=False):
         if left_h < fu.MOVE_WINDOW_H:
             print("  ⚠ 余量已跌破移动窗口：今天必须补跑，否则错位章发出后"
                   "只能去 App 申请+逐章移动", flush=True)
-    if rep["in_window"]:
-        print(f"B 已公开、位置与章号不符、还能在 App 里申请移动: "
-              f"{len(rep['in_window'])} 章", flush=True)
+    if _mov:
+        print(f"B 已公开、位置与章号不符、还能在 App 里申请移动: {_mov} 章",
+              flush=True)
         for r in rep["in_window"]:
             print(f"  第{r['num']}章（现在位置 {r['index']}，应该在位置 "
                   f"{r['num']}）发布于 {fmt(r['pub_at'])}"
                   f"，窗口还剩 {r['left_h']:.1f} 小时", flush=True)
+    else:
+        print("B 已公开段：没有还能靠 App 移动的错位章", flush=True)
     # C 段报的是「位置与章号对不上」的那一批（= --include-published 的改写
     # 范围），不是「排在更大章号后面」的倒挂集合：后者只要一章冲到了前面，
     # 它后面每一章都算进去（实测 640 章），可其中绝大多数位置明明是对的，
     # 报出来等于报假错（2026-10-31 实测）。
-    mis = rep.get("misplaced_pub") or []
     brk = rep.get("order_break") or {}
-    if mis:
+    if _mis:
         # 只报一行：位置动不了（App 窗口已关），但内容能改写。改写计划和上面逐条
         # 列出的目标已经说清范围了，这里再展开一遍只会和 GUI 的体检报告打架。
         if include_published:
@@ -786,18 +802,18 @@ def print_audit(rep, plan, include_published=False):
             print(f"C 已公开段位置与章号不符：{len(plan)} 章（位置 {lo}-{hi}）"
                   f"，位置不可动、内容可改写", flush=True)
         else:
-            print(f"C 已公开段位置与章号不符：{len(mis)} 章 —— "
+            print(f"C 已公开段位置与章号不符：{len(_mis)} 章 —— "
                   + "、".join(f"第{r['num']}章(位置{r['index']})"
-                              for r in mis[:10])
-                  + (f"…共{len(mis)}章" if len(mis) > 10 else "")
+                              for r in _mis[:10])
+                  + (f"…共{len(_mis)}章" if len(_mis) > 10 else "")
                   + "（本工具默认不改已发布段；加 --include-published 才改写）",
                   flush=True)
+    else:
+        print("C 已公开段：位置与章号都对得上", flush=True)
     if brk.get("at"):
         print(f"  顺序断在位置 {brk['at']}：从那儿往后 {brk['affected']} 章的"
               f"顺序被隔断（它们自己的位置大多是对的，重排会自动跳过）",
               flush=True)
-    if not (rep["in_window"] or mis):
-        print("B/C 已公开段没有位置不对的章", flush=True)
 
 
 async def run_remap(page, book_id, steps, num2path, *,
