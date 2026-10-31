@@ -277,10 +277,8 @@ async def main_async(args):
                        None if args.all else args.days_ahead, per_day)
             if gaps:
                 # 中段缺口本工具不碰（发上去只会吊在书尾），提醒去用 remap
-                print(f"⚠ 平台中段还缺 {len(gaps)} 章（如 第"
-                      + "、第".join(str(n) for n in gaps[:5])
-                      + "章…）——这些不能靠发布补回原位，"
-                        "请用 tools/remap/remap.py 处理", flush=True)
+                print(fu.mid_gap_headline(gaps)
+                      + "，请用 tools/remap/remap.py 处理", flush=True)
             if fu.book_mismatch_abort(items, num2path):
                 return True
 
@@ -469,15 +467,12 @@ def main():
     ap.add_argument("--limit", type=int, help="本次最多排多少章（分批用）")
     ap.add_argument("--per-day", type=int, help="每天几章（默认取 config）")
     ap.add_argument("--time", type=str, help="发布时间点，逗号分隔（默认取 config）")
-    ap.add_argument("--run", action="store_true", help="真的写入（不加只预览）")
-    ap.add_argument("--book-id", type=str)
-    ap.add_argument("--content-dir", type=str)
-    ap.add_argument("--use-ai", action="store_true")
-    ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--show-browser", action="store_true")
-    ap.add_argument("--daily", action="store_true",
-                    help="无人值守日常跑：等于 --run --headless，写日志、需人工时弹窗")
-    ap.add_argument("--self-check", action="store_true", help="只跑自检，不联网")
+    ap.add_argument("--run", action="store_true", help=fu._H_RUN_WRITE)
+    fu.add_common_tool_args(ap)
+    ap.add_argument("--use-ai", action="store_true", help=fu._H_USE_AI)
+    ap.add_argument("--show-browser", action="store_true", help=fu._H_SHOW_BROWSER)
+    ap.add_argument("--daily", action="store_true", help=fu._H_DAILY)
+    ap.add_argument("--self-check", action="store_true", help=fu._H_SELF_CHECK)
     args = ap.parse_args()
     if args.self_check:
         demo()

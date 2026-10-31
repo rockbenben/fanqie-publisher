@@ -726,17 +726,14 @@ def _print_review_block(blk):
     """
     if not blk:
         return
-    to = f"（一直排到位置 {blk['blocked_to']}）" if blk.get("blocked_to") else ""
     print("\n" + "=" * 60, flush=True)
-    print(f"⚠ 审核卡住了：位置 {blk['index']} 这一章没过审核，"
-          f"后面 {blk['blocked']} 章全卡在审核中{to}", flush=True)
-    print(f"   被卡住的那章：位置 {blk['index']}「{blk['title'][:24]}」", flush=True)
+    print(fu.review_block_headline(blk), flush=True)
+    print(fu.review_block_where(blk), flush=True)
     # 「修改内容」是图形界面里的操作模式，命令行没有这个模式——纯终端用户
     # 照着这句话找不到入口。所以这里必须留一条不依赖界面的路：去平台改。
     print("   怎么办：去番茄后台把这一章改掉重新提交；或在图形界面里用"
           "「修改内容」模式重发它。改完重新送审，后面这批就跟着过。", flush=True)
-    print(f"   ⚠ 它不会自己过审：平台按位置顺序审，这一章不解决，后面这 "
-          f"{blk['blocked']} 章就一直卡着不发布。", flush=True)
+    print(fu.review_block_never_passes(blk), flush=True)
     print("=" * 60 + "\n", flush=True)
 
 
@@ -768,7 +765,7 @@ def print_audit(rep, plan, include_published=False):
     if _pend:
         print(f"A 未公开段位置不符: {_pend} 个 → 本工具 --run 自动改", flush=True)
     else:
-        print("A 未公开段：位置与章号都对得上", flush=True)
+        print(fu.AUDIT_SEG_CLEAN["A"], flush=True)
     first = next((e for e in plan if int(e.get("timer") or 0) > 0), None)
     if first:
         left_h = (int(first["timer"]) - time.time()) / 3600
@@ -787,7 +784,7 @@ def print_audit(rep, plan, include_published=False):
                   f"{r['num']}）发布于 {fmt(r['pub_at'])}"
                   f"，窗口还剩 {r['left_h']:.1f} 小时", flush=True)
     else:
-        print("B 已公开段：没有还能靠 App 移动的错位章", flush=True)
+        print(fu.AUDIT_SEG_CLEAN["B"], flush=True)
     # C 段报的是「位置与章号对不上」的那一批（= --include-published 的改写
     # 范围），不是「排在更大章号后面」的倒挂集合：后者只要一章冲到了前面，
     # 它后面每一章都算进去（实测 640 章），可其中绝大多数位置明明是对的，
@@ -809,11 +806,9 @@ def print_audit(rep, plan, include_published=False):
                   + "（本工具默认不改已发布段；加 --include-published 才改写）",
                   flush=True)
     else:
-        print("C 已公开段：位置与章号都对得上", flush=True)
+        print(fu.AUDIT_SEG_CLEAN["C"], flush=True)
     if brk.get("at"):
-        print(f"  顺序断在位置 {brk['at']}：从那儿往后 {brk['affected']} 章的"
-              f"顺序被隔断（它们自己的位置大多是对的，重排会自动跳过）",
-              flush=True)
+        print(f"  {fu.order_break_line(brk)}", flush=True)
 
 
 async def run_remap(page, book_id, steps, num2path, *,
@@ -1604,39 +1599,26 @@ def main():
     ap = argparse.ArgumentParser(
         description="章节重排（默认只动未公开的章；--include-published 连已发布段一起改）")
     g = ap.add_mutually_exclusive_group()
-    g.add_argument("--only", type=int, help="只改指定位置（全书位置，多卷已折算；灰度用）")
-    g.add_argument("--range", type=str, help="只改位置区间（全书位置），如 709-800")
-    ap.add_argument("--limit", type=int, help="本次最多改多少个")
+    g.add_argument("--only", type=int, help=fu._H_ONLY)
+    g.add_argument("--range", type=str, help=fu._H_RANGE)
+    ap.add_argument("--limit", type=int, help=fu._H_LIMIT_RW)
     ap.add_argument("--include-published", action="store_true",
-                    help="把已公开的章也纳入改写（用于修已发布段的顺序错位）。"
-                         "平台允许改已发布章，但内容会重新过审、读者可能收到"
-                         "更新 —— 务必先看 dry-run")
+                    help=fu._H_INCLUDE_PUBLISHED)
     bg = ap.add_mutually_exclusive_group()
     bg.add_argument("--buffer-chapter", metavar="N|auto",
-                    help="闭环用本地未发布章节的真实正文做缓冲；"
-                         "auto=取平台末尾之后的未发布章号")
-    bg.add_argument("--buffer-file", metavar="PATH",
-                    help="闭环用指定真实文本文件做缓冲（正文按平台口径≥1000字）")
-    ap.add_argument("--no-buffer", action="store_true",
-                    help="不自动解闭环：闭环整环跳过并报出来。"
-                         "默认会自动用本地未发布章节的真实正文解开闭环"
-                         "（换位期间那个位置的读者会短暂看到该章正文）")
-    ap.add_argument("--run", action="store_true", help="真的写入（不加只预览）")
+                    help=fu._H_BUFFER_CHAPTER)
+    bg.add_argument("--buffer-file", metavar="PATH", help=fu._H_BUFFER_FILE)
+    ap.add_argument("--no-buffer", action="store_true", help=fu._H_NO_BUFFER)
+    ap.add_argument("--run", action="store_true", help=fu._H_RUN_WRITE)
     ap.add_argument("--safety-minutes", type=int, default=SAFETY_MINUTES,
-                    help="跳过多少分钟内就要发布的章（默认 60）")
-    ap.add_argument("--book-id", type=str, help="覆盖 book_id")
-    ap.add_argument("--content-dir", type=str, help="覆盖本地章节目录")
-    ap.add_argument("--use-ai", action="store_true")
-    ap.add_argument("--headless", action="store_true",
-                    help="无头运行（覆盖 config.json 的 headless）")
-    ap.add_argument("--show-browser", action="store_true",
-                    help="显示浏览器窗口（覆盖 config.json 的 headless）")
-    ap.add_argument("--daily", action="store_true",
-                    help="无人值守日常跑：等于 --run --headless，"
-                         "输出写 tools/remap/logs/，需要人工处理时弹窗")
+                    help=fu._H_SAFETY_MINUTES)
+    fu.add_common_tool_args(ap)
+    ap.add_argument("--use-ai", action="store_true", help=fu._H_USE_AI)
+    ap.add_argument("--show-browser", action="store_true", help=fu._H_SHOW_BROWSER)
+    ap.add_argument("--daily", action="store_true", help=fu._H_DAILY)
     ap.add_argument("--audit", action="store_true",
                     help="只做缺口体检（A/B/C 三段 + 余量告警），不改任何东西")
-    ap.add_argument("--self-check", action="store_true", help="只跑自检，不联网")
+    ap.add_argument("--self-check", action="store_true", help=fu._H_SELF_CHECK)
     args = ap.parse_args()
     if args.self_check:
         demo()

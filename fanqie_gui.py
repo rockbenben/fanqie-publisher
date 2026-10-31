@@ -32,9 +32,13 @@ try:
         parse_datetime, TIMER_INPUT_FORMATS,
         fetch_chapter_items, audit_chapter_positions, MOVE_WINDOW_H,
         AUDIT_CLEAN_LINE, audit_position_counts,
+        review_block_headline, review_block_where, AUDIT_SEG_CLEAN,
+        schedule_order_warning, review_block_never_passes, order_break_line,
+        batch_summary_line,
         reader_view_around, review_status_lines, schedule_order_lines,
         queue_state, queue_summary, queue_tail_dt, queue_label_text, rows_to_items,
         schedule_order_conflicts, schedule_repair_plan, slot_timestamp,
+        SCHEDULE_ORDER_CLEAN_LINE,
         wait_book_list_ready, describe_book_page,
         RENAME_RETRIES, RENAME_BACKOFF_S,
         fetch_draft_list, compress_chapter_nums,
@@ -4307,10 +4311,7 @@ class FanqieGUI:
                 _inv = int((autocont_qs or {}).get("inverted") or 0)
                 _cla = int((autocont_qs or {}).get("clash") or 0)
                 if _inv or _cla:
-                    logger.warning(
-                        f"⚠ 平台未公开段排期有错：{_inv} 章排在比它前面那章更早的"
-                        f"时刻、{_cla} 个时刻被两章以上占用 —— 新章会排在队尾之后，"
-                        "但已有的错位要用「修改排期」把时刻挪回来")
+                    logger.warning(schedule_order_warning(_inv, _cla))
             else:
                 schedule = compute_schedule(
                     len(parsed), date_str, time_str, per_day)
@@ -4510,9 +4511,7 @@ class FanqieGUI:
                     # playwright stop（with 退出）可能同样阻塞，不能让它
                     # 挡住结果汇报（实测曾让 GUI"卡死"41 分钟）
                     logger.info(f"{'='*40}")
-                    skip_str = f"  跳过: {skipped}" if skipped else ""
-                    logger.info(
-                        f"  修改完成! 成功: {success}  失败: {failed}{skip_str}")
+                    logger.info(batch_summary_line(success, failed, skipped))
                     log_fail_list(fail_list)
                     logger.info(f"{'='*40}")
 
@@ -4782,9 +4781,7 @@ class FanqieGUI:
         plan, lines = schedule_repair_plan(
             items, pub_time=time_str, per_day=per_day)
         if not plan:
-            self._set_preview(
-                "排期顺序没问题：未公开段里没有「排在别人前面」的章，"
-                "也没有两个章占用同一时刻。")
+            self._set_preview(SCHEDULE_ORDER_CLEAN_LINE)
             self._notify("info", "没有要修的排期",
                          "未公开段的发布时刻与位置顺序一致，读者看到的目录顺序是对的。")
             return
@@ -5197,9 +5194,11 @@ class FanqieGUI:
             rb_published.grid(row=2, column=1, sticky="w", **pad)
             # 这两行本身就是"现在到底有什么问题"的答案，比任何解释性文案都准。
             # 两段都列出来，免得以为另一段没事其实有。
+            # 但空段写成一句话，不报「错位 0 个」——那像一张填了零的表，
+            # 用户得自己判断「0 是不是好消息」（2026-10-31 用户反馈）。
             def _line(lbl, pos):
-                return (f"{lbl}错位 {len(pos)} 个"
-                        + (f"（位置 {_fmt(pos)}）" if pos else "，没有可改的"))
+                return (f"{lbl}错位 {len(pos)} 个（位置 {_fmt(pos)}）" if pos
+                        else f"{lbl}没有错位")
             head.configure(
                 text=(f"上次检查缺口（{audit['at']:%m-%d %H:%M}）：\n"
                       f"   {_line('未公开段', pend_bad)}\n"
@@ -5662,17 +5661,13 @@ class FanqieGUI:
         if blk:
             # 放最前面，并加醒目分隔：这是唯一一条「工具修不了、不处理就一直卡着」
             # 的故障，混在 A/B/C 后面会被当成背景噪音。
-            to = (f"（一直排到位置 {blk['blocked_to']}）"
-                  if blk.get("blocked_to") else "")
             lines += ["!" * 60,
-                      f"⚠ 审核卡住了：位置 {blk['index']} 这一章没过审核，"
-                      f"后面 {blk['blocked']} 章全卡在审核中{to}",
-                      f"   被卡的那章：位置 {blk['index']}「{blk['title'][:24]}」",
+                      review_block_headline(blk),
+                      review_block_where(blk),
                       "   怎么办：用「修改内容」模式把这一章改掉重新提交"
                       "（工具里就能改），或去番茄后台改这一章；"
                       "改完重新送审，后面这批跟着过",
-                      f"   ⚠ 它不会自己过审：平台按位置顺序审，这一章不解决，"
-                      f"后面这 {blk['blocked']} 章就一直卡着不发布",
+                      review_block_never_passes(blk),
                       "!" * 60, ""]
         lines += ["缺口体检", "=" * 60]
         # 未公开段排期错位（倒挂 / 撞时刻）：位置体检看不出这个，而它正是
@@ -5724,7 +5719,7 @@ class FanqieGUI:
                     lines.append(f"   ⚠ 位置 {pend_lo} 只剩 {left_h / 24:.1f} 天就发出，"
                                  f"余量已不足 3 天 —— 今天就得补跑")
             else:
-                lines.append("A 未公开段：位置与章号都对得上")
+                lines.append(AUDIT_SEG_CLEAN["A"])
             lines.append("")
             # B 段只列**真要动**的章：位置不对、确实被挤到后面、且还在 3 天窗口内。
             # 原来这里用的是「章号 < 前面最大章号」的倒挂集合，于是把位置明明正确
@@ -5740,7 +5735,7 @@ class FanqieGUI:
                 lines.append("   修：手机 App 申请调整 → 通过后选中该章 → 移动位置"
                              "（只动这一章，不用重写内容）")
             else:
-                lines.append("B 已公开段：没有还能在 3 天内靠 App 移动的错位章")
+                lines.append(AUDIT_SEG_CLEAN["B"])
             lines.append("")
             lo, hi = (min(pub_bad), max(pub_bad)) if n_bad else (0, 0)
             if n_bad:
@@ -5755,9 +5750,7 @@ class FanqieGUI:
                     # 断点只用来解释「顺序从哪儿开始乱的」。被隔断的那 N 章里，
                     # 绝大多数位置本身是对的（实测：第481章在481）——把它们说成
                     # 「顺序断裂的章」就是报假错（2026-10-31 用户反馈）。
-                    lines.append(f"   顺序断在位置 {brk['at']}：从那儿往后 "
-                                 f"{brk['affected']} 章的顺序被隔断"
-                                 f"（它们自己的位置大多是对的，重排会自动跳过）")
+                    lines.append(f"   {order_break_line(brk)}")
                 # 点名要改的是哪几章：位置 + 它现在装的是什么。只给个数字的话，
                 # 用户得自己回目录里一个个找。
                 _bad = "、".join(f"位置{r['index']} 装第{r['num']}章"
@@ -5778,7 +5771,7 @@ class FanqieGUI:
                     lines.append(f"   注：B 段那 {len(movable)} 章窗口一关"
                                  f"就落进 C 段，本次改写也会覆盖它们")
             else:
-                lines.append("C 已公开段：位置与章号都对得上")
+                lines.append(AUDIT_SEG_CLEAN["C"])
         self._set_preview("\n".join(lines))
         _inv_n = len(rep.get("sched_inverted") or [])
         _cla_n = len(rep.get("sched_clash") or {})

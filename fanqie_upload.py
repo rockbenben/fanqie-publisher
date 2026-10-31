@@ -3104,6 +3104,13 @@ def schedule_order_conflicts(items=(), *, changes=None, new_slots=None,
     return out
 
 
+# 「一键修复排期」没活可干时的那句话。GUI 面板与命令行 --fix-schedule 共用
+# 这一份——同一句话在两个文件里各写一遍的话，改了措辞只记得改一边，
+# 两个入口就开始说两套话（这仓库一贯的做法：同一份措辞只写一份）。
+SCHEDULE_ORDER_CLEAN_LINE = ("排期顺序没问题：未公开段里没有「排在别人前面」的章，"
+                             "也没有两个章占用同一时刻。")
+
+
 def schedule_repair_plan(items, *, pub_time, per_day, now=None):
     """「一键修复排期」：把排到别人前面的那几章挪到队列末尾之后。
 
@@ -3393,9 +3400,7 @@ async def fetch_chapter_items(page, book_id):
         _blk = find_review_block(items)
         if _blk:
             logger.warning(
-                f"⚠ 审核卡住了：位置 {_blk['index']} 这一章没过审核，后面 "
-                f"{_blk['blocked']} 章全卡在审核中"
-                + (f"（一直排到位置 {_blk['blocked_to']}）" if _blk.get("blocked_to") else "")
+                review_block_headline(_blk)
                 + f"。被卡的是「{_blk['title'][:24]}」——平台按位置顺序审，"
                   f"它不会自己过审，得先改这一章重新提交。")
         return items, ch_url, vols
@@ -3448,6 +3453,77 @@ def find_review_block(items):
         # 是「没有卡队列」）。
         logger.warning(f"审核卡队列检测失败（本次当成没有）: {_e}")
         return None
+
+
+def review_block_headline(blk):
+    """「审核卡住了」那句的头一行 —— GUI 面板、命令行日志、remap 输出共用。
+
+    这是整个工具里最要紧的一条警报（不处理就一直卡着）。三处各写一遍的话，
+    改了措辞只记得改一边，两个入口就会开始报不同的章数/后果 —— 而这条
+    恰恰是「748 章那次漏 151 章」那一类静默故障的告警。
+    """
+    to = (f"（一直排到位置 {blk['blocked_to']}）"
+          if blk.get("blocked_to") else "")
+    return (f"⚠ 审核卡住了：位置 {blk['index']} 这一章没过审核，"
+            f"后面 {blk['blocked']} 章全卡在审核中{to}")
+
+
+def review_block_where(blk):
+    """被卡住的是哪一章（位置 + 标题）——同上，共用一份。"""
+    return f"   被卡的那章：位置 {blk['index']}「{blk['title'][:24]}」"
+
+
+def review_block_never_passes(blk):
+    """「它不会自己过审」那句 —— GUI 面板与 remap 输出共用。
+
+    卡队列警报里最要紧的一句（放一放不会自己好）。两边各写一遍的话，改了
+    只记得改一边，两个入口就会一个说「不会自己过审」另一个不说。
+    """
+    return (f"   ⚠ 它不会自己过审：平台按位置顺序审，这一章不解决，"
+            f"后面这 {blk['blocked']} 章就一直卡着不发布")
+
+
+def order_break_line(brk):
+    """「顺序断在位置 N…」那句（不含缩进，各入口自己加）—— GUI 与 remap 共用。"""
+    return (f"顺序断在位置 {brk['at']}：从那儿往后 "
+            f"{brk['affected']} 章的顺序被隔断"
+            f"（它们自己的位置大多是对的，重排会自动跳过）")
+
+
+def batch_summary_line(success, failed, skipped=None):
+    """「修改完成! 成功: N 失败: M」这行 —— GUI 与命令行共用同一份。
+
+    这是改写内容批末的账，是用户判断「这批到底成没成」的唯一一行。图形界面
+    （_on_upload_edit）和命令行（cmd_edit）做的是同一件事，各写一遍的话，
+    改了只记得改一边，两个入口就会给出不一样的账。
+    """
+    skip_str = f"  跳过: {skipped}" if skipped else ""
+    return f"  修改完成! 成功: {success}  失败: {failed}{skip_str}"
+
+
+def schedule_order_warning(inverted, clash):
+    """「平台未公开段排期有错」那条告警 —— GUI 与命令行共用同一份。
+
+    「修改排期」是这套工具对这件事的统称（界面里的「修改排期」模式、
+    命令行的 reschedule --fix-schedule、README 里的同名小节），所以这句
+    两个入口都能用，不必各写一份。
+    """
+    return (f"⚠ 平台未公开段排期有错：{inverted} 章排在比它前面那章更早的时刻、"
+            f"{clash} 个时刻被两章以上占用 —— 新章会排在队尾之后，"
+            "但已有的错位要自己用「修改排期」改回来")
+
+
+def mid_gap_headline(gaps):
+    """「平台中段还缺 N 章」的头一段 —— 共用一份。
+
+    中段缺口是「发上去也补不回原位」那一类，最要紧的就是缺了几章、是哪
+    几章：几个入口各写一遍的话，改了只记得改一边就会报出不同的章数。
+    「怎么修」各入口不同（命令行说 remap 子命令，工具里说脚本路径），
+    由调用方自己接在这句后面。
+    """
+    return (f"⚠ 平台中段还缺 {len(gaps)} 章（如 第"
+            + "、第".join(str(n) for n in gaps[:5])
+            + "章…）——这些不能靠发布补回原位")
 
 
 def _find_review_block(items):
@@ -3517,6 +3593,14 @@ def reader_view_around(items, pos, span=2):
 # 「C 已公开段：正常」），像一张填了零的表，用户得自己判断「0 是不是好消息」
 # （2026-10-31 用户反馈）。空段不该占位置——没有错位就只说结论。
 AUDIT_CLEAN_LINE = "✓ 没查出问题：位置与章号全部对得上，不需要修。"
+
+# 体检报告里「这一段没有错位」的三句。GUI 面板与命令行共用同一份——
+# 同一句话在两个入口各写一遍的话，改了只记得改一边，两个入口就开始说不同的话。
+AUDIT_SEG_CLEAN = {
+    "A": "A 未公开段：位置与章号都对得上",
+    "B": "B 已公开段：没有还能在 3 天内靠 App 移动的错位章",
+    "C": "C 已公开段：位置与章号都对得上",
+}
 
 
 def audit_position_counts(rep):
@@ -5992,8 +6076,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
 
         logger.info("")
         logger.info("=" * 40)
-        skip_str = f"  跳过: {skipped}" if skipped else ""
-        logger.info(f"  修改完成! 成功: {success}  失败: {failed}{skip_str}")
+        logger.info(batch_summary_line(success, failed, skipped))
         log_fail_list(fail_list)
         logger.info("=" * 40)
 
@@ -6036,18 +6119,13 @@ async def _auto_continue_plan(book_id, parsed, files, per_day, pub_time,
             else f"只排到 {days_ahead} 天后")
     tail_dt = queue_tail_dt(items)
     if gaps:
-        logger.warning(
-            f"⚠ 平台中段还缺 {len(gaps)} 章（如 第"
-            + "、第".join(str(n) for n in gaps[:5])
-            + "章…）——这些不能靠发布补回原位，请用 remap 子命令处理")
+        logger.warning(mid_gap_headline(gaps) + "，请用 remap 子命令处理")
     # 排期本身有错（位置在后面却排在更早的时刻 / 两章占同一时刻）时必须说：
     # 续排只能保证**新章**排在队尾之后，已经排错的那几章它救不了。
     _qs = queue_state(items)
     if _qs["inverted"] or _qs["clash"]:
-        logger.warning(
-            f"⚠ 平台未公开段排期有错：{len(_qs['inverted'])} 章排在比它前面那章"
-            f"更早的时刻、{len(_qs['clash'])} 个时刻被两章以上占用"
-            "——新章会排在队尾之后，但已有的错位要自己用「修改排期」改回来")
+        logger.warning(schedule_order_warning(
+            len(_qs["inverted"]), len(_qs["clash"])))
     keep = set(nums)
     kept = [(p_, f_) for p_, f_ in zip(parsed, files)
             if p_[0] is not None and str(p_[0]).isdigit() and int(p_[0]) in keep]
@@ -6183,8 +6261,7 @@ async def cmd_reschedule_cli(args):
                 plan, lines = schedule_repair_plan(
                     _items, pub_time=args.time, per_day=per_day)
                 if not plan:
-                    logger.info("排期顺序没问题：未公开段里没有「排在别人前面」的章，"
-                                "也没有两个章占用同一时刻。")
+                    logger.info(SCHEDULE_ORDER_CLEAN_LINE)
                     return
                 for _ln in lines:
                     logger.info(_ln)
@@ -6244,6 +6321,46 @@ _H_BOOK_ID = "目标作品 ID（默认取上次 GUI 选的）"
 _H_CONTENT_DIR = "本地章节目录（默认取 config.json 的 chapters_dir）"
 _H_HEADLESS = "无头模式（不显示浏览器窗口）"
 _H_SHOW_BROWSER = "强制显示浏览器窗口（覆盖 config.json 的 headless）"
+# 下面这批是**主 CLI 与独立工具**共用的同一批选项。工具自己的 argparse 里
+# 也写了一份同样的说明，两边漂过不止一次（--daily 一边说「写日志」、一边说
+# 「输出写 tools/remap/logs/」；--book-id 一边说「目标作品 ID」、一边说
+# 「覆盖 book_id」）。用户对照 `fanqie_upload.py remap -h` 和
+# `tools/remap/remap.py -h` 会看到两套说法 —— 现在只留一份。
+_H_RUN_WRITE = "真的写入（不加只预览）"
+_H_RUN_DELETE = "真的删除（不加只预览）"
+_H_LIMIT_RW = "本次最多改多少个"
+_H_LIMIT_DEL = "本次最多删多少条"
+_H_FORCE = "安全检查不通过也照删（会丢内容，慎用）"
+_H_SAFETY_MINUTES = "跳过多少分钟内就要发布的章（默认 60）"
+_H_NO_BUFFER = ("不自动解闭环：闭环整环跳过并报出来。"
+                "默认会自动用本地未发布章节的真实正文解开闭环"
+                "（换位期间那个位置的读者会短暂看到该章正文）")
+_H_BUFFER_FILE = "闭环用指定真实文本文件做缓冲（正文按平台口径≥1000字）"
+_H_DAILY = "无人值守日常跑：等于 --run --headless，写日志、需人工时弹窗"
+_H_SELF_CHECK = "只跑自检，不联网"
+_H_USE_AI = "改写内容时申报「使用 AI 创作」"
+# remap 自己的选项：主 CLI 与工具都暴露，也都在两处各写了一遍（措辞已经漂过：
+# --only 一边说「只改指定位置（全书位置）」一边说「…多卷已折算；灰度用」）。
+_H_ONLY = "只改指定位置（全书位置，多卷已折算；灰度用）"
+_H_RANGE = "只改位置区间（全书位置），如 709-800"
+_H_INCLUDE_PUBLISHED = ("把已公开的章也纳入改写（用于修已发布段的顺序错位）。"
+                        "平台允许改已发布章，但内容会重新过审、读者可能收到"
+                        "更新 —— 务必先看 dry-run")
+_H_BUFFER_CHAPTER = ("闭环用本地未发布章节的真实正文做缓冲；"
+                     "auto=取平台末尾之后的未发布章号")
+
+
+def add_common_tool_args(ap):
+    """给工具的 argparse 加上三个工具都有的选项。
+
+    为什么抽出来：remap 与 keep_ahead 的 argparse 里有 6 行一模一样的
+    （选项名 + 共享文案常量）。逐字重复会撞上 test_no_duplicate_logic 的
+    「复制粘贴不得超过 2 组」，而且多写一遍就多漂一遍 —— 三个工具的 -h
+    说明要是对不上，用户对照着看就懵了。
+    """
+    ap.add_argument("--book-id", type=str, help=_H_BOOK_ID)
+    ap.add_argument("--content-dir", type=str, help=_H_CONTENT_DIR)
+    ap.add_argument("--headless", action="store_true", help=_H_HEADLESS)
 
 
 def main():
@@ -6342,32 +6459,23 @@ def main():
                              "（--include-published 可连已发布段一起修）")
     rm.add_argument("--book-id", help=_H_BOOK_ID)
     rm.add_argument("--content-dir", help=_H_CONTENT_DIR)
-    rm.add_argument("--run", action="store_true", help="真的写入（不加只预览）")
-    rm.add_argument("--only", type=int, help="只改指定位置（全书位置）")
-    rm.add_argument("--range", help="只改位置区间，如 709-800")
-    rm.add_argument("--limit", type=int, help="本次最多改多少个")
+    rm.add_argument("--run", action="store_true", help=_H_RUN_WRITE)
+    rm.add_argument("--only", type=int, help=_H_ONLY)
+    rm.add_argument("--range", help=_H_RANGE)
+    rm.add_argument("--limit", type=int, help=_H_LIMIT_RW)
     rm.add_argument("--include-published", action="store_true",
-                    help="把已公开的章也纳入改写（修已发布段的顺序错位）。"
-                         "平台允许改已发布章，但内容会重新过审、读者可能收到"
-                         "更新 —— 务必先看 dry-run")
+                    help=_H_INCLUDE_PUBLISHED)
     rmg = rm.add_mutually_exclusive_group()
     rmg.add_argument("--buffer-chapter", metavar="N|auto",
-                     help="闭环用本地未发布章节的真实正文做缓冲；"
-                          "auto=取平台末尾之后的最小未发布章号")
-    rmg.add_argument("--buffer-file", metavar="PATH",
-                     help="闭环用指定真实文本文件做缓冲（正文按平台口径≥1000字）")
-    rm.add_argument("--no-buffer", action="store_true",
-                    help="不自动解闭环：闭环整环跳过并报出来。"
-                         "默认会自动用本地未发布章节的真实正文解开闭环"
-                         "（换位期间那个位置的读者会短暂看到该章正文）")
+                     help=_H_BUFFER_CHAPTER)
+    rmg.add_argument("--buffer-file", metavar="PATH", help=_H_BUFFER_FILE)
+    rm.add_argument("--no-buffer", action="store_true", help=_H_NO_BUFFER)
     rm.add_argument("--safety-minutes", type=int, default=60,
-                    help="跳过多少分钟内就要发布的章（默认 60）")
-    rm.add_argument("--daily", action="store_true",
-                    help="无人值守日常跑：等于 --run --headless，写日志、需人工时弹窗")
+                    help=_H_SAFETY_MINUTES)
+    rm.add_argument("--daily", action="store_true", help=_H_DAILY)
     rm.add_argument("--headless", action="store_true", help=_H_HEADLESS)
     rm.add_argument("--show-browser", action="store_true", help=_H_SHOW_BROWSER)
-    rm.add_argument("--use-ai", action="store_true",
-                    help="改写内容时申报「使用 AI 创作」")
+    rm.add_argument("--use-ai", action="store_true", help=_H_USE_AI)
 
     # audit: 缺口体检（remap 的只读模式，单独给个名字更好找）
     ad = sub.add_parser("audit", help="缺口体检：按「谁能修」分段报告，只读")
@@ -6383,10 +6491,9 @@ def main():
     cd = sub.add_parser("clean-drafts", help="清空草稿箱（带本地源文件安全检查）")
     cd.add_argument("--book-id", help=_H_BOOK_ID)
     cd.add_argument("--content-dir", help=_H_CONTENT_DIR + "，用于安全检查")
-    cd.add_argument("--run", action="store_true", help="真的删除（不加只预览）")
-    cd.add_argument("--limit", type=int, help="本次最多删多少条")
-    cd.add_argument("--force", action="store_true",
-                    help="安全检查不通过也照删（会丢内容，慎用）")
+    cd.add_argument("--run", action="store_true", help=_H_RUN_DELETE)
+    cd.add_argument("--limit", type=int, help=_H_LIMIT_DEL)
+    cd.add_argument("--force", action="store_true", help=_H_FORCE)
     cd.add_argument("--headless", action="store_true", help=_H_HEADLESS)
     cd.add_argument("--show-browser", action="store_true", help=_H_SHOW_BROWSER)
 

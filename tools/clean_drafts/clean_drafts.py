@@ -216,14 +216,13 @@ def demo():
 
 def main():
     ap = argparse.ArgumentParser(description="清空草稿箱")
-    ap.add_argument("--run", action="store_true", help="真的删除（不加只预览）")
-    ap.add_argument("--limit", type=int, help="本次最多删多少条")
-    ap.add_argument("--force", action="store_true",
-                    help="安全检查不通过也照删（会丢内容，慎用）")
-    ap.add_argument("--book-id", type=str)
-    ap.add_argument("--content-dir", type=str)
-    ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--self-check", action="store_true")
+    ap.add_argument("--run", action="store_true", help=fu._H_RUN_DELETE)
+    ap.add_argument("--limit", type=int, help=fu._H_LIMIT_DEL)
+    ap.add_argument("--force", action="store_true", help=fu._H_FORCE)
+    ap.add_argument("--book-id", type=str, help=fu._H_BOOK_ID)
+    ap.add_argument("--content-dir", type=str, help=fu._H_CONTENT_DIR)
+    ap.add_argument("--headless", action="store_true", help=fu._H_HEADLESS)
+    ap.add_argument("--self-check", action="store_true", help=fu._H_SELF_CHECK)
     args = ap.parse_args()
     if args.self_check:
         demo()
