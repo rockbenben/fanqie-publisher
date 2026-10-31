@@ -39,3 +39,6 @@ Thumbs.db
 .claude
 .workbuddy*
 .omo/
+.qoder*
+.probe/
+.gstack/
