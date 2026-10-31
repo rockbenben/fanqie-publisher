@@ -25,7 +25,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from fanqie_gui import FanqieGUI  # noqa: E402
+from fanqie_gui import FanqieGUI, BTN_AUDIT  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -109,7 +109,7 @@ print("[B1 查出卡队列 → 挂上徽标]")
 # 徽标是「这本书的这一章卡住了」，所以要先选中那本书才该显示
 s = Stub(BOOKS, selected=0)
 FanqieGUI._note_review_block(s, BLK, "111")
-check("B1 按钮带 ⚠", badge_text(s) == "检查缺口 ⚠", badge_text(s))
+check("B1 按钮带 ⚠", badge_text(s) == f"{BTN_AUDIT} ⚠", badge_text(s))
 check("B1 徽标内容在", FanqieGUI._audit_badge(s) is not None)
 check("B1 写盘了", s.saved == 1, str(s.saved))
 
@@ -117,12 +117,12 @@ print("[B1b 没选作品时不挂徽标]")
 s_nb = Stub(BOOKS, selected=-1)          # 没选中任何作品
 FanqieGUI._note_review_block(s_nb, BLK, "111")
 check("B1b 没选作品 → 不显示 ⚠（点了也只会说「未选择作品」）",
-      badge_text(s_nb) == "检查缺口", badge_text(s_nb))
+      badge_text(s_nb) == BTN_AUDIT, badge_text(s_nb))
 check("B1b 没选作品 → 徽标取不到", FanqieGUI._audit_badge(s_nb) is None)
 
 print("[B2 再查没有卡队列 → 徽标要撤掉]")
 FanqieGUI._note_review_block(s, None, "111")
-check("B2 按钮回到「检查缺口」", badge_text(s) == "检查缺口", badge_text(s))
+check("B2 按钮回到「检查缺口」", badge_text(s) == BTN_AUDIT, badge_text(s))
 check("B2 徽标没了", FanqieGUI._audit_badge(s) is None)
 check("B2 状态文件里也清了", "review_block" not in s._gui_state,
       str(s._gui_state))
@@ -131,20 +131,20 @@ check("B2 撤徽标也写盘了", s.saved == 2, str(s.saved))
 print("[B3 换书 → 不继承上一本的徽标]")
 s = Stub(BOOKS, selected=0)
 FanqieGUI._note_review_block(s, BLK, "111")
-check("B3 本书时挂上", badge_text(s) == "检查缺口 ⚠", badge_text(s))
+check("B3 本书时挂上", badge_text(s) == f"{BTN_AUDIT} ⚠", badge_text(s))
 s.cmb_book.current(1)                      # 切到另一本书
 FanqieGUI._refresh_audit_badge(s)
-check("B3 换书后徽标撤掉", badge_text(s) == "检查缺口", badge_text(s))
+check("B3 换书后徽标撤掉", badge_text(s) == BTN_AUDIT, badge_text(s))
 check("B3 换书后徽标取不到", FanqieGUI._audit_badge(s) is None)
 s.cmb_book.current(0)                      # 切回来
 FanqieGUI._refresh_audit_badge(s)
-check("B3 切回来徽标还在", badge_text(s) == "检查缺口 ⚠", badge_text(s))
+check("B3 切回来徽标还在", badge_text(s) == f"{BTN_AUDIT} ⚠", badge_text(s))
 
 print("[B4 老数据（没有 book_id）照旧显示]")
 s = Stub(BOOKS, selected=1)
 s._gui_state["review_block"] = dict(BLK, at="2026-10-29T20:57:00")
 FanqieGUI._refresh_audit_badge(s)
-check("B4 判不出属于哪本 → 先当真话说", badge_text(s) == "检查缺口 ⚠",
+check("B4 判不出属于哪本 → 先当真话说", badge_text(s) == f"{BTN_AUDIT} ⚠",
       badge_text(s))
 
 print("[B5 悬停提示说清是哪本书]")
@@ -257,7 +257,7 @@ s8 = Stub(BOOKS, selected=0)
 s8._gui_state["review_block"] = "oops"
 try:
     FanqieGUI._refresh_audit_badge(s8)
-    check("B8 坏数据 → 不崩，徽标当没有", badge_text(s8) == "检查缺口",
+    check("B8 坏数据 → 不崩，徽标当没有", badge_text(s8) == BTN_AUDIT,
           badge_text(s8))
 except Exception as e:
     check("B8 坏数据 → 不崩，徽标当没有", False, f"{type(e).__name__}: {e}")
@@ -269,11 +269,11 @@ print("[B9 老格式的那一条要能被清掉]")
 s9 = Stub(BOOKS, selected=0)
 s9._gui_state["review_block"] = dict(BLK, at="2026-10-29T20:57:00")
 FanqieGUI._refresh_audit_badge(s9)
-check("B9 老数据先照旧显示", badge_text(s9) == "检查缺口 ⚠", badge_text(s9))
+check("B9 老数据先照旧显示", badge_text(s9) == f"{BTN_AUDIT} ⚠", badge_text(s9))
 FanqieGUI._note_review_block(s9, None, "111")
 check("B9 体检一次之后，老数据被清掉",
       "review_block" not in s9._gui_state, str(s9._gui_state))
-check("B9 清掉之后徽标不再显示", badge_text(s9) == "检查缺口", badge_text(s9))
+check("B9 清掉之后徽标不再显示", badge_text(s9) == BTN_AUDIT, badge_text(s9))
 
 print("[B10 报告不许把位置正确的章报成错]")
 # 2026-10-31 实测（用户反馈「位置很多明明是正确的，你为什么报错？」）：

@@ -42,6 +42,12 @@ SHARED = [
     "parse_datetime", "parse_time_spec",
     # 位置换算
     "global_position", "audit_chapter_positions",
+    # 发布队列状态（队尾/末章/倒挂）—— GUI 与命令行必须算出同一个队尾
+    "queue_state", "queue_summary", "queue_tail_dt", "queue_tail_date",
+    "rows_to_items", "schedule_order_lines", "item_position",
+    # 排期顺序判据与修复方案（GUI 与命令行必须同一份）
+    "schedule_order_conflicts", "schedule_repair_plan", "slot_timestamp",
+    "chapter_publish_ts",
     # 各入口的开场
     "tool_startup", "book_mismatch_abort",
     "require_login_cli", "load_local_chapters",
@@ -111,9 +117,10 @@ check("模块级别名为 0" + ("" if not aliases else f" -> {aliases}"), not al
 print()
 print("== 函数以下粒度的复制粘贴不得增加 ==")
 # 连续 6 行（去空行去注释后）完全相同即算一处。批次循环已抽成执行器
-# （run_creation_batch / run_edit_batch），剩下 2 组是可接受的惯用样板：
-# 单章原语的重试骨架（抽出反而多一层跳转）与 GUI 两个 task 的开场样板
-# （薄壳本来就该长得像）。卡在 2，再长出复制粘贴立即变红。
+# （run_creation_batch / run_edit_batch），剩下 1 组是可接受的惯用样板：
+# 单章原语的重试骨架（抽出反而多一层跳转）与 GUI 的「开浏览器干一件事」
+# 任务外壳（修改内容 / 修改排期 / 抓平台状态 —— 薄壳本来就该长得像）。
+# 卡在 2，再长出复制粘贴立即变红。
 CAP = 2
 W = 6
 wins = defaultdict(set)

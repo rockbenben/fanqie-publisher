@@ -56,7 +56,7 @@ def item(**kw):
 
 def main():
     # ---- 1. 两种状态各取各的时间戳 ----
-    rows, lp = fu.api_items_to_rows([
+    rows = fu.api_items_to_rows([
         item(item_id="A", title="第9章 待", display_status=fu.DISPLAY_PENDING,
              timer_time=str(ts("2026-12-01 20:01")),
              create_time=str(ts("2026-08-27 20:59"))),
@@ -79,14 +79,27 @@ def main():
           f"/main/writer/{BOOK}/publish/A/?enter_from=modifychapter",
           rows[0]["editUrl"])
     check("rowIndex 保持返回顺序", [r["rowIndex"] for r in rows] == [0, 1])
-    check("lastPublish 取最大时刻",
-          lp == {"date": "2026-12-01", "time": "20:01", "chapter": "第9章 待"}, f"{lp}")
+    # 2026-10-31：行里带平台真状态（算队尾要靠它们），位置取接口的 index
+    check("行里带 display_status", rows[0]["display_status"] == fu.DISPLAY_PENDING)
+    check("行里带 timer_time", rows[0]["timer_time"] == ts("2026-12-01 20:01"))
+    check("行里带位置（接口的 index）", rows[0]["pos"] == 1, str(rows[0].get("pos")))
+    # 审核中的章同样占着未来的坑位，排期时刻不能被降级成创建时间
+    # （2026-10-10 实测：降级会让队尾算短，新章排进已占用的时刻）
+    _rev = fu.api_items_to_rows([
+        item(item_id="C", title="第3章 在审", display_status=fu.DISPLAY_REVIEWING,
+             timer_time=str(ts("2026-12-05 08:00")),
+             create_time=str(ts("2026-08-27 20:59")),
+             cant_modify_reason="审核中暂不支持修改"),
+    ], BOOK)
+    check("审核中的章保留排期时刻",
+          (_rev[0]["date"], _rev[0]["time"]) == ("2026-12-05", "08:00"),
+          f"{_rev[0]['date']} {_rev[0]['time']}")
 
     # ---- 2. 平台说不让改的章，必须和 DOM 一样拿不到编辑链接 ----
     # 2026-08-28 在完结作品上实测: 平台根本不渲染「编辑」按钮，DOM 的 editUrl
     # 是 None，修改模式据此安全跳过。接口侧凭 item_id 硬拼一个链接，就会变成
     # "导航过去改一章平台明说不让改的章"。
-    rows, _ = fu.api_items_to_rows([
+    rows = fu.api_items_to_rows([
         item(title="第1章 完结", display_status=fu.DISPLAY_PUBLISHED,
              cant_modify_reason="完结作品不可修改"),
         item(title="第2章 未知", display_status=99, cant_modify_reason="审核中"),
@@ -120,7 +133,7 @@ def main():
               "/?enter_from=modifychapter"), rows[3]["editUrl"])
 
     # ---- 3. 缺字段不崩、不给假数据 ----
-    rows, lp = fu.api_items_to_rows([
+    rows = fu.api_items_to_rows([
         item(title="楔子", timer_time=None, create_time=None),
         item(item_id=None, title="第5章 无id"),
         item(title="2024新春番外", timer_time="not-a-number"),
@@ -135,10 +148,9 @@ def main():
           rows[0]["chapterNum"] is None, rows[0]["chapterNum"])
     check("数字开头番外不被误编号 2024（与 DOM 侧前视守卫一致）",
           rows[2]["chapterNum"] is None, rows[2]["chapterNum"])
-    check("全表无时间时 lastPublish 为 None", lp is None, f"{lp}")
 
     # ---- 4. 章节号解析与平台标题一致 ----
-    rows, _ = fu.api_items_to_rows(
+    rows = fu.api_items_to_rows(
         [item(title=t) for t in ("第12章 甲", "300:遇见", "1 开端")], BOOK)
     check("章节号解析: 第N章 / 裸数字+分隔 / 裸数字+空格",
           [r["chapterNum"] for r in rows] == [12, 300, 1],
@@ -163,8 +175,7 @@ def main():
             fu._extract_via_api(page, BOOK))
 
     check("首行对得上 -> 用接口结果",
-          (run(FakePage("u?page_index=0", ITEMS, "第1326章 货到那刻")) or (None,))[0]
-          and len(run(FakePage("u?page_index=0", ITEMS, "第1326章 货到那刻"))[0]) == 1)
+          len(run(FakePage("u?page_index=0", ITEMS, "第1326章 货到那刻")) or []) == 1)
     check("首行是别的卷 -> 退回 DOM（返回 None）",
           run(FakePage("u?page_index=0", ITEMS, "第7章 另一卷")) is None)
     check("页面首行带「编辑」等尾巴仍算对得上",
@@ -174,7 +185,7 @@ def main():
     check("接口报错 -> 退回 DOM，绝不返回半份",
           run(FakePage("u?page_index=0", {"error": "第3页 HTTP 500"}, "x")) is None)
     check("空书: 没有行就不做首行校验，正常返回空",
-          run(FakePage("u?page_index=0", {"items": []}, "")) == ([], None))
+          run(FakePage("u?page_index=0", {"items": []}, "")) == [])
 
     class BoomPage(FakePage):
         async def evaluate(self, js, arg=None):
@@ -190,7 +201,7 @@ def main():
         item(item_id="C", title="第9章 完结", display_status=98,
              cant_modify_reason="完结作品不可修改"),
         item(item_id="D", title="第5章 未知", display_status=42),     # reason 空
-    ], BOOK)[0]
+    ], BOOK)
     _by = {r["chapterNum"]: r for r in _ed}
     check("审核不通过(reason空) -> 有编辑链接", bool(_by[7]["editUrl"]), _by[7])
     check("审核不通过 -> 显示「审核不通过」",
@@ -208,7 +219,7 @@ def main():
     # 收到更新）。放开那条路的只有审核不通过（7）。
     _ed4 = fu.api_items_to_rows([
         item(item_id="E", title="第4章 在审", display_status=4),
-    ], BOOK)[0]
+    ], BOOK)
     check("审核中(reason为空) -> 仍无编辑链接（正在审的不碰）",
           not _ed4[0]["editUrl"], _ed4[0])
     # 布尔值也是 int 的子类：display_status=true 会被当成 1（已发布），
@@ -216,7 +227,7 @@ def main():
     for _bad in (True, False):
         _edb = fu.api_items_to_rows([
             item(item_id="F", title="第6章 布尔", display_status=_bad),
-        ], BOOK)[0]
+        ], BOOK)
         check(f"display_status={_bad!r}（布尔） -> 无编辑链接",
               not _edb[0]["editUrl"], _edb[0])
     check("平台明说不可改的未知状态 -> 无编辑链接", not _by[9]["editUrl"], _by[9])

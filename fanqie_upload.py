@@ -2067,29 +2067,6 @@ def describe_book_page(state, books=()):
 
 
 # ---------------------------------------------------------------------------
-# JS: 从章节管理页提取最新一条发布时间（仅当前页，不翻页）
-# ---------------------------------------------------------------------------
-LAST_PUBLISH_JS = r"""() => {
-    const re = /(\d{4}[-/]\d{2}[-/]\d{2})\s+(\d{2}:\d{2})/;
-    let best = null, bestKey = '';
-    for (const row of document.querySelectorAll('tr')) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 2) continue;
-        const m = row.textContent.match(re);
-        if (!m) continue;
-        const d = m[1].replace(/\//g, '-');
-        const t = m[2];
-        const key = d + ' ' + t;
-        if (key > bestKey) {
-            best = {date: d, time: t, chapter: cells[0].textContent.trim()};
-            bestKey = key;
-        }
-    }
-    return best;
-}"""
-
-
-# ---------------------------------------------------------------------------
 # 章节列表提取（修改模式用）— 单次 JS 调用完成全部翻页
 # ---------------------------------------------------------------------------
 _EXTRACT_ALL_JS = r"""async (opts) => {
@@ -2108,10 +2085,14 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
     let totalPages = 0;
     let pageCount = 0;
 
-    // 同时提取最新发布时间
+    // 「发布/排期日期」那一列（修改排期要用；「检查缺口」据此判断已发布章
+    // 是否还在 3 天可移动窗口内）。
+    // 2026-10-31：这个 JS 过去还顺手算一个「最大时刻」当 lastPublish 返回，
+    // 那是「队列排到」标签的唯一来源 —— 而「最大时刻」不是队尾、也不是末章，
+    // 队列排期错乱时标签就报错了章号（实测：写着第5191章，平台实际有
+    // 5196章）。队尾/末章统一由核心的 queue_state 按平台真状态算，
+    // 这里不再算第二份。
     const dateRe = /(\d{4}[-\/]\d{2}[-\/]\d{2})\s+(\d{2}:\d{2})/;
-    let lastPub = null;
-    let lastPubKey = '';
 
     // 获取总页数
     for (const li of document.querySelectorAll('li.arco-pagination-item')) {
@@ -2179,14 +2160,6 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
                                date: rowDate, time: rowTime,
                                rowIndex: allChapters.length });
             newCount++;
-
-            if (dm) {
-                const pk = rowDate + ' ' + rowTime;
-                if (pk > lastPubKey) {
-                    lastPub = { date: rowDate, time: rowTime, chapter: title };
-                    lastPubKey = pk;
-                }
-            }
         }
 
         pageCount++;
@@ -2225,7 +2198,7 @@ _EXTRACT_ALL_JS = r"""async (opts) => {
         });
     }
 
-    return { chapters: allChapters, totalPages, pageCount, lastPublish: lastPub };
+    return { chapters: allChapters, totalPages, pageCount };
 }"""
 
 
@@ -2315,7 +2288,7 @@ async def select_volume(page, volume_text: str) -> bool:
 async def _extract_via_api(page, book_id):
     """在已经打开的章节管理页上，用接口直接取当前卷的章节行。
 
-    成功返回 (chapters, last_publish)；任何一处不对劲都返回 None，让调用方退回
+    成功返回章节行列表；任何一处不对劲都返回 None，让调用方退回
     逐页点「下一页」的 DOM 抓取——慢 50 倍，但一定是页面上真正显示的那一卷。
 
     为什么要有那道"首行标题对得上"的校验: 签名 URL 是从 resource timing 里捞
@@ -2331,7 +2304,7 @@ async def _extract_via_api(page, book_id):
         if res.get("error"):
             logger.debug(f"接口取章节列表失败，退回 DOM 翻页: {res['error']}")
             return None
-        chapters, last_pub = api_items_to_rows(res.get("items") or [], book_id)
+        chapters = api_items_to_rows(res.get("items") or [], book_id)
         if chapters:
             first = await page.evaluate(
                 "() => (document.querySelector('tr td')||{}).textContent || ''")
@@ -2339,7 +2312,7 @@ async def _extract_via_api(page, book_id):
                 logger.debug("接口首行与页面首行对不上（签名可能是上一卷的），"
                              "退回 DOM 翻页")
                 return None
-        return chapters, last_pub
+        return chapters
     except Exception as e:
         logger.debug(f"接口取章节列表异常，退回 DOM 翻页: {e}")
         return None
@@ -2347,25 +2320,26 @@ async def _extract_via_api(page, book_id):
 
 async def extract_chapters_from_page(
     page, book_id: str = "", on_progress=None,
-) -> tuple[list[dict], dict | None]:
-    """从章节管理页提取全部章节列表（单次 JS 调用完成全部翻页）。
-
-    返回 (chapters, last_publish_info)。
-    last_publish_info: {date, time, chapter} 或 None。
+) -> list[dict]:
+    """从章节管理页提取全部章节列表。
 
     on_progress(已翻页数, 总页数, 已抓章数): 可选。章节多的书要翻十几页、耗时十
     几秒，没有进度的话界面看着像卡死。CLI 不传，行为完全不变。
+
+    2026-10-31：不再返回「最大时刻那一行」。那个数既不是队尾也不是末章，
+    队列排期错乱时标签就报错了章号（实测：写着第5191章，平台实际有5196章）。
+    队尾/末章统一由 queue_state 按平台真状态算 —— 只有一份判据。
     """
     rows = await _extract_via_api(page, book_id)
     if rows is not None:
-        chapters, last_pub = rows
+        chapters = rows
         if on_progress is not None:
             try:
                 on_progress(1, 1, len(chapters))
             except Exception:
                 pass
         logger.info(f"  接口直取 {len(chapters)} 个章节")
-        return chapters, last_pub
+        return chapters
 
     if on_progress is not None:
         try:
@@ -2382,14 +2356,21 @@ async def extract_chapters_from_page(
     chapters = result.get("chapters", [])
     total_pages = result.get("totalPages", 0)
     page_count = result.get("pageCount", 0)
-    last_pub = result.get("lastPublish")
+
+    # DOM 这条路拿不到平台的位置字段（接口的 index），但表格默认按位置**倒序**
+    # 排（实测：首页是 5196→5182），于是「总行数 - 行号」就是它的位置。
+    # 前提是用户没在页面上改过排序；改过的话这个位置是错的 —— 接口那条路
+    # （正常走的那条）不受影响，它带的是平台自己的 index。
+    _total = len(chapters)
+    for _i, _c in enumerate(chapters):
+        _c.setdefault("pos", _total - _i)
 
     if total_pages:
         logger.info(f"  共 {page_count}/{total_pages} 页, {len(chapters)} 个章节")
     elif chapters:
         logger.info(f"  共 {page_count} 页, {len(chapters)} 个章节")
 
-    return chapters, last_pub
+    return chapters
 
 
 def match_chapters(
@@ -2770,16 +2751,28 @@ _EDIT_URL_TPL = "/main/writer/{book_id}/publish/{item_id}/?enter_from=modifychap
 def api_items_to_rows(items, book_id):
     """chapter_list 接口的 item -> _EXTRACT_ALL_JS 的行结构。
 
-    返回 (chapters, last_publish)，与 extract_chapters_from_page 的返回同形:
-      chapters: [{title, chapterNum, editUrl, status, date, time, rowIndex,
-                  cant_modify_reason}]
-      last_publish: {date, time, chapter} —— 行里最大的那个时刻，同 DOM 版。
+    返回 chapters: [{title, chapterNum, editUrl, status, date, time, rowIndex,
+                     cant_modify_reason, display_status, timer_time, pos}]
 
-    date/time 取哪个时间戳: 待发布章看 timer_time（排期时刻，改排期要用它），
-    已发布章看 create_time（平台在发布时把它改写成实际发布时刻）。两者都是
-    unix 秒，按本机时区格式化 —— DOM 里那串也是浏览器按本机时区渲染的。
+    date/time 取哪个时间戳: **未公开**的章看 timer_time（排期时刻，改排期和
+    算队尾都要用它），已发布章看 create_time（平台在发布时把它改写成实际发布
+    时刻）。两者都是 unix 秒，按本机时区格式化 —— DOM 里那串也是浏览器按本机
+    时区渲染的。
+
+    2026-10-31 修：过去只有「待发布」用 timer_time，审核中(4)、审核不通过(7)
+    的章被降级成 create_time —— 排期时刻直接丢了。而它们同样占着未来的发布
+    坑位，队尾因此算短，新章会被排进已被占用的时刻（2026-10-10 实测：新章
+    排在 2028-06-30 07:00~20:00，正好撞上第4783~4787章已占的坑位）。
+
+    行里额外带 display_status / timer_time / pos: 下游算队尾要的是**平台真
+    状态**，从格式化过的日期字符串反推会把这三个信息丢掉（DOM 兜底那条路
+    没有 pos，见 extract_chapters_from_page 的说明）。
+
+    2026-10-31 也去掉了「行里最大时刻那一行」这个返回值：那个数既不是队尾
+    也不是末章，队列排期错乱时标签就报错了章号（实测：写着第5191章，平台
+    实际有5196章）。队尾/末章统一由 queue_state 按平台真状态算。
     """
-    rows, last_pub, last_key = [], None, ""
+    rows = []
     for i, it in enumerate(items):
         title = it.get("title")
         if not isinstance(title, str):
@@ -2817,17 +2810,29 @@ def api_items_to_rows(items, book_id):
             # 放开「reason 为空 → 可改」的只有审核不通过（7）：它是解审核卡队列
             # 唯一能动的地方。
             editable = (not reason) and ds != DISPLAY_REVIEWING
-        ts = it.get("timer_time") if ds == DISPLAY_PENDING else it.get("create_time")
+        # 未公开的章一律用 timer_time（它占着的发布时刻）。已发布章用
+        # create_time —— 那是它真正公开的时刻（平台在发布时改写该字段）。
+        # 2026-10-31 修：过去只有「待发布」用 timer_time，审核中/审核不通过
+        # 的章被降级成 create_time，排期时刻直接丢失，队尾因此算短。
+        if ds in (DISPLAY_PUBLISHED, DISPLAY_REVIEWING_PUBLISHED):
+            ts = it.get("create_time")
+        else:
+            ts = it.get("timer_time") or it.get("create_time")
         try:
             ts = int(ts or 0)
         except (TypeError, ValueError):
             ts = 0
+        try:
+            timer = int(it.get("timer_time") or 0)
+        except (TypeError, ValueError):
+            timer = 0
         if ts > 0:
             dt = datetime.fromtimestamp(ts)
             d, t = dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
         else:
             d = t = None
         item_id = it.get("item_id")
+        idx = it.get("index")
         rows.append({
             "title": title,
             "chapterNum": chapter_title_num(title),
@@ -2836,15 +2841,413 @@ def api_items_to_rows(items, book_id):
             "status": status,
             "date": d, "time": t,
             "rowIndex": i,
+            # 平台真状态：算队尾、找末章都要用它们，别从格式化字符串反推。
+            "display_status": ds,
+            "timer_time": timer,
+            # 卷内位置（接口的 index）。单卷书它就是全书位置；多卷书要靠
+            # global_position 换算成全书位置（见 fetch_chapter_items）。
+            "pos": idx if isinstance(idx, int) and not isinstance(idx, bool) else None,
             # 平台明说不能改的理由。带着它，修改模式才能说清「为什么改不了」
             # —— 只说「审核不通过的章可以改」，碰上带理由的那一种就是死路。
             "cant_modify_reason": reason,
         })
-        if d:
-            key = f"{d} {t}"
-            if key > last_key:
-                last_pub, last_key = {"date": d, "time": t, "chapter": title}, key
-    return rows, last_pub
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 发布队列状态（GUI 与命令行共用同一份判据）
+#
+# 2026-10-31 用户报「队列排到第5191章，实际有5196章」。查下来是两层问题叠在
+# 一起，缺一层都修不掉：
+#
+# ① **口径错**：队列尾 ≠ 末章。
+#    · 队列尾 = 未公开章里**最晚的排期时刻** —— 新章必须排在它后面。
+#    · 末章   = **位置最后**的那一章 —— 读者最后看到的是它。
+#    健康的书上两者重合；排期错乱的书上不重合（实测：末章第5196章排在
+#    2028-06-30 20:00，而第5191章排在 2028-09-06 07:00）。过去只报一个，
+#    报的还是「最大时刻」那一个 —— 于是标签写着第5191章，末章却是第5196章。
+#    这两个数必须分开报，不能挑一个冒充另一个。
+#
+# ② **漏算**：队尾过去只统计 display_status=10（待发布）。审核中(4)、
+#    审核不通过(7)的章**同样占着未来的发布坑位**，漏掉它们就会把新章排进
+#    已被占用的时刻。2026-10-10 实测就是这么撞的：新章排在 2028-06-30
+#    07:00~20:00，正好撞上第4783~4787章已占的坑位，而且整体排在第5191章
+#    （2028-09-06）**前面** —— 位置顺序与发布时刻倒挂，读者看到的目录是乱的。
+#    修法：**所有未公开且有排期时刻的章都算坑位**，不按状态码筛。
+# ---------------------------------------------------------------------------
+
+# 还没对外公开 = 还占着一个发布坑位。5（已发布章的修改审核中）章子本身早
+# 就公开了，不占坑位。
+_PUBLISHED_CODES = (DISPLAY_PUBLISHED, DISPLAY_REVIEWING_PUBLISHED)
+
+
+def is_unpublished(display_status):
+    """这一章还没公开吗（还占着一个发布坑位）。
+
+    认不出的状态码一律当成「未公开」：宁可把队尾算长（排得更晚，浪费一点
+    队列深度），也不能算短 —— 算短就是把新章塞进别人已占的坑位。
+    """
+    if display_status is None:
+        return True
+    return display_status not in _PUBLISHED_CODES
+
+
+def item_position(it):
+    """这一章在全书的位置（多卷书已换算过全书位置；单卷书就是 index）。
+
+    位置是**读者看到的顺序**，跟标题里的「第N章」不是一回事 —— 这个项目
+    存在的全部理由就是这两者会错开。
+    """
+    v = it.get("pos")
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    v = it.get("index")
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def chapter_slot_time(it):
+    """这一章占着的发布时刻（unix 秒）；没占坑位返回 0。
+
+    占坑 = 未公开 + 有排期时刻（timer_time）。
+    """
+    if not is_unpublished(it.get("display_status")):
+        return 0
+    try:
+        tt = int(it.get("timer_time") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return tt if tt > 0 else 0
+
+
+def queue_state(items):
+    """平台的发布队列状态。
+
+    返回:
+      slots        所有占坑的章 [{pos, timer, title, display_status}]，按位置升序
+      tail         队尾：最晚的那个发布时刻所占的章（{pos, timer, title, ...}）
+      tail_dt      队尾时刻（datetime）
+      last         末章：位置最后那一章（同 slots 的形状；位置未知时为 None）
+      inverted     排期倒挂的章：位置更靠后，时刻却比前面某章更早
+                   （读者会先看到它 → 目录顺序是乱的）
+      clash        撞时刻：同一个发布时刻被两章以上占用 {timer: [pos, ...]}
+      unpublished  占坑的章数
+
+    位置未知（DOM 兜底那条路拿不到 index）时 last 为 None —— 宁可不说末章，
+    也不把「列表里的最后一行」当成末章（接口那条路是**倒序**返回的）。
+    """
+    slots = []
+    for it in items or []:
+        tt = chapter_slot_time(it)
+        if not tt:
+            continue
+        slots.append({"pos": item_position(it), "timer": tt,
+                      "title": it.get("title") or "",
+                      "display_status": it.get("display_status")})
+    slots.sort(key=lambda s: s["pos"])
+    tail = max(slots, key=lambda s: s["timer"]) if slots else None
+    # 倒挂：位置更靠后的章，时刻比前面某章更早 → 读者会先看到它。
+    # 记下「挡在它前面的是哪一章」（那一刻最晚的那章），报告才说得清是谁
+    # 把它压到了后面 —— 只说「有 5 章倒挂」用户没法自己去改。
+    inverted, run_max, run_at = [], 0, None
+    for s in slots:
+        if s["timer"] < run_max:
+            inv = dict(s)
+            inv["after_timer"] = run_max
+            inv["after_pos"] = (run_at or {}).get("pos")
+            inv["after_title"] = (run_at or {}).get("title")
+            inverted.append(inv)
+        else:
+            run_max, run_at = s["timer"], s
+    # 撞时刻：同一个发布时刻被两章以上占用（平台会自己挑一个先发，另一个
+    # 就晚了 —— 或者干脆把两章同时放出去）。
+    by_timer = {}
+    for s in slots:
+        by_timer.setdefault(s["timer"], []).append(s["pos"])
+    clash = {t: ps for t, ps in by_timer.items() if len(ps) > 1}
+    known_pos = all(s["pos"] for s in slots)
+    return {
+        "slots": slots,
+        "tail": tail,
+        "tail_dt": datetime.fromtimestamp(tail["timer"]) if tail else None,
+        "last": slots[-1] if (slots and known_pos) else None,
+        "inverted": inverted,
+        "clash": clash,
+        "unpublished": len(slots),
+    }
+
+
+def queue_tail_dt(items):
+    """平台队列排到哪一刻（datetime，精确到分）。没有未公开章返回 None。
+
+    口径：**所有未公开且有排期时刻的章**里最晚的那个 —— 不按状态码筛。
+    2026-10-10 的续排出事正是因为这里只数「待发布」，把还在审核、已经占了
+    未来坑位的章漏掉了，新章直接排进了别人占的时刻。
+    """
+    return queue_state(items)["tail_dt"]
+
+def queue_tail_date(items, *, today=None):
+    """平台队列排到哪一天了（返回 date）。没有未公开章就返回今天。"""
+    dt = queue_tail_dt(items)
+    return dt.date() if dt else (today or datetime.now().date())
+
+
+# ---------------------------------------------------------------------------
+# 排期顺序：发布顺序必须 = 位置顺序
+#
+# 2026-10-31 实测：全书 5196 章里，位置 5192~5196 被排在 2028-06-30，
+# 而位置 5191 排在 2028-09-06 —— 读者会先看到第5196章、再看到第5191章。
+# 根因是 2026-10-10 那次续排只统计「待发布」，把还在审核、同样占着坑位的
+# 章漏掉了（见 queue_state 上面那段）。
+#
+# 判据只有一条：**发布时刻必须随位置递增，且不与别的章占用同一时刻**。
+# 位置顺序 = 目录顺序 = 读者看到的顺序；发布时刻一旦倒过来，读者就会先看到
+# 后面的章。位置本身没错（位置=章号全对），所以这一类错位「位置体检」看不出来。
+# ---------------------------------------------------------------------------
+
+
+def slot_timestamp(date_str, time_str):
+    """'2028-06-30' + '07:00' -> unix 秒（本地时区，平台按本机时区渲染）。"""
+    try:
+        return int(datetime.strptime(
+            f"{date_str} {time_str or '00:00'}", "%Y-%m-%d %H:%M").timestamp())
+    except (ValueError, TypeError):
+        return 0
+
+
+def chapter_publish_ts(it):
+    """这一章的「发布时刻」（unix 秒）：未公开的看排期，已发布的看实际公开时刻。"""
+    try:
+        if is_unpublished(it.get("display_status")):
+            return int(it.get("timer_time") or 0)
+        return int(it.get("create_time") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fmt_ts(ts):
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return str(ts)
+
+
+def schedule_order_conflicts(items=(), *, changes=None, new_slots=None,
+                             tail_dt=None):
+    """排期之后「读者的阅读顺序 = 目录顺序」还成不成立。
+
+    items      平台章节（pos / title / display_status / timer_time / create_time）
+    changes    {位置: 新时刻(unix 秒)} —— 这次要改的已有章
+    new_slots  [(日期, 时间)] —— 这次要新建的章（它们的位置在全书末尾）
+    tail_dt    队列末尾时刻（items 为空时当锚点用）
+
+    只报**与本次改动有关**的冲突：书上已有的错位不该在用户改别章时反复冒出来。
+
+    返回冲突说明列表（空 = 安全）。
+    """
+    changes = changes or {}
+    rows = []
+    for it in items or []:
+        pos = item_position(it)
+        ts = changes.get(pos)
+        if ts is None:
+            ts = chapter_publish_ts(it)
+        if ts:
+            rows.append([pos, ts, it.get("title") or "", pos in changes])
+    if tail_dt is not None and not rows:
+        # 没有章节明细时只拿队尾当锚点（GUI 手填起始日期那条路就是这样）
+        _ts = int(tail_dt.timestamp()) if hasattr(tail_dt, "timestamp") else int(tail_dt)
+        if _ts:
+            rows.append([0, _ts, "平台队列末尾", False])
+    if new_slots:
+        max_pos = max((r[0] for r in rows), default=0)
+        for i, slot in enumerate(new_slots):
+            d, t = (slot if isinstance(slot, (tuple, list)) else (slot, ""))
+            ts = slot_timestamp(d, t)
+            if ts:
+                rows.append([max_pos + 1 + i, ts, f"新排的第{i + 1}章", True])
+    if not rows:
+        return []
+    rows.sort(key=lambda r: r[0])
+    n = len(rows)
+    pre_max = [0] * (n + 1)      # 位置在它前面的章里最晚的时刻
+    for i in range(n):
+        pre_max[i + 1] = max(pre_max[i], rows[i][1])
+    suf_min = [0] * (n + 1)      # 位置在它后面的章里最早的时刻
+    for i in range(n - 1, -1, -1):
+        suf_min[i] = min(suf_min[i + 1], rows[i][1])
+    by_ts = {}
+    for r in rows:
+        by_ts.setdefault(r[1], []).append(r)
+    out = []
+    for i, r in enumerate(rows):
+        if not r[3]:
+            continue              # 只报与本次改动有关的
+        pos, ts, title = r[0], r[1], r[2]
+        lo, hi = pre_max[i], suf_min[i + 1]
+        if lo and ts < lo:
+            worst = max(rows[:i], key=lambda x: x[1])
+            out.append(
+                f"位置{pos}「{title[:20]}」排在 {_fmt_ts(ts)}，比它前面的"
+                f"位置{worst[0]}（{_fmt_ts(worst[1])}）更早 —— 读者会先看到它")
+        if hi and ts > hi:
+            soonest = min(rows[i + 1:], key=lambda x: x[1])
+            out.append(
+                f"位置{pos}「{title[:20]}」排在 {_fmt_ts(ts)}，比它后面的"
+                f"位置{soonest[0]}（{_fmt_ts(soonest[1])}）更晚 —— "
+                "读者会先看到后面那章")
+        same = [x for x in by_ts.get(ts, []) if x[0] != pos]
+        if same:
+            out.append(
+                f"位置{pos}「{title[:20]}」的时刻 {_fmt_ts(ts)} 与位置"
+                f"{'、'.join(str(x[0]) for x in same)} 撞了 —— "
+                "平台只能挑一个先发")
+    return out
+
+
+def schedule_repair_plan(items, *, pub_time, per_day, now=None):
+    """「一键修复排期」：把排到别人前面的那几章挪到队列末尾之后。
+
+    返回 (方案, 说明行)：
+      方案   [(位置, 标题, 新日期, 新时间)]，按位置升序
+      说明行 给人看的几句（没有要修的章时为空列表）
+
+    修法说明：光挪那几章不够 —— 它们后面的章也得跟着往后挪，否则修完还是
+    乱的（挪走一章，它后面的章就变成「排在它前面」了）。所以要挪的是
+    **从第一个错排的位置开始、到末尾的整段**。
+    """
+    st = queue_state(items)
+    inverted = st["inverted"]
+    clash = st["clash"]
+    tail_dt = st["tail_dt"]
+    if not tail_dt or not (inverted or clash):
+        return [], []
+    # 该从哪一章开始挪：
+    #   · 倒挂的章 = 排在太早的那一章（挪它）；
+    #   · 撞时刻的一对 = 挪**靠后**的那一章（挪靠前的要连带挪一大段）。
+    cut = None
+    for r in inverted:
+        cut = r["pos"] if cut is None else min(cut, r["pos"])
+    for _ts, ps in clash.items():
+        p = max(ps)
+        cut = p if cut is None else min(cut, p)
+    moving = [it for it in (items or [])
+              if is_unpublished(it.get("display_status"))
+              and item_position(it) >= cut]
+    moving.sort(key=item_position)
+    if not moving:
+        return [], []
+    mod = _load_tool_module("keep_ahead")
+    # 多排一些，把已被占用的时刻让开（撞时刻是最容易犯的错）
+    slots = mod.schedule_after(tail_dt, len(moving) + 30, pub_time, per_day,
+                                now=now)
+    used = {chapter_publish_ts(it) for it in (items or [])}
+    used.discard(0)
+    free = [s for s in slots if slot_timestamp(*s) not in used]
+    slots = free[:len(moving)]
+    if len(slots) < len(moving):
+        return [], []
+    plan = []
+    for it, (d, t) in zip(moving, slots):
+        plan.append((item_position(it), it.get("title") or "", d, t))
+    lines = [
+        f"把位置 {cut}~{plan[-1][0]} 的 {len(plan)} 章挪到队尾之后：",
+        f"   队尾 {tail_dt.strftime('%Y-%m-%d %H:%M')} → "
+        f"新排期 {plan[0][2]} {plan[0][3]} ~ {plan[-1][2]} {plan[-1][3]}",
+    ]
+    for pos, title, d, t in plan[:8]:
+        lines.append(f"   位置{pos}「{title[:20]}」→ {d} {t}")
+    if len(plan) > 8:
+        lines.append(f"   … 共 {len(plan)} 章")
+    return plan, lines
+
+
+def queue_summary(state):
+    """queue_state → 界面/日志用的摘要（两处入口拿同一份，别各写各的）。
+
+    date / time      队尾时刻（最新被占用的发布时刻）—— 起始日期按它推
+    chapter          末章（位置最后那章）的标题
+    last_date/time   末章自己的排期时刻
+    tail_chapter     队尾时刻所占的那一章
+    inverted/clash   排期错位计数（倒挂章数 / 被两章以上占用的时刻数）
+
+    「队尾时刻」和「末章」是两个数：健康的书上它们重合，排期错乱的书上不
+    重合（实测：末章第5196章排在 2028-06-30，第5191章却排在 2028-09-06）。
+    过去只报后者（还是「最大时刻」那个），于是标签写着第5191章而平台实际
+    有5196章 —— 用户看到的就是对不上。
+    """
+    tail = state.get("tail") or {}
+    last = state.get("last") or {}
+    out = {"date": None, "time": None, "chapter": "",
+           "last_date": None, "last_time": None, "tail_chapter": "",
+           "inverted": 0, "clash": 0, "last_inverted": False}
+    if tail.get("timer"):
+        dt = datetime.fromtimestamp(tail["timer"])
+        out["date"] = dt.strftime("%Y-%m-%d")
+        out["time"] = dt.strftime("%H:%M")
+        out["tail_chapter"] = tail.get("title") or ""
+    if last.get("timer"):
+        dt = datetime.fromtimestamp(last["timer"])
+        out["last_date"] = dt.strftime("%Y-%m-%d")
+        out["last_time"] = dt.strftime("%H:%M")
+        out["chapter"] = last.get("title") or ""
+    if not out["chapter"]:
+        # 位置未知（拿不到平台的 index）时没有末章可报，退回队尾那一章，
+        # 总比空着强。
+        out["chapter"] = out["tail_chapter"]
+    inv = state.get("inverted") or []
+    out["inverted"] = len(inv)
+    out["clash"] = len(state.get("clash") or {})
+    # 末章自己是不是那个「排在更早」的章（多数情况是：错位都发生在队尾）
+    out["last_inverted"] = bool(
+        last.get("pos") and any(r.get("pos") == last.get("pos") for r in inv))
+    return out
+
+
+# 行 → items 的唯一转换（GUI 的「自动接续」和「队列排到」都要用平台的
+# **真状态**算队尾；各写一份转换，两份判据早晚会漂，漂了就出现「标签说
+# 排到 5191、续排却按 5196 走」这种对不上的场面）。
+_STATUS_TEXT_TO_CODE = {
+    "待发布": DISPLAY_PENDING,
+    "审核中": DISPLAY_REVIEWING,
+    "审核不通过": DISPLAY_REVIEW_FAILED,
+    "已发布": DISPLAY_PUBLISHED,
+}
+
+
+def rows_to_items(rows):
+    """章节表行 -> items（pos / title / display_status / timer_time）。
+
+    行里有的字段直接用（接口那条路带 display_status/timer_time/pos）；没有的
+    才从中文状态和「发布时间」反推（DOM 兜底那条路）。反推只对**未公开**的
+    章做：已发布章那一列是它真正公开的时刻，不是排期。
+    """
+    out = []
+    for i, c in enumerate(rows or []):
+        status = (c.get("status") or "").strip()
+        ds = c.get("display_status")
+        if not isinstance(ds, int) or isinstance(ds, bool):
+            ds = _STATUS_TEXT_TO_CODE.get(status)
+        try:
+            tt = int(c.get("timer_time") or 0)
+        except (TypeError, ValueError):
+            tt = 0
+        if not tt and status != "已发布":
+            d, t = c.get("date"), c.get("time")
+            if d:
+                try:
+                    tt = int(datetime.strptime(
+                        f"{d} {t or '00:00'}", "%Y-%m-%d %H:%M").timestamp())
+                except ValueError:
+                    tt = 0
+        pos = c.get("pos")
+        if not isinstance(pos, int) or isinstance(pos, bool):
+            pos = None
+        out.append({"index": pos if pos is not None else i + 1,
+                    "pos": pos,
+                    "title": c.get("title", ""),
+                    "display_status": ds,
+                    "timer_time": tt})
+    return out
 
 
 # 页面自己发过的已签名 chapter_list URL —— 从 resource timing 里捞，不必额外
@@ -3145,6 +3548,14 @@ def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
     第 1/3/4 章——读者看到的是 1、3、4，不该让人去动它）。
 
     已发布章的 create_time 就是实际发布时刻（平台在发布时改写该字段）。
+
+    sched_inverted / sched_clash 是**未公开段**的排期体检（2026-10-31 加）：
+    前面那些检查看的都是「位置 ≠ 章号」，可排期本身也能错 —— 位置对的章被排到
+    了比它前面那章更早的时刻（倒挂），或者两章占了同一个时刻（撞时刻）。
+    实测踩过：第5192~5196章排在 2028-06-30，而第5191章排在 2028-09-06，
+    于是读者先看到第5196章、再看到第5191章；同一批时刻还被第4783~4787章
+    占了一遍。这种错位靠「位置体检」一个都看不出来，而它恰恰是续排出事
+    （新章排进了已占用的坑位）的直接后果，必须能被工具自己发现。
     """
     now_ts = int(time.time()) if now_ts is None else now_ts
     pend_bad, in_window, expired, misplaced_pub = [], [], [], []
@@ -3156,14 +3567,11 @@ def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
     # .get() 拿，缺了就当没有——体检是**只读诊断**，不该因为平台少给一个
     # 字段就整份报告都出不来（之前 find_review_block 已经这么兜住了，
     # 同一个函数里却还留着会抛 KeyError 的写法）。
-    def _pos_of(x):
-        v = x.get("pos")
-        return v if isinstance(v, int) else (x.get("index") or 0)
-
-    # 按全书位置排序/比对：多卷作品的 index 带卷序号偏移（见 global_position），
-    # 直接拿 index 和「第N章」比会把整卷判成错位。单卷时 pos 缺省等于 index。
-    for it in sorted(items, key=_pos_of):
-        pos = _pos_of(it)
+    # 位置换算只有一份（item_position）：多卷作品的 index 带卷序号偏移
+    # （见 global_position），直接拿 index 和「第N章」比会把整卷判成错位。
+    # 单卷时 pos 缺省等于 index。
+    for it in sorted(items, key=item_position):
+        pos = item_position(it)
         title = it.get("title") or ""
         ds = it.get("display_status")
         n = chapter_title_num(title)
@@ -3219,12 +3627,102 @@ def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
     # 卡队列是**诊断**：检测挂了（平台少给一个字段之类）不该让整份体检报告
     # 报废——那会让用户以为体检失败，而其实只是少了一条附加信息。
     # 兜底在 find_review_block 里面（两个调用点原来各写一份一样的）。
+    # 未公开段的排期体检（倒挂 / 撞时刻）：位置对不对是另一回事，排期本身
+    # 也能错，而排期错位才是续排出事的直接后果。判据与 queue_state 同一份。
+    _qs = queue_state(items)
     return {"pending_bad": pend_bad, "in_window": in_window,
             "expired": expired, "misplaced_pub": misplaced_pub,
             "reviewing": reviewing, "rejected": rejected,
             "order_break": ({"at": inverted_pos[0], "affected": len(inverted_pos)}
                             if inverted_pos else None),
-            "review_block": find_review_block(items)}
+            "review_block": find_review_block(items),
+            "sched_inverted": _qs["inverted"],
+            "sched_clash": _qs["clash"],
+            "queue_tail": _qs["tail"],
+            "queue_last": _qs["last"]}
+
+
+def schedule_order_lines(rep, *, limit=5):
+    """未公开段排期错位（倒挂 / 撞时刻）的说明行。GUI 与 CLI 共用这一份。
+
+    为什么单列一段：位置体检查的是「位置 ≠ 章号」，可**排期本身**也能错 ——
+    位置对的章被排到了比它前面那章更早的时刻（读者会先看到它），或者两章
+    占了同一个时刻。2026-10-31 实测踩过：第5192~5196章排在 2028-06-30，
+    而第5191章排在 2028-09-06 —— 位置全对，时刻全乱。这种错位「位置体检」
+    一个都看不出来，而它恰恰是续排出事（新章排进已占用的坑位）的直接后果。
+
+    没有这类问题时返回空列表——正常书不该多这一段。
+    """
+    inv = rep.get("sched_inverted") or []
+    clash = rep.get("sched_clash") or {}
+    if not inv and not clash:
+        return []
+    out = []
+    if inv:
+        out.append(f"⚠ 未公开段排期顺序有错：{len(inv)} 章排在比它前面那章更早的"
+                   "时刻 —— 读者会先看到它们，目录顺序是乱的")
+        for r in inv[:limit]:
+            _t = datetime.fromtimestamp(r["timer"]).strftime("%Y-%m-%d %H:%M")
+            _a = datetime.fromtimestamp(r["after_timer"]).strftime("%Y-%m-%d %H:%M")
+            _at = (r.get("after_title") or "").split(" ")[0] or f"位置{r.get('after_pos')}"
+            out.append(f"   位置{r['pos']}「{(r.get('title') or '')[:20]}」排在 {_t}，"
+                       f"比它前面的{_at}（{_a}）更早")
+        if len(inv) > limit:
+            out.append(f"   … 共 {len(inv)} 章")
+    if clash:
+        out.append(f"⚠ {len(clash)} 个发布时刻被两章以上占用："
+                   "平台只能挑一个先发，另一个会被推迟")
+        for _ts, _ps in list(clash.items())[:limit]:
+            _t = datetime.fromtimestamp(_ts).strftime("%Y-%m-%d %H:%M")
+            out.append(f"   {_t} —— 位置 {'、'.join(str(p) for p in _ps)}")
+        if len(clash) > limit:
+            out.append(f"   … 共 {len(clash)} 个时刻")
+    _tail = rep.get("queue_tail") or {}
+    if _tail.get("timer"):
+        _dt = datetime.fromtimestamp(_tail["timer"])
+        _t = _dt.strftime("%Y-%m-%d %H:%M")
+        _next = (_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        out.append(f"   修：切到「修改排期」模式，选中这几章，起始日期填 {_next}"
+                   f"（队尾 {_t} 的次日）—— 位置动不了（3 天窗口早过了），"
+                   "只能改时刻")
+    return out
+
+
+def queue_label_text(info, *, label="队列排到"):
+    """「队列排到」标签的文案（GUI 与日志共用同一份措辞，好测）。
+
+    第一行：队列排到 <队尾时刻>（<末章>）
+      · 队尾时刻 = 最新被占用的发布时刻 —— 新章要排在它后面；
+      · 末章     = 位置最后那章 —— 读者最后看到的是它。
+      健康的书上两者重合；排期错乱的书上不重合（2026-10-31 实测：末章排在
+      2028-06-30，第5191章却排在 2028-09-06）。
+    第二行（只在排期错乱时）：把错在哪说清楚，并给出修法。
+    """
+    date_str = info.get("date")
+    time_str = info.get("time")
+    if not date_str or not time_str:
+        return "暂无发布记录"
+    chapter = info.get("chapter", "")
+    text = f"{label}：{date_str} {time_str}"
+    if chapter:
+        text += f"（{chapter}）"
+    inverted = int(info.get("inverted") or 0)
+    clash = int(info.get("clash") or 0)
+    if not (inverted or clash):
+        return text
+    bad = []
+    if inverted:
+        bad.append(f"{inverted} 章排在比它前面那章更早")
+    if clash:
+        bad.append(f"{clash} 个时刻被两章以上占用")
+    if info.get("last_inverted") and info.get("last_date"):
+        # 末章自己就是那个排在更早的章 —— 说清它到底排在几点，别让
+        # 「队列排到 X（第N章）」让人以为第N章就排在 X。
+        text += (f"\n⚠ 末章排在 {info['last_date']} {info['last_time']}，"
+                 f"比队尾更早（" + "、".join(bad) + "）")
+    else:
+        text += "\n⚠ 排期反了：" + "、".join(bad)
+    return text + " —— 用「修改排期」挪回来"
 
 
 def review_status_lines(rep):
@@ -3652,7 +4150,7 @@ async def reconcile_after_batch(page, book_id, claimed_nums, fail_list):
                      f"{'、'.join(f'第{n}章' for n in missing[:20])}"
                      f"{' …' if len(missing) > 20 else ''}")
         logger.error("  这些章需要重发；番茄新建章只会追加到全书末尾，所以越早补越好"
-                     "（已发布章的**位置**只能在手机 App 里申请移动，限 3 天；"
+                     "（已发布章的位置只能在手机 App 里申请移动，限 3 天；"
                      "错过窗口仍可用 tools/remap --include-published 改写内容补正）")
         for n in missing:
             fail_list.append((f"第{n}章 ", "对账: 日志记成功但平台上不存在"))
@@ -4167,7 +4665,7 @@ async def run_creation_batch(page, parsed, new_chapter_url, *, book_id,
             lab = limit_label(e)
             logger.warning(f"  达{lab}（{e}），中止整批")
             if lab.startswith("每月"):
-                logger.warning("  这是**每月**额度耗尽，明天再跑同样发不动；"
+                logger.warning("  这是每月额度耗尽，明天再跑同样发不动；"
                                "请先核对余量够不够撑到下月（tools/remap 会算）")
             fail_list.append((f"{num_str}{title}", str(e)))
             daily_limit = True
@@ -4766,6 +5264,30 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
     async with async_playwright() as p:
         browser, context = await create_context(p, headless=headless)
         page = await context.new_page()
+
+        # 排期顺序校验（必须在写平台之前）：新章只能追加到全书末尾 ——
+        # 排在已排好的章前面，读者会先看到它（2026-10-10 那次续排就是这么
+        # 把 5 章排到别人前面的）。
+        if schedule and not getattr(args, "auto_continue", False):
+            try:
+                _items, _sig, _vols = await fetch_chapter_items(page, book_id)
+            except Exception as e:
+                logger.warning(f"读不到平台队列，跳过排期顺序校验: {e}")
+                _items = None
+            if _items:
+                _conf = schedule_order_conflicts(_items, new_slots=schedule)
+                if _conf:
+                    logger.error("这个起始日期会把发布顺序弄乱，已中止：")
+                    for _ln in _conf[:6]:
+                        logger.error("  " + _ln)
+                    _tail = queue_tail_dt(_items)
+                    if _tail:
+                        logger.error(
+                            f"平台队列排到 {_tail:%Y-%m-%d %H:%M} —— "
+                            f"请把 --schedule 改到 "
+                            f"{(_tail + timedelta(days=1)):%Y-%m-%d} 或更晚"
+                            "（或用 --auto-continue 让工具自己接在队尾后）。")
+                    return
 
         # 先验证登录态：打开新建章节页看是否能进入编辑器
         await page.goto(new_chapter_url)
@@ -5399,7 +5921,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
         await page.goto(chapter_manage_url)
         await settle_page(page)
 
-        platform_chapters, _ = await extract_chapters_from_page(page, book_id)
+        platform_chapters = await extract_chapters_from_page(page, book_id)
 
         if not platform_chapters:
             logger.warning("未在平台找到章节。请检查 Book ID 和登录状态。")
@@ -5492,12 +6014,20 @@ async def _auto_continue_plan(book_id, parsed, files, per_day, pub_time,
         days_ahead=days_ahead or 0, per_day=max(1, per_day))
     mode = ("全部补齐" if days_ahead is None
             else f"只排到 {days_ahead} 天后")
-    tail_dt = mod.queue_tail_dt(items)
+    tail_dt = queue_tail_dt(items)
     if gaps:
         logger.warning(
             f"⚠ 平台中段还缺 {len(gaps)} 章（如 第"
             + "、第".join(str(n) for n in gaps[:5])
             + "章…）——这些不能靠发布补回原位，请用 remap 子命令处理")
+    # 排期本身有错（位置在后面却排在更早的时刻 / 两章占同一时刻）时必须说：
+    # 续排只能保证**新章**排在队尾之后，已经排错的那几章它救不了。
+    _qs = queue_state(items)
+    if _qs["inverted"] or _qs["clash"]:
+        logger.warning(
+            f"⚠ 平台未公开段排期有错：{len(_qs['inverted'])} 章排在比它前面那章"
+            f"更早的时刻、{len(_qs['clash'])} 个时刻被两章以上占用"
+            "——新章会排在队尾之后，但已有的错位要自己用「修改排期」改回来")
     keep = set(nums)
     kept = [(p_, f_) for p_, f_ in zip(parsed, files)
             if p_[0] is not None and str(p_[0]).isdigit() and int(p_[0]) in keep]
@@ -5505,7 +6035,12 @@ async def _auto_continue_plan(book_id, parsed, files, per_day, pub_time,
         return [], [], None
     schedule = mod.schedule_after(tail_dt, len(kept), pub_time, per_day)
     tail_s = tail_dt.strftime("%Y-%m-%d %H:%M") if tail_dt else "空"
-    logger.info(f"自动接续（{mode}）: 平台队列排到 {tail_s}，"
+    # 队尾时刻和末章**分开报**：两者重合时只报一次；不重合（排期错乱）时
+    # 都报出来 —— 只报一个会让用户以为队列没问题（2026-10-31 用户反馈：
+    # 标签写着第5191章，平台上实际有5196章）。
+    last = _qs["last"]
+    last_s = (f"（末章 {last['title'][:20]}）" if last else "")
+    logger.info(f"自动接续（{mode}）: 平台队列排到 {tail_s}{last_s}，"
                 f"从 {schedule[0][0]} {schedule[0][1]} 起接着排")
     logger.info(f"自动接续: 本次发 {len(kept)} 章，第{nums[0]}~{nums[-1]}章")
     return [k[0] for k in kept], [k[1] for k in kept], schedule
@@ -5566,15 +6101,20 @@ async def cmd_reschedule_cli(args):
         return
     cfg = load_config()
     headless = args.headless or cfg.get("headless", False)
+    fix = bool(getattr(args, "fix_schedule", False))
     validated = validate_times(args.time)
     if not validated:
         logger.error(f"发布时间格式错误: {args.time}")
         return
-    try:
-        datetime.strptime(args.schedule, "%Y-%m-%d")
-    except ValueError:
-        logger.error(f"日期格式错误: {args.schedule}（应为 YYYY-MM-DD）")
-        return
+    if not fix:
+        if not getattr(args, "schedule", None):
+            logger.error("请用 --schedule 指定起始日期，或加 --fix-schedule 自动修复排期")
+            return
+        try:
+            datetime.strptime(args.schedule, "%Y-%m-%d")
+        except ValueError:
+            logger.error(f"日期格式错误: {args.schedule}（应为 YYYY-MM-DD）")
+            return
     per_day = max(1, args.per_day)
     async with async_playwright() as p:
         browser, context = await create_context(p, headless=headless)
@@ -5598,38 +6138,76 @@ async def cmd_reschedule_cli(args):
             if vol_texts:
                 for vt in vol_texts:
                     await select_volume(page, vt)
-                    chs, _ = await extract_chapters_from_page(page, args.book_id)
+                    chs = await extract_chapters_from_page(page, args.book_id)
                     all_chapters.extend(chs)
             else:
-                all_chapters, _ = await extract_chapters_from_page(
+                all_chapters = await extract_chapters_from_page(
                     page, args.book_id)
 
             # 只有「待发布」能改排期；顺序与 GUI 一致（列表是倒序展示的）
             pending = [ch for ch in reversed(all_chapters)
                        if "待发布" in ch.get("status", "")]
             if not pending:
-                logger.warning("这部作品里没有「待发布」状态的章节，"
-                               "已发布的章节不能再改排期。")
+                if fix:
+                    logger.info("没有未公开的章节，没有排期可改。")
+                else:
+                    logger.warning("这部作品里没有「待发布」状态的章节，"
+                                   "已发布的章节不能再改排期。")
                 return
 
-            schedule = compute_schedule(
-                len(pending), args.schedule, args.time, per_day)
-            schedule_map, dups, unchanged, order = build_schedule_map(pending, schedule)
-            if dups:
-                # 排期按标题匹配行，同名会互相覆盖、排错章 —— 无人值守下直接中止
-                logger.error(
-                    "存在同名章节: " + "、".join(dict.fromkeys(dups))
-                    + " —— 排期按标题匹配，同名会错配，已中止。"
-                      "请先在平台修改章节标题后再试。")
-                return
+            if fix:
+                # 一键修复：把排在别人前面的那几章挪到队列末尾之后。
+                # 挪的是「从第一个错排的位置到末尾」的一整段 —— 挪走一章，它
+                # 后面的章就变成「排在它前面」了。
+                _items = rows_to_items(all_chapters)
+                plan, lines = schedule_repair_plan(
+                    _items, pub_time=args.time, per_day=per_day)
+                if not plan:
+                    logger.info("排期顺序没问题：未公开段里没有「排在别人前面」的章，"
+                                "也没有两个章占用同一时刻。")
+                    return
+                for _ln in lines:
+                    logger.info(_ln)
+                schedule_map = {title: (d, t) for _pos, title, d, t in plan}
+                unchanged = 0
+                order = "desc"      # 整体推后 → 新→旧处理（见 build_schedule_map）
+            else:
+                schedule = compute_schedule(
+                    len(pending), args.schedule, args.time, per_day)
+                schedule_map, dups, unchanged, order = build_schedule_map(pending, schedule)
+                if dups:
+                    # 排期按标题匹配行，同名会互相覆盖、排错章 —— 无人值守下直接中止
+                    logger.error(
+                        "存在同名章节: " + "、".join(dict.fromkeys(dups))
+                        + " —— 排期按标题匹配，同名会错配，已中止。"
+                          "请先在平台修改章节标题后再试。")
+                    return
 
-            if not schedule_map:
-                logger.info(f"待发布章节 {len(pending)} 个，排期与平台现有一致，无需修改。")
-                return
+                if not schedule_map:
+                    logger.info(f"待发布章节 {len(pending)} 个，排期与平台现有一致，无需修改。")
+                    return
 
-            logger.info(f"待发布章节 {len(pending)} 个，"
-                        f"排期 {schedule[0][0]} ~ {schedule[-1][0]}"
-                        + (f"，其中 {unchanged} 章排期未变、跳过" if unchanged else ""))
+                # 改完之后「读者的阅读顺序 = 目录顺序」还成不成立？
+                # 位置不动（位置=章号是对的），动的是时刻 —— 时刻一倒，读者就会
+                # 先看到后面那章（2026-10-31 实测全书有 5 处这样的错位）。
+                _items = rows_to_items(all_chapters)
+                _changes = {}
+                for _ch, (_d, _t) in zip(pending, schedule):
+                    _pos = _ch.get("pos")
+                    if isinstance(_pos, int) and not isinstance(_pos, bool):
+                        _changes[_pos] = slot_timestamp(_d, _t)
+                _conf = schedule_order_conflicts(_items, changes=_changes)
+                if _conf:
+                    logger.error("这样改会把发布顺序弄乱，已中止：")
+                    for _ln in _conf[:6]:
+                        logger.error("  " + _ln)
+                    logger.error("把起始日期往后挪到队尾之后即可"
+                                 "（队尾时刻见 audit 报告）。")
+                    return
+
+                logger.info(f"待发布章节 {len(pending)} 个，"
+                            f"排期 {schedule[0][0]} ~ {schedule[-1][0]}"
+                            + (f"，其中 {unchanged} 章排期未变、跳过" if unchanged else ""))
             ok, bad = await reschedule_on_manage_page(
                 page, args.book_id, schedule_map,
                 max_retries=cfg.get("max_retries", 2),
@@ -5795,11 +6373,14 @@ def main():
     # reschedule: 批量改排期（GUI 一直有，CLI 之前缺）
     rs = sub.add_parser("reschedule", help="批量修改待发布章节的排期")
     rs.add_argument("--book-id", required=True, help="目标作品 ID")
-    rs.add_argument("--schedule", metavar="DATE", required=True,
-                    help="起始日期 YYYY-MM-DD")
+    rs.add_argument("--schedule", metavar="DATE",
+                    help="起始日期 YYYY-MM-DD（--fix-schedule 时不用填）")
     rs.add_argument("--time", default="08:00",
                     help="发布时间，多个逗号分隔，如 08:00,12:00,20:00")
     rs.add_argument("--per-day", type=int, default=1, help="每天章数")
+    rs.add_argument("--fix-schedule", action="store_true",
+                    help="一键修复排期：把「排在别人前面」的那几章挪到队列末尾之后"
+                         "（只改发布时间，位置/章号/正文都不动）")
     rs.add_argument("--headless", action="store_true", help=_H_HEADLESS)
     rs.add_argument("--all-volumes", action="store_true",
                     help="合并所有卷一起排（不加则只排当前卷）")

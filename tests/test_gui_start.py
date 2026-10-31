@@ -68,7 +68,26 @@ def main():
         check("GUI 构造成功（初始化不崩）", True)
         txt = app.btn_audit.cget("text")
         check("审计按钮文案是预期的两种之一",
-              txt in ("检查缺口", "检查缺口 ⚠"), repr(txt))
+              txt in (fanqie_gui.BTN_AUDIT, f"{fanqie_gui.BTN_AUDIT} ⚠"), repr(txt))
+        # 引导栏那颗「下一步」按钮：展开态和收起态两个入口都得建出来，
+        # 而且都注册进了同步列表——漏一个，矮屏上就没有能点的下一步了。
+        check("引导栏「下一步」按钮（展开态）建出来了",
+              hasattr(app, "btn_guide_cta"))
+        check("引导栏「下一步」按钮（收起态）建出来了",
+              hasattr(app, "btn_guide_cta_stub"))
+        check("两个入口都注册进同步列表",
+              len(getattr(app, "_guide_ctas", [])) == 2,
+              str(getattr(app, "_guide_ctas", None)))
+        # 引导栏按钮要跟「当前这一步指向的那颗按钮」说同一件事——不是恒等于
+        # 主按钮：第 ① ② ③ 步指向的是登录/刷新/选文件夹，只有第 ④ 步才指主按钮。
+        _step = app._compute_onboarding_step(*app._onboarding_state())
+        _spec = fanqie_gui.GUIDE_CTA.get(_step)
+        _target = getattr(app, _spec[0], None) if _spec else None
+        _expect = (_spec[1] if (_spec and _spec[1])
+                   else (_target.cget("text") if _target else ""))
+        check(f"引导栏按钮跟第 {_step} 步指向的那颗按钮说同一件事",
+              app.btn_guide_cta.cget("text") == _expect,
+              f"{app.btn_guide_cta.cget('text')!r} vs {_expect!r}")
         check("构造完没有把状态写进用户目录",
               not (REPO / ".gui_state.json.tmp").exists())
     except Exception as e:

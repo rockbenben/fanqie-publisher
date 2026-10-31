@@ -74,28 +74,10 @@ DEFAULT_DAYS_AHEAD = 3
 LEAD_MINUTES = 10
 
 
-def queue_tail_dt(items):
-    """平台队列排到哪一刻（datetime，精确到分）。没有待发布章返回 None。
-
-    只看待发布章的 timer_time——已发布的是过去，不构成"队列深度"。
-    """
-    tails = []
-    for it in items:
-        if it.get("display_status") != fu.DISPLAY_PENDING:
-            continue
-        try:
-            tt = int(it.get("timer_time") or 0)
-        except (TypeError, ValueError):
-            tt = 0
-        if tt:
-            tails.append(datetime.fromtimestamp(tt))
-    return max(tails) if tails else None
-
-
-def queue_tail_date(items, *, today=None):
-    """平台队列排到哪一天了（返回 date）。没有待发布章就返回今天。"""
-    dt = queue_tail_dt(items)
-    return dt.date() if dt else (today or datetime.now().date())
+# 队尾判据（queue_tail_dt / queue_tail_date）只有一份，在核心里：
+# fanqie_upload.queue_tail_dt。这里不抄第二份 —— GUI 的「自动接续」和命令行
+# 的续排必须算出**同一个**队尾，两份判据早晚会漂，漂了就出现「标签说排到
+# 9 月底、续排却从明天接着排」这种对不上的场面。
 
 
 def schedule_after(tail_dt, n, pub_time, per_day, *, now=None):
@@ -156,7 +138,7 @@ def plan_refill(items, num2path, *, days_ahead=DEFAULT_DAYS_AHEAD, per_day=9,
     schedule_after 接着队尾的**时刻**算，会先填满队尾那天剩下的时间点。
     """
     today = today or datetime.now().date()
-    tail = queue_tail_date(items, today=today)
+    tail = fu.queue_tail_date(items, today=today)
     # 夹到今天: tail 落在过去是真实情况（队列已经排干、或有待发布章的
     # 排期早就过了平台却没发出去），但起排日不能跟着回到过去——平台会拒
     # 掉定时到过去的章，而 --daily 没有 GUI 那个「日期已过去」确认框：
@@ -289,7 +271,7 @@ async def main_async(args):
             nums, start_date, need_days, tail, gaps = plan_refill(
                 items, num2path, days_ahead=args.days_ahead, per_day=per_day,
                 all_remaining=args.all, limit=args.limit)
-            schedule = schedule_after(queue_tail_dt(items), len(nums),
+            schedule = schedule_after(fu.queue_tail_dt(items), len(nums),
                                       pub_time, per_day)
             print_plan(items, nums, schedule, tail, need_days,
                        None if args.all else args.days_ahead, per_day)

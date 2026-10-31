@@ -7,7 +7,9 @@
 1. _visible_toast_texts：content 节点优先、display:none 退场残留过滤、
    message/notification 角色分离、宽选择器回退、去重
 2. BOOKS_JS：bookId/书名(URL编码段+链接文字回退)/章数/字数/状态提取
-3. LAST_PUBLISH_JS：跨行取最大时间、斜杠日期归一
+
+LAST_PUBLISH_JS 那条已删（2026-10-31）：它只扫章节管理页首页的十几行，
+「队列排到」改走 chapter_list 接口拿全书（fanqie_upload.queue_state）。
 
 运行:  python tests/test_js_blocks_browser2.py
 """
@@ -69,6 +71,8 @@ LASTPUB = """
 </tbody></table>
 </body></html>
 """
+# 注: LAST_PUBLISH_JS 已于 2026-10-31 删除（只扫首页十几行，队尾算不准），
+# 这份夹具随之不再被使用 —— 留着是为了记录它当年长什么样，方便对照。
 
 
 def main():
@@ -123,12 +127,12 @@ def main():
         check("books: 无名作品回退链接文字",
               b2 and b2["name"] == "无名书链接", f"name={b2 and b2['name']!r}")
 
-        # ---- 3. LAST_PUBLISH_JS ----
-        page.set_content(LASTPUB)
-        lp = page.evaluate(fu.LAST_PUBLISH_JS)
-        check("lastpub: 取最大时间且斜杠归一",
-              lp and lp["date"] == "2026-06-02" and lp["time"] == "21:30",
-              f"lp={lp}")
+        # ---- 3. LAST_PUBLISH_JS 已删除（2026-10-31）----
+        # 那个 JS 只扫章节管理页**首页**的十几行，按「最大时刻」取一行。
+        # 几千章的书，首页那点数据跟真实队尾毫无关系 —— 实测标签写着
+        # 第5191章，平台实际有5196章，末章还排在更早的时刻。「队列排到」
+        # 现在走 chapter_list 接口拿全书（fanqie_upload.queue_state）。
+        # 这里不再测一个已经不存在的常量。
     finally:
         try:
             browser.close()

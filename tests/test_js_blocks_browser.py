@@ -119,10 +119,16 @@ def main():
         check("单页: 编辑链接提取",
               c1 is not None and c1["editUrl"]
               and "publish" in c1["editUrl"], f"editUrl={c1 and c1['editUrl']}")
-        lp = r["lastPublish"]
-        check("单页: 最新发布时间取最大",
-              lp and lp["date"] == "2026-06-15" and lp["time"] == "09:00",
-              f"lastPublish={lp}")
+        # 2026-10-31：这个 JS 过去还返回一个「最大时刻」（lastPublish），那是
+        # 「队列排到」标签的唯一来源 —— 而「最大时刻」既不是队尾也不是末章，
+        # 队列排期错乱时标签就报错了章号（实测：写着第5191章，平台实际有
+        # 5196章）。队尾/末章统一由核心的 queue_state 按平台真状态算，
+        # 这里不再有第二份口径。
+        check("单页: 不再返回「最大时刻」那一行", "lastPublish" not in r,
+              f"keys={list(r)}")
+        _dates = sorted(c["time"] for c in chs if c.get("date"))
+        check("单页: 每章的排期日期照样抓得到",
+              _dates == ["08:00", "09:00", "10:00"], f"{_dates}")
 
         # ---- 2. 翻页 + 跨页去重 ----
         page.set_content(PAGED)

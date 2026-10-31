@@ -744,6 +744,14 @@ def print_audit(rep, plan, include_published=False):
         for _ln in _rev_lines:
             print(_ln, flush=True)
     print("\n—— 缺口体检 ——", flush=True)
+    # 未公开段排期错位（倒挂 / 撞时刻）：位置体检看不出这个，而它正是续排
+    # 出事的直接后果（2026-10-31 实测：位置全对，时刻全乱）。措辞与 GUI
+    # 同一份（fanqie_upload.schedule_order_lines），两边不该各说各话。
+    _sched_lines = fu.schedule_order_lines(rep)
+    if _sched_lines:
+        for _ln in _sched_lines:
+            print(_ln, flush=True)
+        print("", flush=True)
     print(f"A 未公开段位置不符: {len(rep['pending_bad'])} 个 → 本工具 --run 自动改",
           flush=True)
     first = next((e for e in plan if int(e.get("timer") or 0) > 0), None)

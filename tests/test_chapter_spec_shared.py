@@ -98,13 +98,21 @@ check("GUI 边界含等于", "(mt.timestamp() >= cutoff_ts) == (op != " in GUI)
 print()
 print("== 自动接续必须读真实缓存字段（不是不存在的那两个）==")
 # _EXTRACT_ALL_JS 产出的行是 {title, chapterNum, editUrl, status, date, time,
-# rowIndex}；缓存里**没有** display_status / timer_time。GUI 曾直接
-# .get("display_status", 1) / .get("timer_time", 0)，等于把每章都当「已发布、
-# 无定时」，队列末尾恒等于今天、起始日期恒为明天 —— 队列已排到 9 月底时勾自动
-# 接续，新章会全堆到明天起的已占用日期上，正是这个功能要防的事。
-check("GUI 从中文状态判待发布", '"待发布" in status' in GUI)
-check("GUI 从 date/time 换算 timer_time",
-      'c.get("date")' in GUI and "timestamp()" in GUI)
+# rowIndex}；接口那条路（api_items_to_rows）还带 display_status/timer_time/pos。
+# 曾直接 .get("display_status", 1) / .get("timer_time", 0)，等于把每章都当
+# 「已发布、无定时」，队列末尾恒等于今天、起始日期恒为明天 —— 队列已排到
+# 9 月底时勾自动接续，新章会全堆到明天起的已占用日期上，正是这个功能要防的。
+#
+# 2026-10-31：转换规则搬到核心里（fanqie_upload.rows_to_items）—— GUI 自己
+# 转一份、命令行转一份，两份判据早晚会漂，漂了就出现「标签说排到 9 月底、
+# 续排却从明天接着排」。这里守的就是「只有一份」。
+check("转换规则在核心里", "def rows_to_items(" in _FU)
+check("GUI 调用共用转换", "rows_to_items(cached)" in GUI)
+check("从中文状态认状态码", '"待发布": DISPLAY_PENDING' in _FU)
+check("已发布的不占坑位", '"已发布": DISPLAY_PUBLISHED' in _FU)
+check("从 date/time 换算 timer_time",
+      'c.get("date")' in _FU and "timestamp()" in _FU)
+check("GUI 不再自己转 items", '"display_status": MOVE_PENDING' not in GUI)
 check("GUI 不再默认 display_status",
       'c.get("display_status", 1)' not in GUI)
 check("GUI 不再默认 timer_time", 'c.get("timer_time", 0)' not in GUI)

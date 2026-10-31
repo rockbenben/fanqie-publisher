@@ -51,10 +51,16 @@ check("reschedule 用 _last_published", 'if mode == "reschedule":' in src and "s
 check("只有 edit 才停在「已索引」", 'if mode == "edit" or not lp:' in src)
 check("标签写「最后发布」", '"最后发布" if mode == "reschedule"' in src)
 
-print("== 合并所有卷时队尾取最晚的一卷 ==")
+print("== 合并所有卷时位置要换算成全书连续 ==")
+# 2026-10-31 改：队尾/末章统一由核心里那一份判据算（queue_state 按平台真
+# 状态），不再在 GUI 里挑「各卷里 date/time 最大的那个」。但合并时必须把
+# 卷内位置换算成全书位置 —— 否则末章和排期倒挂会按卷内位置算，跨卷的先后
+# 关系全错。
 src = inspect.getsource(fg.FanqieGUI._fetch_platform_chapters_for_edit)
-check("不再只留第一卷的 last_pub", "if lp and not last_pub:" not in src)
-check("按 date time 取最大", "if lp and (not last_pub or" in src)
+check("合并时给位置加卷偏移", '_c["pos"] = _p + _off' in src)
+check("不再挑各卷里最大的 last_pub", "if lp and (not last_pub or" not in src)
+check("队尾判据只有一份（核心的 queue_state）",
+      "queue_state" in inspect.getsource(fg.FanqieGUI._on_platform_chapters_fetched))
 
 print()
 if FAILED:
