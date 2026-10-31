@@ -182,9 +182,10 @@ def main():
               ok is True
               and json.loads(fu.AUTH_FILE.read_text(encoding="utf-8"))["cookies"][0]["value"] == "new",
               fu.AUTH_FILE.read_text(encoding="utf-8")[:80])
+        check("旧的 tmp 没有残留", not stale.exists())
         if os.name != "nt":
-            mode = stale.stat().st_mode & 0o777
-            check("残留 tmp 换成 0600（cookie 不该宽权限）",
+            mode = fu.AUTH_FILE.stat().st_mode & 0o777
+            check("目标文件权限为 0600（cookie 不该宽权限）",
                   mode == 0o600, oct(mode))
         else:
             print("     （Windows 上权限位不可观测，跳过权限断言）")
