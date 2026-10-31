@@ -30,10 +30,10 @@ try:
         deduplicate_titles, compute_schedule, validate_times,
         parse_chapter_spec, filter_by_chapter_spec, parse_time_spec,
         parse_datetime, TIMER_INPUT_FORMATS,
-        fetch_chapter_items, audit_chapter_positions, MOVE_WINDOW_H, chapter_title_num,
+        fetch_chapter_items, audit_chapter_positions, MOVE_WINDOW_H,
+        reader_view_around, review_status_lines,
         wait_book_list_ready, describe_book_page,
         DISPLAY_PENDING as MOVE_PENDING, DISPLAY_PUBLISHED as MOVE_PUBLISHED,
-        DISPLAY_REVIEW_FAILED as MOVE_REVIEW_FAILED,
         RENAME_RETRIES, RENAME_BACKOFF_S,
         fetch_draft_list, compress_chapter_nums,
         volume_count,
@@ -428,6 +428,9 @@ class FanqieGUI:
         self.uploading = False
         self._closing = False
         self._cancel_requested = False
+        # 工具子进程正在吐实时输出：这期间别让别的东西把预览面板整个换掉
+        # （跑着的时候改目录/筛选会重画面板，会把正在滚的进度冲没）。
+        self._tool_streaming = False
         # 上一次「检查缺口」的结论，供「章节重排…」预填区间用。
         # 带上 book_id：换书后位置含义完全不同，拿上一本的区间去填会写错书。
         self._last_audit = None
@@ -1728,12 +1731,55 @@ class FanqieGUI:
         self.txt_log.see(tk.END)
         self.txt_log.configure(state="disabled")
 
-    def _set_preview(self, text):
+    def _set_preview(self, text, *, tail=False):
+        if self._tool_streaming:
+            # 工具正在跑：实时输出不能被别的东西冲掉。改成追加，中间用横线
+            # 分隔，让人看得出这是另一段内容（多半是改了目录/筛选）。
+            self._append_preview("\n" + "-" * 46 + "\n" + text + "\n")
+            return
         self.txt_preview.configure(state="normal")
         self.txt_preview.delete("1.0", tk.END)
         self.txt_preview.insert("1.0", text)
         self.txt_preview.configure(state="disabled")
+        # tail=True：流式输出结束后把视图留在末尾（汇总在最后一段）。
+        # 不然替换内容的瞬间视图会弹回顶部，正在看进度的人会以为跑完了。
+        if tail:
+            self.txt_preview.see(tk.END)
         self._update_guidance()
+
+    def _append_preview(self, text):
+        """往「章节预览」面板追加内容（子进程工具的实时输出）。
+
+        为什么要有这个：这些工具跑在子进程里，原来用 capture_output 一次性
+        收结果、跑完才显示。几十章的重排要跑一两个小时，中途屏幕一动不动，
+        用户根本没法判断程序是死了还是在动（2026-10-31 反馈）。
+        """
+        if not text:
+            return
+        self.txt_preview.configure(state="normal")
+        self.txt_preview.insert(tk.END, text)
+        self.txt_preview.see(tk.END)
+        self.txt_preview.configure(state="disabled")
+
+    def _set_tool_progress(self, done, total):
+        """子进程工具的进度条（重排按章数推进）。"""
+        total = max(int(total), 1)
+        self.progress["maximum"] = total
+        self.progress["value"] = min(int(done), total)
+        self.lbl_progress.configure(text=f"{done}/{total}")
+
+    def _on_tool_line(self, step_rx, line):
+        """子进程吐一行：进预览面板；是进度行就推进度条。
+
+        step_rx 是工具模块自己定义的 STEP_PROGRESS_RE（CLI 打印、这里解析，
+        同一份格式定义）。认不出就只当普通日志行。
+        """
+        self._append_preview(line)
+        if step_rx is None:
+            return
+        m = step_rx.search(line)
+        if m:
+            self._set_tool_progress(int(m.group(1)), int(m.group(2)))
 
     def _export_log(self):
         """导出运行日志到文件。"""
@@ -4322,19 +4368,12 @@ class FanqieGUI:
         return _load_tool_module(name)
 
     def _reader_view_around(self, items, pos, span=2):
-        """位置 pos 前后各 span 个位置，读者在目录里实际看到的章号。
+        """读者目录里位置 pos 前后看到的章号。
 
-        报告「读者看到什么」比报告「哪些 item 错位」有用得多——前者才是作者在意的
-        后果（读到第694章之后突然接第480章），后者只是内部状态。倒挂章往往只有
-        几章，但底下被顶偏的可能是几百章，光看倒挂数完全看不出工作量。
+        实现在 fanqie_upload（共享核心）：GUI 的体检报告和 CLI 的重排收尾
+        要的是同一份，别各写一遍。
         """
-        by_pos = {x.get("pos", x["index"]): x for x in items}
-        out = []
-        for p in range(pos - span, pos + span + 1):
-            it = by_pos.get(p)
-            n = chapter_title_num(it["title"]) if it is not None else None
-            out.append(f"第{n}章" if n is not None else "（无章号）")
-        return out
+        return reader_view_around(items, pos, span=span)
 
     def _current_book_id(self):
         """当前选中作品的 book_id；没选返回 None。不弹窗、不做登录检查。
@@ -4616,9 +4655,12 @@ class FanqieGUI:
         pub = tk.BooleanVar(value=False)
         rng = tk.StringVar(value="")
         lim = tk.StringVar(value="")
-        # 闭环处理：跳过 / 用本地未发布章自动缓冲 / 选一个真实文本文件。
+        # 闭环处理：自动缓冲（默认）/ 跳过 / 选一个真实文本文件。
         # 合成提示会被平台按内容安全驳回，所以缓冲必须是真实正文。
-        buf_mode = tk.StringVar(value="skip")
+        # 默认自动解：闭环不解开，那一段的顺序就永远是错的，而且用户看不出
+        # 「为什么还有 9 章没改」。代价（换位期间某章正文短暂露出来）写在
+        # 下面的红字里，选「跳过」可以不接受这个代价。
+        buf_mode = tk.StringVar(value="auto")
         buf_file = tk.StringVar(value="")
 
         # 控件只建一次。place() 只负责摆放 —— 它被 pub 的 trace 每次切换都调一遍，
@@ -4638,9 +4680,9 @@ class FanqieGUI:
         head = ttk.Label(frm, text="", foreground="#5a5a5a", justify="left")
         lb_buf = ttk.Label(frm, text="闭环处理", font=("", 10, "bold"))
         rb_buf_skip = ttk.Radiobutton(
-            frm, text="跳过（默认）", variable=buf_mode, value="skip")
+            frm, text="跳过（闭环留着不动）", variable=buf_mode, value="skip")
         rb_buf_auto = ttk.Radiobutton(
-            frm, text="用本地未发布章节自动缓冲（会提前露出该章正文）",
+            frm, text="自动用本地未发布章节缓冲（会短暂露出该章正文）",
             variable=buf_mode, value="auto")
         rb_buf_file = ttk.Radiobutton(
             frm, text="选择真实文本文件（不剧透）",
@@ -4723,8 +4765,8 @@ class FanqieGUI:
                 text=(("⚠ 已发布的内容会被整章替换、重新送审，读者可能收到更新；"
                        "要等审核通过才在读者端生效。\n" if pub.get()
                        else "待发布章只改内容、排期不动，读者暂时看不到影响。\n")
-                      + "闭环（互相占着章号）默认跳过；可用真实正文缓冲来解："
-                        "本地未发布章节会提前露出正文，选文本文件则不剧透。"
+                      + "闭环（位置互相占着章号）默认自动用真实正文缓冲解开："
+                        "本地未发布章节会短暂露出正文，选文本文件则不剧透。"
                         "合成提示会被平台按内容安全驳回，不能用。\n"
                       + cost))
             warn.grid(row=11, column=0, columnspan=4, sticky="w", **pad)
@@ -4766,9 +4808,12 @@ class FanqieGUI:
             if n:
                 args += ["--limit", n]
             bdesc = ""
-            if buf_mode.get() == "auto":
+            if buf_mode.get() == "skip":
+                args += ["--no-buffer"]
+                bdesc = "；闭环不自动解（留着不动）"
+            elif buf_mode.get() == "auto":
                 args += ["--buffer-chapter", "auto"]
-                bdesc = "；闭环用本地未发布章节作真实缓冲（可能提前露出）"
+                bdesc = "；闭环用本地未发布章节作真实缓冲（可能短暂露出）"
             elif buf_mode.get() == "file":
                 p = (buf_file.get() or "").strip()
                 if not p:
@@ -4836,12 +4881,13 @@ class FanqieGUI:
         bm = re.search(r"用真实正文缓冲解\s*(\d+)\s*个闭环", out)
         if bm:
             rows.append(f"· 用真实正文缓冲解 {bm.group(1)} 个闭环"
-                        f"（换位期间可能提前露出，最后写回正确章节）")
+                        f"（换位期间那个位置会短暂露出该章正文，最后写回"
+                        f"正确章节）")
         cyc = re.search(r"跳过\s*(\d+)\s*个闭环", out)
         if cyc:
-            rows.append(f"· 另有 {cyc.group(1)} 个闭环会跳过：工具不写合成占位"
-                        f"（平台会按内容安全驳回），要解就在「闭环处理」里"
-                        f"选一种真实正文缓冲")
+            rows.append(f"· 还有 {cyc.group(1)} 个闭环没动：位置互相占着章号，"
+                        f"纯改写解不开；工具不写合成占位（平台会按内容安全驳回），"
+                        f"要解就在「闭环处理」里选一种真实正文缓冲")
         if "已发布" in (desc or ""):
             rows.append("· 已发布章的修改要过审：每章提交后等它真正生效再写下一章，"
                         "审核没跑完本次会暂停，等审完重跑继续")
@@ -4866,7 +4912,10 @@ class FanqieGUI:
         if not book_id:
             return
         script = SCRIPT_DIR / "tools" / name / (name + ".py")
-        base = [sys.executable, str(script), "--book-id", book_id,
+        # -u：子进程的输出必须实时到。管道下 Python 默认按块缓冲，不加 -u
+        # 的话进度会攒在缓冲区里一次性吐出来，界面看着还是「没动」——
+        # 那正是这次要解决的事。
+        base = [sys.executable, "-u", str(script), "--book-id", book_id,
                 "--content-dir", self._chapters_dir_for_tools()]
         if self.headless_var.get():
             base.append("--headless")
@@ -4876,27 +4925,57 @@ class FanqieGUI:
             base.append("--use-ai")
 
         state = {"extra": list(extra)}
+        # 进度行的格式跟工具模块共用一份（工具里定义的 STEP_PROGRESS_RE）：
+        # 两边各写一份必然对不上，界面会显示错的进度——比没有进度更糟。
+        step_rx = getattr(self._load_tool(name), "STEP_PROGRESS_RE", None)
 
         def run_cli(more, on_done):
             def work():
+                buf = []
                 try:
                     env = dict(os.environ, PYTHONIOENCODING="utf-8")
-                    r = subprocess.run(
-                        base + state["extra"] + list(more), capture_output=True,
+                    proc = subprocess.Popen(
+                        base + state["extra"] + list(more),
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         text=True, encoding="utf-8", errors="replace",
-                        cwd=str(SCRIPT_DIR), env=env, timeout=6 * 3600)
-                    out = (r.stdout or "") + (r.stderr or "")
+                        cwd=str(SCRIPT_DIR), env=env)
+                    # 6 小时上限照旧（原来靠 subprocess.run 的 timeout=）：
+                    # 改成流式读就拿不到那个参数了，用看门狗线程补上。
+                    timed_out = []
+                    def watchdog():
+                        try:
+                            proc.wait(timeout=6 * 3600)
+                        except subprocess.TimeoutExpired:
+                            timed_out.append(True)
+                            proc.kill()
+                    threading.Thread(target=watchdog, daemon=True).start()
+                    for line in proc.stdout:
+                        buf.append(line)
+                        self._after(0, self._on_tool_line, step_rx, line)
+                    proc.wait()
+                    out = "".join(buf)
+                    if timed_out:
+                        out += "\n⚠ 超过 6 小时仍未结束，已终止。"
                 except Exception as e:
-                    out = "启动失败: " + str(e)
+                    out = "".join(buf) + "\n启动失败: " + str(e)
                 self._after(0, on_done, out)
 
+            # 预览和真写入是两段输出，混在一起看不出哪段是刚跑的：
+            # 每次开跑先清空面板，再打这一段的开头，后面是实时追加。
+            # 顺序要紧：先清空（此时还没开流），再打开"流"（之后谁都不许冲掉它）。
+            self._set_preview(
+                (f"正在执行「{title}」（--run）…"
+                 if "--run" in list(more)
+                 else f"正在预览「{title}」…") + "\n")
+            self._tool_streaming = True
             # 重排/工具走子进程，读不到 _cancel_requested；预览结果在预览页
             self._set_uploading(True, cancellable=False, show_log=False)
             threading.Thread(target=work, daemon=True).start()
 
         def after_preview(out):
             self._set_uploading(False)
-            self._set_preview(out.strip() or "(无输出)")
+            self._tool_streaming = False
+            self._set_preview(out.strip() or "(无输出)", tail=True)
             # --limit 截断闭环等：工具明确说这次不会写，别再问"要不要执行"。
             if "本次不会写入" in out and "将改写" not in out:
                 self._notify("warning", title,
@@ -4920,7 +4999,8 @@ class FanqieGUI:
 
         def after_run(out):
             self._set_uploading(False)
-            self._set_preview(out.strip() or "(无输出)")
+            self._tool_streaming = False
+            self._set_preview(out.strip() or "(无输出)", tail=True)
             m2 = re.search(r"成功\s*(\d+)\s*失败\s*(\d+)", out)
             cyc = re.search(r"跳过\s*(\d+)\s*个闭环", out)
             skip = (f"；另有 {cyc.group(1)} 个闭环跳过，"
@@ -4943,7 +5023,6 @@ class FanqieGUI:
                 msg = f"详见预览面板{skip}。"
             self._notify("info", title + "完成", msg)
 
-        self._set_preview("正在预览「%s」…" % title)
         run_cli([], after_preview)
 
     def _audit_badge(self):
@@ -5113,28 +5192,12 @@ class FanqieGUI:
         """把体检结果渲染到预览面板（主线程）。"""
         rep = audit_chapter_positions(items)
         pend_bad = rep["pending_bad"]
-        # 已公开段里「位置 ≠ 章号」的整段。它才是 --include-published 要改的范围，
-        # 比 rep["expired"] 全（expired 只挑倒挂的，漏掉均匀偏移的那一大片）。
-        # 字段用 .get() 拿（跟 audit_chapter_positions 一样）：平台少给一个
-        # 字段时，这一行不该把整份报告带走。章号也只算一遍——原来算了两次
-        # （一次判 None、一次比大小），5291 个章要跑两轮正则。
-        def _pub_bad_pos(x):
-            pos = x.get("pos", x.get("index"))
-            ds = x.get("display_status")
-            # 审核不通过（display_status=7）的章也要算进来：平台没给「不可
-            # 修改」理由时它同样能改（实测）；把 7 排除掉的话区间会漏掉
-            # 位置 480/670。
-            if ds not in (MOVE_PUBLISHED, MOVE_REVIEW_FAILED):
-                return None
-            if ds == MOVE_REVIEW_FAILED and (x.get("cant_modify_reason") or "").strip():
-                return None
-            n = chapter_title_num(x.get("title") or "")
-            if n is None or n == pos:
-                return None
-            return pos
-
-        pub_bad = sorted(p for p in (_pub_bad_pos(x) for x in items)
-                         if p is not None)
+        # 已公开段里「位置 ≠ 章号」的整段 —— 就是 --include-published 要改的范围。
+        # 判据在 fanqie_upload.audit_chapter_positions 里（CLI 的体检用同一份），
+        # 这里不再自己算一遍：两份判据早晚会漂，漂了就出现「GUI 说 32 章、
+        # 改写时却改了 33 章」这种对不上的场面。
+        misplaced = rep.get("misplaced_pub") or []
+        pub_bad = sorted(r["index"] for r in misplaced)
         # 存给「章节重排…」的选项对话框预填。带上 book_id：换书后位置含义完全
         # 不同，拿上一本的区间去填等于写错书。
         self._last_audit = {"at": datetime.now(), "book_id": self._current_book_id(),
@@ -5159,6 +5222,11 @@ class FanqieGUI:
                       f"后面这 {blk['blocked']} 章就一直卡着不发布",
                       "!" * 60, ""]
         lines += ["缺口体检", "=" * 60]
+        # 审核状态单列一段：原来只有「卡队列」那种会报，散着的审核中/被驳回
+        # 章一个字都不提，作者不知道有几章动不了（2026-10-31 用户反馈）。
+        _rev_lines = review_status_lines(rep)
+        if _rev_lines:
+            lines += ["审核状态", "-" * 60] + _rev_lines + [""]
         # 整份报告的组织方式：三段各自只回答四件事——坏在哪 / 改多少 /
         # 怎么点 / 代价，一行一样。取证信息（页面旁证、命令行写法、原理推导）
         # 只在可疑时才展开：那是排查用的，正常读报告的人不需要，
@@ -5184,35 +5252,44 @@ class FanqieGUI:
                 lines.append(f"   ⚠ 位置 {pend_lo} 只剩 {left_h / 24:.1f} 天就发出，"
                              f"余量已不足 3 天 —— 今天就得补跑")
         lines.append("")
-        lines.append(f"B 已公开、发布 3 天内（App 里还能移动位置）："
-                     f"{len(rep['in_window'])} 章")
-        for r in rep["in_window"]:
-            lines.append(f"   第{r['num']}章（现在位置 {r['index']}），"
+        # B 段只列**真要动**的章：位置不对、确实被挤到后面、且还在 3 天窗口内。
+        # 原来这里用的是「章号 < 前面最大章号」的倒挂集合，于是把位置明明正确
+        # 的章（实测：第1121章在1121）也列进来，还教用户去 App 移动它——
+        # 移动一个位置正确的章没有任何用处（2026-10-31 用户反馈）。
+        movable = rep["in_window"]
+        lines.append(f"B 已公开、位置与章号不符、发布 3 天内"
+                     f"（App 里还能移动位置）：{len(movable)} 章")
+        for r in movable:
+            lines.append(f"   第{r['num']}章（现在位置 {r['index']}，"
+                         f"应该在位置 {r['num']}），"
                          f"窗口还剩 {r['left_h']:.1f} 小时")
-        if rep["in_window"]:
+        if movable:
             lines.append("   修：手机 App 申请调整 → 通过后选中该章 → 移动位置"
                          "（只动这一章，不用重写内容）")
         lines.append("")
-        exp = rep["expired"]
         n_bad = len(pub_bad)
         lo, hi = (min(pub_bad), max(pub_bad)) if n_bad else (0, 0)
         if n_bad:
-            # 倒挂的章（位置在某章之后却装更小的章号）可能一个都没有——
-            # 整段均匀偏移时就是这样。所以首行报的是**要改的章数**，不是倒挂数：
+            # 首行报的是**要改的章数**（位置与章号对不上的那些），不是倒挂数：
             # 两者差两个数量级，只报倒挂会让人以为「修 3 章就完事」。
-            lines.append(f"C 已公开段顺序错位：{n_bad} 章（位置 {lo}-{hi}）")
-            if exp:
-                view = self._reader_view_around(items, exp[0]["index"], span=2)
+            lines.append(f"C 已公开段位置与章号不符：{n_bad} 章（位置 {lo}-{hi}）")
+            brk = rep.get("order_break") or {}
+            if brk.get("at"):
+                view = self._reader_view_around(items, brk["at"], span=2)
                 if view:
                     lines.append("   读者目录现在看到：… " + " → ".join(view) + " …")
-                # 点名是哪几章顺序断裂。只给「其中 3 章」这个数字的话，用户还得
-                # 自己回目录里找那 3 章。它紧跟上面那串，因为它就是那串的解释。
-                _bad = "、".join(f"第{r['num']}章(在{r['index']})" for r in exp[:5])
-                _more = f"…共{len(exp)}章" if len(exp) > 5 else ""
-                _pron = "它们" if len(exp) > 1 else "它"
-                _tail = (f"；其余 {n_bad - len(exp)} 章是被{_pron}带偏的，"
-                         f"内容同样要换") if n_bad > len(exp) else ""
-                lines.append(f"   顺序断裂的是 {len(exp)} 章：{_bad}{_more}{_tail}")
+                # 断点只用来解释「顺序从哪儿开始乱的」。被隔断的那 N 章里，
+                # 绝大多数位置本身是对的（实测：第481章在481）——把它们说成
+                # 「顺序断裂的章」就是报假错（2026-10-31 用户反馈）。
+                lines.append(f"   顺序断在位置 {brk['at']}：从那儿往后 "
+                             f"{brk['affected']} 章的顺序被隔断"
+                             f"（它们自己的位置大多是对的，重排会自动跳过）")
+            # 点名要改的是哪几章：位置 + 它现在装的是什么。只给个数字的话，
+            # 用户得自己回目录里一个个找。
+            _bad = "、".join(f"位置{r['index']} 装第{r['num']}章"
+                             for r in misplaced[:5])
+            _more = f"…共{n_bad}章" if n_bad > 5 else ""
+            lines.append(f"   要改的就是这 {n_bad} 章：{_bad}{_more}")
             lines.append(f"   修：点「章节重排…」选『已公开段』，"
                          f"再点「填入 {lo}-{hi}」")
             cost = "要重写线上内容并重新过审，读者可能收到更新"
@@ -5223,17 +5300,17 @@ class FanqieGUI:
             if span_n != n_bad:
                 lines.append(f"   注：区间里另有 {span_n - n_bad} 章本来就对，"
                              f"会自动跳过")
-            if rep["in_window"]:
-                lines.append(f"   注：B 段那 {len(rep['in_window'])} 章窗口一关"
+            if movable:
+                lines.append(f"   注：B 段那 {len(movable)} 章窗口一关"
                              f"就落进 C 段，本次改写也会覆盖它们")
 
         else:
             lines.append("C 已公开段：正常")
         self._set_preview("\n".join(lines))
-        if rep["in_window"]:
+        if movable:
             self._notify(
                 "warning", "有章节还能救",
-                f"{len(rep['in_window'])} 章已公开但顺序错位，还在 3 天移动窗口内。"
+                f"{len(movable)} 章已公开但位置与章号不符，还在 3 天移动窗口内。"
                 f"详见预览面板，尽快去手机 App 申请移动。")
         elif pub_bad:
             # 弹窗比面板短，只说工作量差两个数量级这件事 + 去哪儿点。细节留面板。

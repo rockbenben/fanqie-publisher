@@ -170,6 +170,7 @@ print("[B6 体检结果 → 徽标的接线]")
 class RenderSelf(Stub):
     _render_audit = FanqieGUI._render_audit
     _compress_nums = staticmethod(FanqieGUI._compress_nums)
+    _reader_view_around = FanqieGUI._reader_view_around
 
     def __init__(self, books=None, selected=-1):
         super().__init__(books, selected)
@@ -273,6 +274,40 @@ FanqieGUI._note_review_block(s9, None, "111")
 check("B9 体检一次之后，老数据被清掉",
       "review_block" not in s9._gui_state, str(s9._gui_state))
 check("B9 清掉之后徽标不再显示", badge_text(s9) == "检查缺口", badge_text(s9))
+
+print("[B10 报告不许把位置正确的章报成错]")
+# 2026-10-31 实测（用户反馈「位置很多明明是正确的，你为什么报错？」）：
+# 位置 2 卡着第5290章，它后面每一章都比它小。按「章号 < 前面最大章号」判倒挂，
+# 后面三章全进「顺序断裂」清单——可它们位置明明是对的（第3章在3、第4章在4…）。
+# 报告照抄那份清单，用户看到的就是一堆假错。
+
+
+def _overshoot_items():
+    out = []
+    for p in (1, 3, 4, 5):
+        out.append({"index": p, "pos": p, "title": f"第{p}章 甲",
+                    "display_status": 1, "create_time": 0, "timer_time": 0,
+                    "item_id": f"i{p}", "cant_modify_reason": ""})
+    out.append({"index": 2, "pos": 2, "title": "第5290章 甲",
+                "display_status": 1, "create_time": 0, "timer_time": 0,
+                "item_id": "i2", "cant_modify_reason": ""})
+    return out
+
+
+rs10 = RenderSelf(BOOKS, selected=0)
+FanqieGUI._render_audit(rs10, _overshoot_items(), None, "111")
+check("B10 C 段只数位置不对的那一章",
+      "C 已公开段位置与章号不符：1 章" in rs10.preview, rs10.preview)
+check("B10 B 段不再叫用户去移动位置正确的章",
+      "B 已公开、位置与章号不符、发布 3 天内（App 里还能移动位置）：0 章"
+      in rs10.preview, rs10.preview)
+check("B10 报告里没有「顺序断裂的是 N 章」那种清单",
+      "顺序断裂的是" not in rs10.preview, rs10.preview)
+check("B10 顺序断点单独说明，并说清被隔断的章位置是对的",
+      "顺序断在位置 3" in rs10.preview
+      and "它们自己的位置大多是对的" in rs10.preview, rs10.preview)
+check("B10 点名要改的是哪一章（位置 + 现在装的是什么）",
+      "位置2 装第5290章" in rs10.preview, rs10.preview)
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

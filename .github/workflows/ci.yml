@@ -39,8 +39,11 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
 
-      # 部分测试 import fanqie_gui，需要 tkinter 能 import（不需要显示器，
-      # 没有任何测试会创建 Tk 窗口，所以不用 xvfb）。Windows 自带 tkinter。
+      # 部分测试 import fanqie_gui，需要 tkinter 能 import（不需要显示器）。
+      # 现在有两个测试**会**创建 Tk 窗口（tests/test_gui_start.py、
+      # tests/test_dialog_placement.py）：没有显示环境时它们自己跳过（不算失败），
+      # 所以这里仍然不用 xvfb——代价是弹窗摆位那条守卫在 Linux CI 上不会被跑到。
+      # Windows 自带 tkinter，那两个测试在 Windows CI 上是真跑的。
       - name: 安装 tkinter (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y python3-tk

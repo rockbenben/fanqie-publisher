@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fanqie_upload import (  # noqa: E402
     find_missing_after_batch, audit_chapter_positions, chapter_title_num,
-    find_review_block,
+    find_review_block, review_status_lines,
     volume_count, global_position, VOLUME_INDEX_STRIDE,
     verify_content_matches_book,
     DISPLAY_PUBLISHED, DISPLAY_PENDING,
@@ -75,6 +75,41 @@ check("窗口内倒挂→B段", [r["num"] for r in rep["in_window"]] == [2])
 check("超窗口倒挂→C段", [r["num"] for r in rep["expired"]] == [3])
 check("B段剩余小时数正确", 70 < rep["in_window"][0]["left_h"] < 72)
 
+print("== 位置体检: 一章冲到前面，不许把它后面正确的章全报成错 ==")
+# 2026-10-31 实测（用户反馈「位置很多明明是正确的，你为什么报错？」）：
+# 位置 480 卡着第5290章，它后面每一章都比它小——按「章号 < 前面最大章号」
+# 判倒挂的话，后面 640 章全被判成「顺序断裂」，可其中绝大多数位置是对的
+# （第481章在481、第482章在482…）。报告照抄那份清单 = 报假错。
+overshoot = [item(1, "第1章", ct=NOW - 200 * H),
+             item(2, "第5290章", ct=NOW - 200 * H),      # 冲到前面的那一章
+             item(3, "第3章", ct=NOW - 200 * H),        # 位置对
+             item(4, "第4章", ct=NOW - 200 * H),        # 位置对
+             item(5, "第5章", ct=NOW - 1 * H)]          # 位置对、刚发布
+rep = audit_chapter_positions(overshoot, now_ts=NOW, window_h=72)
+check("只有位置≠章号的那一章进改写范围",
+      [r["index"] for r in rep["misplaced_pub"]] == [2], rep["misplaced_pub"])
+check("位置正确的章不进 B 段（App 移动对它们毫无意义）",
+      rep["in_window"] == [], rep["in_window"])
+check("位置正确的章不进 C 段",
+      rep["expired"] == [], rep["expired"])
+check("顺序断点指到第一个被隔断的位置",
+      rep["order_break"]["at"] == 3, rep["order_break"])
+check("断点之后被隔断的章数单独报（不混进「要改的章数」）",
+      rep["order_break"]["affected"] == 3, rep["order_break"])
+
+print("== 位置体检: 改写范围 = remap --include-published 的范围 ==")
+# 位置≠章号的已发布章 + 审核不通过但平台仍允许改的章，两边都要在。
+mixed = [item(1, "第5章", ct=NOW - 200 * H),                 # 位置不对
+         item(2, "第2章", ct=NOW - 200 * H),                 # 位置对
+         dict(item(3, "第9章", ds=7), cant_modify_reason=""),  # 被驳回、仍可改
+         dict(item(4, "第9章", ds=7), cant_modify_reason="完结作品不可修改")]
+rep = audit_chapter_positions(mixed, now_ts=NOW)
+check("改写范围 = 位置不对的已发布章 + 仍可改的被驳回章",
+      [r["index"] for r in rep["misplaced_pub"]] == [1, 3],
+      rep["misplaced_pub"])
+check("被驳回章不进 B 段（它从没发布过，没有 App 移动窗口）",
+      rep["in_window"] == [], rep["in_window"])
+
 print("== 位置体检: 未公开段 ==")
 pend = [item(1, "第1章"), item(2, "第9章", ds=DISPLAY_PENDING, tt=NOW + 50 * H),
         item(3, "第3章", ds=DISPLAY_PENDING, tt=NOW + 60 * H)]
@@ -82,6 +117,44 @@ rep = audit_chapter_positions(pend, now_ts=NOW)
 check("位置≠章号→A段", rep["pending_bad"] == [2])
 check("位置==章号→不进A段", 3 not in rep["pending_bad"])
 check("已公开的不进A段", 1 not in rep["pending_bad"])
+
+print("== 位置体检: 审核中 / 被驳回的章要说清楚 ==")
+# 2026-10-31 用户反馈：整书检查时，会看有没有章节在审核或被拒绝吗？
+# 原来只有「卡队列」那一种会报，散着的审核中/被驳回章一个字都不提。
+_rev_items = [
+    item(1, "第1章", ct=NOW - 100 * H),
+    dict(item(2, "第9章", ds=4), cant_modify_reason="审核中暂不支持修改"),
+    dict(item(3, "第5章", ds=4), cant_modify_reason="审核中暂不支持修改"),
+    dict(item(4, "第9章", ds=7), cant_modify_reason=""),
+    dict(item(5, "第5章", ds=7), cant_modify_reason="完结作品不可修改"),
+]
+_rep = audit_chapter_positions(_rev_items, now_ts=NOW)
+check("审核中的章被记下来", [r["index"] for r in _rep["reviewing"]] == [2, 3],
+      _rep["reviewing"])
+check("审核中的章标出「位置也不对」（审完再跑就能改）",
+      all(r["wrong"] for r in _rep["reviewing"]), _rep["reviewing"])
+check("被驳回的章被记下来", [r["index"] for r in _rep["rejected"]] == [4, 5],
+      _rep["rejected"])
+check("被驳回且平台没给理由→改得动",
+      [r["editable"] for r in _rep["rejected"]] == [True, False],
+      _rep["rejected"])
+check("改得动的被驳回章也算进改写范围",
+      4 in [r["index"] for r in _rep["misplaced_pub"]],
+      _rep["misplaced_pub"])
+_lines = review_status_lines(_rep)
+_txt = "\n".join(_lines)
+check("清单说清审核中有几章、什么位置",
+      "审核中 2 章" in _txt and "位置 2-3" in _txt, _txt)
+check("清单说清被驳回的有几章",
+      "被平台驳回 2 章" in _txt, _txt)
+check("清单说清哪些改得动、哪些改不动",
+      "改得动" in _txt and "改不动" in _txt, _txt)
+check("清单说清改不动的为什么改不动",
+      "完结作品不可修改" in _txt, _txt)
+check("清单说清有几章白等（位置也不对）",
+      "位置也不对" in _txt, _txt)
+check("没有这类章时不加这段",
+      review_status_lines(audit_chapter_positions([_rev_items[0]], now_ts=NOW)) == [])
 
 print("== 章号解析与平台标题对称（裸数字标题也认） ==")
 check("裸数字+空格", chapter_title_num("1 开端") == 1)

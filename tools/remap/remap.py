@@ -31,9 +31,9 @@
   改写永远解不开：番茄拒绝同名/同段落章节，先写环上哪一章，它要的章号都还在
   环上另一个位置。2026-10-30 实测：用合成「调整中」占位破环会被平台按内容
   安全规范驳回（本章打卡字数清零）。所以工具**不生成任何合成占位正文**：
-  默认整环跳过、报出来；可用 --buffer-chapter（本地高于平台末尾的未发布
-  章节的真实正文，会提前露出）或 --buffer-file（真实文本文件，不剧透）给
-  真实正文缓冲，解第一个闭环，最后写回正确章节。要过审的章（已公开/被驳回）
+  默认自动用真实正文解开（本地未发布章节，一个闭环一份；加 --no-buffer 改为整环跳过）；
+  也可用 --buffer-file（真实文本文件，不剧透）指定缓冲。无人值守（--daily）默认不自动解。
+  换位完成后会写回正确章节。要过审的章（已公开/被驳回）
   提交后必须等平台生效再写依赖它的下一章，审核没跑完就暂停，等审完重跑继续。
 
   为什么要开这个开关: 已公开段的错位是**位移**而不是缺章 —— 有几章被顶到书尾
@@ -67,9 +67,9 @@
   修已公开段的顺序错位（会改写已发布内容，务必先看 dry-run）:
   python tools/remap/remap.py --include-published --range 480-694          # 先看计划
   python tools/remap/remap.py --include-published --range 480-694 --run     # 真写入
-  # 计划报「闭环」时默认整环跳过；用真实正文缓冲解开（本地未发布章/指定文件）：
-  python tools/remap/remap.py --include-published --range 670-694 --buffer-chapter auto --run
-  python tools/remap/remap.py --include-published --range 670-694 --buffer-file buffer.md --run
+  # 闭环默认自动用未发布章解开；加 --no-buffer 整环跳过；也可用 --buffer-file：
+  python tools/remap/remap.py --include-published --range 480-694 --no-buffer --run
+  python tools/remap/remap.py --include-published --range 480-694 --buffer-file buffer.md --run
 
   python tools/remap/remap.py --daily            # 无人值守日常跑（写日志+告警弹窗）
   python tools/remap/remap.py --self-check       # 纯离线自检
@@ -102,6 +102,11 @@ _VERIFY_WINDOW_S = 600  # 批末复核最多等多久（平台审核滞后，10 
 _VERIFY_POLL_S = 45     # 复核轮询间隔
 _APPLY_WINDOW_S = 600   # 单章提交后等平台审核/生效的窗口；超时就暂停，等重跑
 _APPLY_POLL_S = 30
+_HEARTBEAT_S = 30       # 单章操作超过这么久就报一次「还在动」
+# 进度行的格式只有这一份定义：CLI 打印它，GUI 靠它把子进程的输出变成
+# 进度条。两边各写一份必然对不上（改了一边忘了另一边，用户看到的是错的
+# 进度——比没有进度更糟）。
+STEP_PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]")
 
 
 def _ts(v):
@@ -241,8 +246,8 @@ def _one_cycle(left, deps):
     return path[seen[cur]:]
 
 
-def resolve_write_plan(entries, holders, buffer_num=None):
-    """排写入顺序；闭环默认跳过，给了真实缓冲章号时用它解第一个闭环。
+def resolve_write_plan(entries, holders, buffer_nums=None):
+    """排写入顺序；闭环默认跳过，给了真实缓冲章号时用它解闭环。
 
     平台给每个位置判章号唯一性，而重排是**置换**不是覆盖：位置 i 要写第 i 章，
     可第 i 章此刻还装在另一个位置上（p(i) = 现在装着第 i 章的位置）。约束就是
@@ -251,13 +256,17 @@ def resolve_write_plan(entries, holders, buffer_num=None):
     缓冲必须是**真实正文**（本地未发布章节/用户给的场景），而且章号不能已经
     在平台目录里：先把它写到环上某位置，旧章号腾出来后按依赖换完整环，
     最后写回正确章。
-    没有 buffer_num 时闭环整环跳过、报出来。
+
+    buffer_nums: 真实正文缓冲的章号列表，**一个闭环一个**（用同一个号解两个
+    环会撞重名：前一个环还没把缓冲章写回去，后一个又写了一遍）。
+    数量不够时，多出来的闭环照样整环跳过、报出来。
 
     返回 (steps, dropped, cycles):
-      steps   = [{"entry": e, "placeholder": bool}]，按执行顺序；placeholder=True
-                的是真实缓冲写入（位置 e，内容是 buffer 文本）。
+      steps   = [{"entry": e, "placeholder": bool, "buffer_num": int|None}]，
+                按执行顺序；placeholder=True 的是真实缓冲写入（位置 e，
+                内容是 buffer_num 那章的正文）。
       dropped = 写了必然重名的 entry（含被跳过闭环连带卡住的，已排序）。
-      cycles  = 被跳过的闭环（不含已用缓冲解开的那个），每项是位置列表。
+      cycles  = 被跳过的闭环（不含已用缓冲解开的那些），每项是位置列表。
     """
     by_i = {e["index"]: e for e in entries}
     # 目标章号的持有位置不在本轮改写范围 → 永远腾不出来，连锁到不动点。
@@ -278,13 +287,13 @@ def resolve_write_plan(entries, holders, buffer_num=None):
 
     deps = {i: {h for h in (holders.get(by_i[i]["want_num"]) or ())
                 if h in live} for i in live}
-    events = {}          # 负数事件号 -> 缓冲断点 entry
+    events = {}          # 负数事件号 -> 缓冲断点 {entry, buffer_num}
     cycles = []
-    buffer_used = False
+    buffers = list(buffer_nums or [])
 
     def _key(n):
         if n < 0:
-            return (1, events[n]["index"])
+            return (1, events[n]["entry"]["index"])
         return (0, by_i[n]["index"])
 
     while deps:
@@ -294,13 +303,13 @@ def resolve_write_plan(entries, holders, buffer_num=None):
         cyc = _one_cycle(left, deps)
         if not cyc:
             raise RuntimeError(f"依赖图有环却找不到环: {sorted(left)[:10]}")
-        if buffer_num is not None and not buffer_used:
-            # 用真实正文解第一个闭环：缓冲写入断点，断点的旧章号腾出来，
+        if buffers:
+            # 用真实正文解这个闭环：缓冲写入断点，断点的旧章号腾出来，
             # 依赖它的位置改等缓冲事件；断点自己的真实写入排在最后。
-            buffer_used = True
+            bn = buffers.pop(0)
             b = min(cyc)
             ev = -(len(events) + 1)
-            events[ev] = by_i[b]
+            events[ev] = {"entry": by_i[b], "buffer_num": bn}
             for x in deps:
                 if b in deps[x]:
                     deps[x].discard(b)
@@ -335,9 +344,11 @@ def resolve_write_plan(entries, holders, buffer_num=None):
     steps = []
     for n in order:
         if n < 0:
-            steps.append({"entry": events[n], "placeholder": True})
+            steps.append({"entry": events[n]["entry"], "placeholder": True,
+                          "buffer_num": events[n]["buffer_num"]})
         else:
-            steps.append({"entry": by_i[n], "placeholder": False})
+            steps.append({"entry": by_i[n], "placeholder": False,
+                          "buffer_num": None})
     return steps, dropped, cycles
 
 
@@ -364,11 +375,15 @@ def reviewing_in_scope(items, lo=0, hi=10 ** 9):
 
 
 
-def check_applied(before, after, want_num):
+def check_applied(before, after, want_num, notes=None):
     """对账: 平台回读结果是否就是我们要的。返回 None=通过，否则返回失败原因。
 
     标题号与排期都必须对上，任何一项不成立都说明"提交看起来成功但实际没生效"，
     这正是漏 151 章那类静默失败——宁可当失败中止，也不能记成功往下跑。
+
+    notes: 可选。给了就把"状态跟预期不一样"的提示塞进这个列表（由调用方
+    汇总成一行打印），不给就直接打印。直接打印的话，一批 23 章改已发布段
+    就会刷出 23 行一模一样的提示（2026-10-31 实测），日志被噪音埋掉。
     """
     if after is None:
         return "回读不到该 item（平台状态未知）"
@@ -379,10 +394,20 @@ def check_applied(before, after, want_num):
     # 判据是标题号和排期。而 remap 是失败即停，为状态变化停掉整批代价太大
     # （每天额度有限、余量只有几天）。异常状态只提示，下一轮会重新对账。
     # 实测(2026-08-20): 改 82 个待发布章，状态全程保持 10，未见转审核中。
-    if after["display_status"] != fu.DISPLAY_PENDING:
-        print(f"    （注意：状态变成 {after['display_status']}，"
-              f"多为审核滞后或排期已触发；标题与排期已核对无误，按成功计）",
-              flush=True)
+    #
+    # 比的是「这一章本来就该有的状态」，不是一律跟"待发布"比：已发布章改完
+    # 仍然是已发布（status=1），拿"不是待发布"当异常，它每次都会被报成状态
+    # 变了——一批 9 章已发布段就是 9 条假提示（2026-10-31 实测）。
+    _want_status = (fu.DISPLAY_PUBLISHED if before.get("published")
+                    else fu.DISPLAY_PENDING)
+    if after["display_status"] != _want_status:
+        _msg = (f"    （注意：状态是 {after['display_status']}"
+                f"（应为 {_want_status}），多为审核滞后或排期已触发；"
+                f"标题与排期已核对无误，按成功计）")
+        if notes is None:
+            print(_msg, flush=True)
+        else:
+            notes.append(_msg)
 
     # 已公开/曾被驳回的章都没有有效排期：它们的 timer_time 里留的是当初的
     # 定时（已公开的按 create_time 算发布时刻），拿它当判据会把「压根没动」
@@ -398,6 +423,59 @@ def check_applied(before, after, want_num):
 
 def fmt(ts):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "—"
+
+
+def fmt_dur(seconds):
+    """把秒数说成人话：48 秒 / 3 分 12 秒 / 1 小时 20 分。"""
+    s = int(max(0, round(seconds)))
+    if s < 60:
+        return f"{s} 秒"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m} 分 {sec} 秒" if sec else f"{m} 分"
+    h, m = divmod(m, 60)
+    return f"{h} 小时 {m} 分" if m else f"{h} 小时"
+
+
+def step_line(n, total, body, eta=""):
+    """进度行的唯一格式（认它的地方见 STEP_PROGRESS_RE）。
+
+    eta 传空串时**不留尾随空格**——进度行会刷几百行，尾巴上一个空格看着
+    像少了半个字段。
+    """
+    return f"[{n}/{total}] {body}" + (f" {eta}" if eta else "")
+
+
+def eta_hint(elapsed_s, done, left):
+    """按已完成的步数平均估剩余时间。
+
+    少于 2 步不给预估：两个样本的平均是骗人，宁可不说。
+    """
+    if done < 2 or left <= 0:
+        return ""
+    per = elapsed_s / done
+    return f"（已用 {fmt_dur(elapsed_s)}，预计还需 {fmt_dur(per * left)}）"
+
+
+async def with_heartbeat(coro, label, interval_s=_HEARTBEAT_S):
+    """跑一个可能很慢的操作，途中定期报一次「还在动」。
+
+    为什么需要（2026-10-31 用户反馈：重排中一直不知道是否再动）：
+    改写一章要开编辑器、清空旧稿、灌正文、等平台保存，这一段可能一分多钟
+    一个字都不吐。屏幕上一动不动，用户只能猜程序是死了还是真在动。
+    间隔到了就报一次当前动作和已用时间——让"还在动"变成看得见的事实。
+
+    心跳本身不影响语义：超时只是再等一轮，真正的结果照旧从 coro 里取。
+    """
+    task = asyncio.ensure_future(coro)
+    t0 = time.monotonic()
+    while True:
+        done, _pending = await asyncio.wait({task},
+                                           timeout=max(interval_s, 0.01))
+        if done:
+            return task.result()
+        print(f"    ⏳ {label} 还在进行"
+              f"（已用 {fmt_dur(time.monotonic() - t0)}）…", flush=True)
 
 
 async def wait_applied(page, book_id, pos, want_num, *,
@@ -431,63 +509,83 @@ async def wait_applied(page, book_id, pos, want_num, *,
         await page.wait_for_timeout(poll_s * 1000)
 
 
-def resolve_buffer(args, num2path, holders, platform_max=0):
-    """解析 --buffer-chapter / --buffer-file，返回 (章号, 路径, 错误)。
+def resolve_buffers(args, num2path, holders, platform_max=0, n_cycles=0,
+                    allow_auto=True):
+    """解析闭环用的真实正文缓冲，返回 (buffers, err)。
+
+    buffers = [{"num": 章号, "path": 路径}, ...]，**一个闭环一个**。
+    为什么不能一个缓冲解多个闭环：缓冲章号在环转完写回正确章节之前一直占着
+    那个位置，第二个闭环再写同一个号就是重名（平台直接拒）。
+
+    三种来源：
+      --buffer-file PATH   指定真实文本文件（不剧透）；只解一个闭环。
+      --buffer-chapter N   指定本地某章的真实正文；只解一个闭环。
+      --buffer-chapter auto / 什么都没给  自动挑：平台末尾之后的未发布章，
+                           按章号从小到大取 n_cycles 个。
 
     两条硬约束：章号不能已在平台目录里（写进去就是重名）；正文按平台的
     非空白字符口径至少 1000 字。
     --buffer-chapter 还要求**平台末尾之后**：平台中段的标题缺号可能只是位置
     错位/缺号，正文仍挂在别的标题下，拿它当缓冲会撞重名。--buffer-file 是
     用户自己挑的一段真实场景，不受"末尾之后"这条限（内容有没有已经在平台
-    上由用户自己保证）。auto 取末尾后的最小章号。
+    上由用户自己保证）。
+
+    allow_auto=False（--no-buffer / 无人值守 --daily）时不给参数就一个也不给：
+    闭环整环跳过并报出来。无人值守不自动解，是因为缓冲会让某一章的正文在
+    读者端短暂露出来——没人盯着的时候不该替作者做这个决定。
     """
     file_arg = getattr(args, "buffer_file", None)
     chap_arg = getattr(args, "buffer_chapter", None)
+    want = []
     if file_arg:
         p = Path(file_arg)
         if not p.is_file():
-            return None, None, f"缓冲文件不存在: {p}"
-        cnum, _title, content = fu.parse_md_file(p)
-        buffer_path = str(p)
-    elif chap_arg:
-        if str(chap_arg).strip().lower() == "auto":
-            cand = sorted(n for n in num2path
-                          if n > platform_max and n not in holders)
-            if not cand:
-                return None, None, ("本地没有高于平台末尾的未发布章节"
-                                    "可用作缓冲")
-            num = cand[0]
-        else:
-            try:
-                num = int(chap_arg)
-            except (TypeError, ValueError):
-                return None, None, "--buffer-chapter 要填章号或 auto"
-            if num not in num2path:
-                return None, None, f"本地缺第{num}章文件"
+            return [], f"缓冲文件不存在: {p}"
+        want.append({"num": None, "path": str(p)})
+    elif chap_arg and str(chap_arg).strip().lower() != "auto":
+        try:
+            num = int(chap_arg)
+        except (TypeError, ValueError):
+            return [], "--buffer-chapter 要填章号或 auto"
+        if num not in num2path:
+            return [], f"本地缺第{num}章文件"
         if num <= platform_max:
-            return None, None, (f"第{num}章不高于平台末尾（{platform_max}）："
-                                f"中段缺号很可能正文仍在平台上（换个标题挂着），"
-                                f"当缓冲会撞重名。请用高于末尾的未发布章节，"
-                                f"或 --buffer-file 指定一段真实场景")
-        if num in holders:
-            return None, None, (f"第{num}章在平台目录里已存在，"
-                                f"不能当缓冲（会撞重名）；用 auto 或换一章")
-        buffer_path = num2path[num]
-        cnum, _title, content = fu.parse_md_file(Path(buffer_path))
+            return [], (f"第{num}章不高于平台末尾（{platform_max}）："
+                        f"中段缺号很可能正文仍在平台上（换个标题挂着），"
+                        f"当缓冲会撞重名。请用高于末尾的未发布章节，"
+                        f"或 --buffer-file 指定一段真实场景")
+        want.append({"num": num, "path": num2path[num]})
+    elif n_cycles > 0:
+        if not allow_auto:
+            return [], None
+        cand = sorted(n for n in num2path
+                      if n > platform_max and n not in holders)
+        if not cand:
+            return [], None          # 没有可用的：闭环跳过，报告里说清楚
+        for num in cand[:n_cycles]:
+            want.append({"num": num, "path": num2path[num]})
     else:
-        return None, None, None
-    try:
-        n = int(cnum)
-    except (TypeError, ValueError):
-        return None, None, "缓冲章节没有章号（需要 # 第N章 标题）"
-    if n in holders:
-        return None, None, (f"第{n}章在平台目录里已存在，不能当缓冲"
-                            f"（会撞重名）；换一章或改章号")
-    body = fu._prepare_body(content or "")
-    nchar = len(re.sub(r"\s", "", body))
-    if nchar < 1000:
-        return None, None, f"缓冲正文只有 {nchar} 字（平台要求 ≥1000）"
-    return n, buffer_path, None
+        return [], None
+
+    out = []
+    for b in want:
+        cnum, _title, content = fu.parse_md_file(Path(b["path"]))
+        try:
+            n = int(cnum)
+        except (TypeError, ValueError):
+            return [], "缓冲章节没有章号（需要 # 第N章 标题）"
+        if n in holders:
+            return [], (f"第{n}章在平台目录里已存在，不能当缓冲"
+                        f"（会撞重名）；换一章或改章号")
+        if b["num"] is not None and n != b["num"]:
+            return [], (f"缓冲文件里的章号是第{n}章，"
+                        f"与指定的第{b['num']}章对不上")
+        body = fu._prepare_body(content or "")
+        nchar = len(re.sub(r"\s", "", body))
+        if nchar < 1000:
+            return [], f"缓冲正文只有 {nchar} 字（平台要求 ≥1000）"
+        out.append({"num": n, "path": b["path"]})
+    return out, None
 
 
 def _apply_range(plan, skipped, args):
@@ -535,6 +633,9 @@ def print_plan(items, plan, skipped, num2path):
               flush=True)
     for i, why in skipped[:10]:
         print(f"  跳过 index {i}: {why}", flush=True)
+    if len(skipped) > 10:
+        # 只列 10 行却不给总数，用户会以为就这 10 章（实测一次跳过 413 章）。
+        print(f"  … 共 {len(skipped)} 个跳过", flush=True)
     missing = [e["want_num"] for e in plan if e["want_num"] not in num2path]
     if missing:
         print(f"⚠ 本地缺文件、无法改: {missing[:20]}"
@@ -636,6 +737,12 @@ def _print_review_block(blk):
 def print_audit(rep, plan, include_published=False):
     """体检报告 + 余量告警（余量=第一个还没改对的 item 距离被发出去还有多久）。"""
     _print_review_block(rep.get("review_block"))
+    # 审核状态（审核中 / 被驳回）单列一段：跟 GUI 的体检报告同一份措辞。
+    _rev_lines = fu.review_status_lines(rep)
+    if _rev_lines:
+        print("\n—— 审核状态 ——", flush=True)
+        for _ln in _rev_lines:
+            print(_ln, flush=True)
     print("\n—— 缺口体检 ——", flush=True)
     print(f"A 未公开段位置不符: {len(rep['pending_bad'])} 个 → 本工具 --run 自动改",
           flush=True)
@@ -650,41 +757,60 @@ def print_audit(rep, plan, include_published=False):
             print("  ⚠ 余量已跌破移动窗口：今天必须补跑，否则错位章发出后"
                   "只能去 App 申请+逐章移动", flush=True)
     if rep["in_window"]:
-        print(f"B 已公开、还能在 App 里申请移动: {len(rep['in_window'])} 章", flush=True)
+        print(f"B 已公开、位置与章号不符、还能在 App 里申请移动: "
+              f"{len(rep['in_window'])} 章", flush=True)
         for r in rep["in_window"]:
-            print(f"  第{r['num']}章（现在位置 {r['index']}）发布于 {fmt(r['pub_at'])}"
+            print(f"  第{r['num']}章（现在位置 {r['index']}，应该在位置 "
+                  f"{r['num']}）发布于 {fmt(r['pub_at'])}"
                   f"，窗口还剩 {r['left_h']:.1f} 小时", flush=True)
-    if rep["expired"]:
+    # C 段报的是「位置与章号对不上」的那一批（= --include-published 的改写
+    # 范围），不是「排在更大章号后面」的倒挂集合：后者只要一章冲到了前面，
+    # 它后面每一章都算进去（实测 640 章），可其中绝大多数位置明明是对的，
+    # 报出来等于报假错（2026-10-31 实测）。
+    mis = rep.get("misplaced_pub") or []
+    brk = rep.get("order_break") or {}
+    if mis:
         # 只报一行：位置动不了（App 窗口已关），但内容能改写。改写计划和上面逐条
         # 列出的目标已经说清范围了，这里再展开一遍只会和 GUI 的体检报告打架。
         if include_published:
             lo = min((e["index"] for e in plan), default=0)
             hi = max((e["index"] for e in plan), default=0)
-            print(f"C 已公开段顺序错位：{len(plan)} 章（位置 {lo}-{hi}）"
+            print(f"C 已公开段位置与章号不符：{len(plan)} 章（位置 {lo}-{hi}）"
                   f"，位置不可动、内容可改写", flush=True)
         else:
-            print(f"C 已公开、超窗口无解: {len(rep['expired'])} 章 —— "
+            print(f"C 已公开段位置与章号不符：{len(mis)} 章 —— "
                   + "、".join(f"第{r['num']}章(位置{r['index']})"
-                              for r in rep["expired"]), flush=True)
-    if not (rep["in_window"] or rep["expired"]):
-        print("B/C 已公开段无顺序倒挂", flush=True)
+                              for r in mis[:10])
+                  + (f"…共{len(mis)}章" if len(mis) > 10 else "")
+                  + "（本工具默认不改已发布段；加 --include-published 才改写）",
+                  flush=True)
+    if brk.get("at"):
+        print(f"  顺序断在位置 {brk['at']}：从那儿往后 {brk['affected']} 章的"
+              f"顺序被隔断（它们自己的位置大多是对的，重排会自动跳过）",
+              flush=True)
+    if not (rep["in_window"] or mis):
+        print("B/C 已公开段没有位置不对的章", flush=True)
 
 
 async def run_remap(page, book_id, steps, num2path, *,
-                    use_ai=False, max_retries=2, buffer_path=None):
+                    use_ai=False, max_retries=2):
     """按 steps 的顺序写入；steps 已由 resolve_write_plan 排好依赖。
 
-    steps 里可能有 **真实缓冲** 步（placeholder=True）：把 buffer_path 指向的
-    真实章节正文写到闭环断点，等它过审/生效后再换位。它不用平台会驳回的合成
-    提示文本。提交成功 ≠ 平台已生效：已发布章的修改会先进审核（status 5），
-    审核通过前旧标题/正文仍在线上——这类章（needs_review）写完必须等
-    wait_applied 确认真的换过来了，再写依赖它的下一章；待发布章没有审核
-    这一步，改写即时生效、不用等。审核没在窗口内完成就**暂停**（不是失败）。
+    steps 里可能有 **真实缓冲** 步（placeholder=True）：把该步自带的
+    buffer_path 指向的真实章节正文写到闭环断点，等它过审/生效后再换位。
+    它不用平台会驳回的合成提示文本。提交成功 ≠ 平台已生效：已发布章的修改
+    会先进审核（status 5），审核通过前旧标题/正文仍在线上——这类章
+    （needs_review）写完必须等 wait_applied 确认真的换过来了，再写依赖它的
+    下一章；待发布章没有审核这一步，改写即时生效、不用等。审核没在窗口内
+    完成就**暂停**（不是失败）。
 
     返回 (new_ok, fail, paused)。paused = (位置, "write"/"buffer", 详情)。
     """
     new_ok, fail = [], []
     paused = None
+    t0 = time.monotonic()   # 整批起点，用来报「已用 / 预计还需」
+    n_done = 0              # 已完成的步数（含缓冲步），算平均耗时的样本
+    total = len(steps)
 
     def abort(n, reason):
         fail.append((steps[n - 1]["entry"]["index"], reason))
@@ -702,10 +828,12 @@ async def run_remap(page, book_id, steps, num2path, *,
         want = e["want_num"]
         url = EDIT_URL_TPL.format(book_id=book_id, item_id=e["item_id"])
         if s["placeholder"]:
-            if not buffer_path:
+            # 每个闭环用自己那份缓冲（章号不能重复，否则撞重名）。
+            bpath = s.get("buffer_path")
+            if not bpath:
                 print("    ✗ 闭环缓冲缺少真实文本文件 —— 中止整批", flush=True)
                 return abort(n, "缺少缓冲文件")
-            bnum, btitle, bcontent = fu.parse_md_file(Path(buffer_path))
+            bnum, btitle, bcontent = fu.parse_md_file(Path(bpath))
             try:
                 bnum_int = int(bnum) if bnum is not None else None
             except (TypeError, ValueError):
@@ -713,14 +841,23 @@ async def run_remap(page, book_id, steps, num2path, *,
             if bnum_int is None:
                 print("    ✗ 缓冲章节号无效 —— 中止整批", flush=True)
                 return abort(n, "缓冲章节号无效")
-            print(f"[{n}/{len(steps)}] index {e['index']}: 借用真实章节"
-                  f"第{bnum_int}章作缓冲（{btitle[:18]}，腾出第{want}章）",
-                  flush=True)
+            if s.get("buffer_num") is not None and bnum_int != s["buffer_num"]:
+                print(f"    ✗ 缓冲章号对不上（要第{s['buffer_num']}章，"
+                      f"文件里是第{bnum_int}章）—— 中止整批", flush=True)
+                return abort(n, "缓冲章号对不上")
+            print(step_line(
+                n, total,
+                f"index {e['index']}: 借用真实章节"
+                f"第{bnum_int}章作缓冲（{btitle[:18]}，腾出第{want}章）",
+                eta_hint(time.monotonic() - t0, n_done, total - n + 1)),
+                flush=True)
             try:
-                done, err = await fu.edit_one_chapter(
-                    page, url, bnum_int, btitle, bcontent,
-                    use_ai=False, max_retries=max_retries,
-                    set_num=str(bnum_int))
+                done, err = await with_heartbeat(
+                    fu.edit_one_chapter(
+                        page, url, bnum_int, btitle, bcontent,
+                        use_ai=False, max_retries=max_retries,
+                        set_num=str(bnum_int)),
+                    f"位置 {e['index']} 写缓冲正文（第{bnum_int}章）")
             except fu.DailyLimitReached as ex:
                 print(f"    撞字数上限（{ex}），中止整批", flush=True)
                 return abort(n, f"字数上限:{ex}")
@@ -738,6 +875,7 @@ async def run_remap(page, book_id, steps, num2path, *,
                 print(f"    ⏸ 缓冲已提交，平台还在审核（{detail}）"
                       f"—— 本次暂停", flush=True)
                 return pause_tail(n)
+            n_done += 1
             continue
 
         path = num2path.get(want)
@@ -752,12 +890,18 @@ async def run_remap(page, book_id, steps, num2path, *,
         if cnum_int != want:
             print(f"    ✗ 本地文件章节号不符({cnum!r}) —— 中止整批", flush=True)
             return abort(n, f"本地文件章节号不符({cnum!r})")
-        print(f"[{n}/{len(steps)}] index {e['index']}: 「{e['now_title'][:18]}」"
-              f" → 第{want}章 {title[:18]}", flush=True)
+        print(step_line(
+            n, total,
+            f"index {e['index']}: 「{e['now_title'][:18]}」"
+            f" → 第{want}章 {title[:18]}",
+            eta_hint(time.monotonic() - t0, n_done, total - n + 1)),
+            flush=True)
         try:
-            done, err = await fu.edit_one_chapter(
-                page, url, want, title, content,
-                use_ai=use_ai, max_retries=max_retries, set_num=str(want))
+            done, err = await with_heartbeat(
+                fu.edit_one_chapter(
+                    page, url, want, title, content,
+                    use_ai=use_ai, max_retries=max_retries, set_num=str(want)),
+                f"位置 {e['index']} 改写为第{want}章")
         except fu.DailyLimitReached as ex:
             print(f"    撞字数上限（{ex}），中止整批", flush=True)
             return abort(n, f"字数上限:{ex}")
@@ -779,6 +923,7 @@ async def run_remap(page, book_id, steps, num2path, *,
                 print(f"    ⏸ 已提交，平台还在审核（{detail}）—— 本次暂停",
                       flush=True)
                 return pause_tail(n)
+        n_done += 1
     return new_ok, fail, paused
 
 
@@ -786,24 +931,26 @@ async def verify_batch(page, book_id, entries, done_positions, *,
                        window_s=_VERIFY_WINDOW_S, poll_s=_VERIFY_POLL_S):
     """批末复核: 重抓平台真实状态核实本批目标，没反映的按窗口轮询等审核。
 
-    返回 (still_pending, fresh_items)。still_pending 不算失败——下一轮会从
-    平台真实状态重算，真没生效的会被再改一次。
+    返回 (still_pending, fresh_items, notes)。still_pending 不算失败——下一轮会从
+    平台真实状态重算，真没生效的会被再改一次。notes 是"状态跟预期不一样"的
+    提示，调用方汇总成一行打印（逐章打印的话，一批 23 章就是 23 行噪音）。
     """
     byidx = {e["index"]: e for e in entries}
     pending = list(done_positions)
     deadline = time.monotonic() + window_s
     fresh = []
+    notes = []
     while True:
         fresh = (await fu.fetch_chapter_items(page, book_id))[0]
         bypos = {x.get("pos", x["index"]): x for x in fresh}
         still = []
         for i in pending:
             after = bypos.get(i)
-            if after is None or check_applied(byidx.get(i, {}), after, i):
+            if after is None or check_applied(byidx.get(i, {}), after, i, notes):
                 still.append(i)
         pending = still
         if not pending or time.monotonic() >= deadline:
-            return pending, fresh
+            return pending, fresh, notes
         print(f"  复核: 还有 {len(pending)} 章平台未反映（审核滞后），"
               f"{poll_s}s 后重查…", flush=True)
         await page.wait_for_timeout(poll_s * 1000)
@@ -884,16 +1031,33 @@ async def main_async(args):
             # 范围已经在 _apply_range 里作用于 plan，这里直接用。
             entries = plan
             holders = build_chapter_holders(items)
+            _by_pos = {it.get("pos", it["index"]): it for it in items}
             platform_max = max((it.get("pos", it["index"]) for it in items),
                                default=0)
-            buffer_num, buffer_path, buffer_err = resolve_buffer(
-                args, num2path, holders, platform_max)
+            # 先不带缓冲排一次，看看有几个闭环 —— 才知道要配几个缓冲。
+            # 闭环是死锁：位置互相占着章号（位置 670 装第673章、位置 673 装
+            # 第676章……最后一个装第670章），写谁都要撞重名。要解开必须先往
+            # 环上某个位置写一份**章号还没被平台占用**的真实正文，腾出章号，
+            # 环转完再把正确章节写回原位。
+            _pre, _pre_drop, cycles_pre = resolve_write_plan(entries, holders)
+            # 无人值守（--daily）不自动解闭环：缓冲会让某一章的正文在读者端
+            # 短暂露出来，没人盯着的时候不该替作者做这个决定。
+            allow_auto = not (getattr(args, "no_buffer", False)
+                              or getattr(args, "daily", False))
+            buffers, buffer_err = resolve_buffers(
+                args, num2path, holders, platform_max,
+                n_cycles=len(cycles_pre), allow_auto=allow_auto)
             if buffer_err:
                 print(f"\n⚠ 缓冲不可用: {buffer_err}", flush=True)
                 print("  本次不会写入。", flush=True)
                 return True
+            buffer_by_num = {b["num"]: b["path"] for b in buffers}
             steps, dropped, cycles = resolve_write_plan(
-                entries, holders, buffer_num=buffer_num)
+                entries, holders,
+                buffer_nums=[b["num"] for b in buffers])
+            for _s in steps:
+                if _s["placeholder"]:
+                    _s["buffer_path"] = buffer_by_num.get(_s["buffer_num"])
             if dropped:
                 print(f"\n踢掉 {len(dropped)} 个会造成永久重名的位置"
                       f"（它们要的章号还占在本轮改不到的地方）:", flush=True)
@@ -909,24 +1073,44 @@ async def main_async(args):
             ph_steps = [s for s in steps if s["placeholder"]]
             n_buffer = len(ph_steps)
             if ph_steps:
-                _bn, _bt, _ = fu.parse_md_file(Path(buffer_path))
-                _src = (f"文件 {Path(buffer_path).name}"
-                        if getattr(args, "buffer_file", None)
-                        else f"本地第{_bn}章")
-                print(f"\n用真实正文缓冲解 {n_buffer} 个闭环：位置 "
-                      f"{'、'.join(str(s['entry']['index']) for s in ph_steps)}"
-                      f" ← {_src}「{_bt[:24]}」。", flush=True)
-                print("  ⚠ 换位期间读者可能提前看到这份正文；"
-                      "最后会写回正确章节，缓冲章仍留在本地。", flush=True)
+                print(f"\n用真实正文缓冲解 {n_buffer} 个闭环:", flush=True)
+                for _s in ph_steps:
+                    _bn = _s["buffer_num"]
+                    _bt = ""
+                    try:
+                        _bn2, _bt, _ = fu.parse_md_file(Path(_s["buffer_path"]))
+                    except Exception:
+                        pass
+                    print(f"  位置 {_s['entry']['index']} ← 本地第{_bn}章"
+                          f"「{_bt[:24]}」", flush=True)
+                print("  做法：先把这份正文写到那个位置腾出章号，环转完再把"
+                      "正确章节写回原位；缓冲章仍留在本地。", flush=True)
+                print("  ⚠ 换位期间（等平台过审，可能几分钟到几小时）"
+                      "那个位置的读者会短暂看到这份正文。", flush=True)
             if cycles:
-                print(f"\n跳过 {len(cycles)} 个闭环（共 {n_cycle} 章；"
-                      f"没有可用缓冲时不自动写占位）:", flush=True)
+                print(f"\n跳过 {len(cycles)} 个闭环（共 {n_cycle} 章）:",
+                      flush=True)
                 for c in cycles:
-                    print(f"  {len(c)} 章：位置 {min(c)}-{max(c)} 之间"
-                          f"（{c[:3]}{' …' if len(c) > 3 else ''}）", flush=True)
-                print("  这些位置互相占着章号，纯改写解不开。可用 "
-                      "--buffer-chapter auto / --buffer-file 用真实正文解一个；"
-                      "或人工在平台用真实章节占位后再跑。", flush=True)
+                    _now = "、".join(
+                        f"位置{p}装第"
+                        f"{fu.chapter_title_num(_by_pos.get(p, {}).get('title') or '') or '?'}章"
+                        for p in c[:4])
+                    print(f"  {len(c)} 章：位置 {min(c)}-{max(c)} 之间：{_now}"
+                          f"{' …' if len(c) > 4 else ''}", flush=True)
+                print("  这些位置互相占着章号，读者目录里是一圈（写到第670章"
+                      "之后又接回第670章），纯改写是死锁：先写谁都会撞重名。",
+                      flush=True)
+                if allow_auto and not buffers:
+                    print("  本地没有高于平台末尾的未发布章节可作缓冲，这批"
+                          "只能先放着；把后面几章补进本地、或用 --buffer-file "
+                          "指定一段真实场景（不剧透），再跑一次。", flush=True)
+                elif not allow_auto:
+                    print("  已按 --no-buffer / 无人值守跳过。去掉这个开关"
+                          "（或用 --buffer-chapter auto）就会自动解。",
+                          flush=True)
+                else:
+                    print("  还剩的闭环可以用 --buffer-file 指定一段真实场景"
+                          "再解一个。", flush=True)
             # --limit 只能截在"缓冲已经换回"的位置：截在换回之前，那一章会永远
             # 停在借来的真实正文上（读者看到的是别人的稿子），这种截断直接拒绝。
             if args.limit and len(steps) > args.limit:
@@ -945,14 +1129,15 @@ async def main_async(args):
             if not args.run:
                 print(f"\n[dry-run] 本次将改写 {n_real} 个 item"
                       + (f"（另用 {n_buffer} 个真实缓冲" if n_buffer else "")
-                      + (f"；{n_cycle} 章闭环跳过" if n_cycle else "")
+                      + (f"；{n_cycle} 章闭环没动（见上）" if n_cycle else "")
                       + ("）" if (n_buffer or n_cycle) else "")
                       + "。确认无误后加 --run 才会真正写入。", flush=True)
                 return attn
             if not steps:
                 if cycles:
-                    print(f"只剩 {n_cycle} 章闭环：可用 --buffer-chapter auto "
-                          f"或 --buffer-file 用真实正文解；本次不会写入。",
+                    print(f"只剩 {n_cycle} 章闭环，本次没动它们"
+                          f"（{('本地没有可用的缓冲章节' if allow_auto and not buffers else '按 --no-buffer / 无人值守跳过')}）。"
+                          f"补几章到本地、或用 --buffer-file 指定真实场景再跑。",
                           flush=True)
                     return True
                 # 比如剩下的都在"临近发布"的冷却里被跳过（--safety-minutes，
@@ -963,15 +1148,23 @@ async def main_async(args):
                   + (f"（含 {n_buffer} 个真实缓冲）" if n_buffer else "")
                   + " —— 3 秒后开始…", flush=True)
             await page.wait_for_timeout(3000)
+            t_run = time.monotonic()
             ok, fail, paused = await run_remap(
-                page, book_id, steps, num2path, use_ai=args.use_ai,
-                buffer_path=buffer_path)
+                page, book_id, steps, num2path, use_ai=args.use_ai)
+            _write_s = time.monotonic() - t_run
             _tail = ("前方中止，未处理", "前方暂停，未处理")
             real_fail = [(i, w) for i, w in fail if w not in _tail]
             unprocessed = len(fail) - len(real_fail)
+            # 「没动」= 本来要改、但这次一个字节都没写的位置（闭环跳过 + 被踢掉
+            # 的重名位置）。它不体现在 fail 里（那些位置压根没排进写入步骤），
+            # 所以汇总里必须单列：只写「成功 23 失败 0」会让人以为全改完了，
+            # 而读者目录里那 9 章其实还是错的（2026-10-31 用户反馈）。
+            n_untouched = n_cycle + len(dropped)
             print("=" * 50, flush=True)
             print(f"完成  成功 {len(ok)}  失败 {len(real_fail)}"
-                  + (f"  未处理 {unprocessed}" if unprocessed else ""),
+                  + (f"  未处理 {unprocessed}" if unprocessed else "")
+                  + (f"  没动 {n_untouched}" if n_untouched else "")
+                  + f"  （写入用时 {fmt_dur(_write_s)}）",
                   flush=True)
             _ok_set = set(ok)
             left_buf = [s["entry"]["index"] for s in ph_steps
@@ -980,6 +1173,24 @@ async def main_async(args):
                 print(f"  · 真实缓冲 {n_buffer} 个"
                       + (f"，仍有 {len(left_buf)} 个未换回" if left_buf
                          else "，均已换回"), flush=True)
+            if n_cycle:
+                # 说清楚"没动"是什么：哪几个位置、现在各装什么、读者会看到什么。
+                print(f"  · 没动的 {n_cycle} 章是闭环：这些位置互相占着章号，"
+                      f"纯改写解不开（写谁都会撞重名）", flush=True)
+                for c in cycles:
+                    _now = "、".join(
+                        f"位置{p}装第"
+                        f"{fu.chapter_title_num(_by_pos.get(p, {}).get('title') or '') or '?'}章"
+                        for p in c[:4])
+                    print(f"    {len(c)} 章：位置 {min(c)}-{max(c)} 之间：{_now}"
+                          f"{' …' if len(c) > 4 else ''}", flush=True)
+                print("    读者目录里这一段还是转圈的（…第669章 → 第673章 → "
+                      "… → 第670章 → 第671章…）", flush=True)
+                print("    下次跑会自动用真实正文缓冲解开（除非加 --no-buffer）",
+                      flush=True)
+            if dropped:
+                print(f"  · 另有 {len(dropped)} 个位置被踢掉：它们要的章号"
+                      f"还占在本轮改不到的地方，写进去就是永久重名", flush=True)
             if paused:
                 _kind = "真实缓冲" if paused[1] == "buffer" else "改写"
                 print(f"⏸ 位置 {paused[0]} 的{_kind}已提交，平台审核中"
@@ -994,7 +1205,7 @@ async def main_async(args):
             if left_buf:
                 # 形状要和 GUI 的解析对上（它按「位置 N 临时借用了真实章节」取号），
                 # 这里写成列表 repr 的话，GUI 弹窗就只剩半句没有位置。
-                print("⚠ 这些位置临时借用了真实章节"
+                print(f"⚠ 位置 {'、'.join(map(str, left_buf))} 临时借用了真实章节"
                       "（尚未换回）。重跑本工具会写回正确内容。", flush=True)
             if paused:
                 # 已提交的章在审核里，批末复核等不出结果；直接按暂停收尾
@@ -1003,9 +1214,14 @@ async def main_async(args):
                 return True
             # 批末复核：重抓平台真实状态核实本批目标；没反映的按窗口轮询等审核。
             # 复核完再用这份新状态算一遍还剩多少位置与章号不符。
-            not_yet, fresh = await verify_batch(page, book_id, entries, ok)
+            not_yet, fresh, _notes = await verify_batch(page, book_id, entries, ok)
             print(f"批末复核: 本批提交 {len(ok)} 章，平台已反映 "
                   f"{len(ok) - len(not_yet)} 章", flush=True)
+            if _notes:
+                # 同一句话刷了 N 遍没意义，合并成一行说清"有几章这样"。
+                print(f"  · {len(_notes)} 章的平台状态跟预期不一样"
+                      f"（多为审核滞后或排期已触发）；标题与排期已核对无误，"
+                      f"按成功计", flush=True)
             if not_yet:
                 print(f"  · 等满 {_VERIFY_WINDOW_S // 60} 分钟仍未反映 "
                       f"{len(not_yet)} 章: {not_yet[:10]}"
@@ -1014,6 +1230,24 @@ async def main_async(args):
                       "真没生效的会被再改一次", flush=True)
             left, _ = compute_remap(fresh, safety_minutes=args.safety_minutes)
             print(f"复核: 未公开段还有 {len(left)} 个 item 位置与章号不符", flush=True)
+            if args.include_published:
+                # 刚才改的是已公开段，那一段也得有回执——只报"未公开段 0 个"
+                # 的话，用户根本不知道刚修的那 9 章到底对上了没有。
+                _rep2 = fu.audit_chapter_positions(fresh)
+                _still = sum(1 for r in (_rep2.get("misplaced_pub") or [])
+                             if r.get("published"))
+                if _still:
+                    print(f"复核: 已公开段还有 {_still} 章位置与章号不符"
+                          f"（本次没动的那几章）", flush=True)
+                else:
+                    print("复核: 已公开段的顺序已全部对上", flush=True)
+            if ok:
+                # 读者目录现在是什么样 —— 这是作者最关心的一句话，
+                # 光看"成功 9"不知道顺序到底对没对。
+                _lo_f, _hi_f = min(ok), max(ok)
+                _view = fu.reader_view_around(fresh, _lo_f, span=2)
+                print(f"读者目录现在看到（位置 {_lo_f}~{_hi_f} 那一段）：… "
+                      + " → ".join(_view) + " …", flush=True)
             attn, why = needs_attention(fu.audit_chapter_positions(fresh), left)
             # 异常中止（≠字数上限）也要惊动人：撞上限是每天的常态，
             # 但改写失败/对账不过若不报，会每天静默卡在同一处
@@ -1356,9 +1590,13 @@ def main():
     bg = ap.add_mutually_exclusive_group()
     bg.add_argument("--buffer-chapter", metavar="N|auto",
                     help="闭环用本地未发布章节的真实正文做缓冲；"
-                         "auto=取平台末尾之后的最小未发布章号")
+                         "auto=取平台末尾之后的未发布章号")
     bg.add_argument("--buffer-file", metavar="PATH",
                     help="闭环用指定真实文本文件做缓冲（正文按平台口径≥1000字）")
+    ap.add_argument("--no-buffer", action="store_true",
+                    help="不自动解闭环：闭环整环跳过并报出来。"
+                         "默认会自动用本地未发布章节的真实正文解开闭环"
+                         "（换位期间那个位置的读者会短暂看到该章正文）")
     ap.add_argument("--run", action="store_true", help="真的写入（不加只预览）")
     ap.add_argument("--safety-minutes", type=int, default=SAFETY_MINUTES,
                     help="跳过多少分钟内就要发布的章（默认 60）")

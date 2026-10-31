@@ -147,9 +147,7 @@ def plan_refill(items, num2path, *, days_ahead=DEFAULT_DAYS_AHEAD, per_day=9,
 
     返回 (nums, start_date, need_days, tail, gaps):
       nums       要排的章号（升序，只取平台最大章号之后的）
-      start_date 队列末尾的次日；**只用来算 need_days**，不是真正的起排点
-                 —— 那个由 schedule_after 接着队尾的时刻算（会先填满队尾那天
-                 剩下的时间点）
+      start_date 队尾的次日（队尾落在过去时夹到今天）；不是真正的起排点
       need_days  这批要占几天
       tail       当前队列排到哪天
       gaps       平台中段缺的章号（本工具不碰，交给 tools/remap；仅用于提醒）
@@ -200,8 +198,9 @@ async def run_publish(page, book_id, nums, schedule, num2path, sig_urls, *,
     CLI 上传、GUI 上传和本工具共用的同一份实现，不在这里再抄一遍循环。
     本函数只负责: 选题已定后的顺序控制、逐章确认、失败即停、记账。
 
-    失败即停的理由: 新建章只能追加到全书末尾，跳过一章继续发会把缺口永久
-    卡在中段；而停在队尾毫无代价——下一轮从平台真实状态重算，接着发即可。
+    失败即停的理由: 新建章只能追加到全书末尾，跳过一章继续发会在中段留下
+    一个真缺口（3 天移动窗口内还能救、之后只能靠改写内容）；而停在队尾毫无
+    代价——下一轮从平台真实状态重算，接着发即可。
     """
     new_url = fu.NEW_CHAPTER_URL_TPL.format(book_id=book_id)
     ok, fail = [], []

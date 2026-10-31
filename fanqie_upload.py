@@ -3085,26 +3085,72 @@ def _find_review_block(items):
     return None
 
 
+def reader_view_around(items, pos, span=2):
+    """位置 pos 前后各 span 个位置，读者在目录里实际看到的章号。
+
+    报告「读者看到什么」比报告「哪些 item 错位」有用得多——前者才是作者在意的
+    后果（读到第694章之后突然接第480章），后者只是内部状态。倒挂章往往只有
+    几章，但底下被顶偏的可能是几百章，光看倒挂数完全看不出工作量。
+
+    GUI 的体检报告和 CLI 的重排收尾都用这一份（2026-10-31 移到共享核心）。
+    """
+    by_pos = {}
+    for x in items:
+        p = x.get("pos")
+        if not isinstance(p, int):
+            p = x.get("index") or 0
+        by_pos[p] = x
+    out = []
+    for p in range(pos - span, pos + span + 1):
+        it = by_pos.get(p)
+        n = chapter_title_num(it["title"]) if it is not None else None
+        out.append(f"第{n}章" if n is not None else "（无章号）")
+    return out
+
+
 def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
     """缺口体检: 按「谁能修」把问题分三段。
 
     A pending_bad 未公开段位置与章号不符 → 可用 tools/remap 自动改写内容。
-    B in_window  已公开、发布在 window_h 内、且排在了它该在的位置之后
-                 → 只能手机 App 申请+审批+逐章移动，很贵，必须在窗口内知道。
+    B in_window  已公开、位置与章号对不上、发布在 window_h 内、且确实被挤到
+                 了更大的章号后面 → 只能手机 App 申请+审批+逐章移动，很贵，
+                 必须在窗口内知道。
     blocked      某一章审核被拒、后面整批卡在审核中（平台侧结论，工具改不了，
                  但不告诉用户就会一直卡下去，见 find_review_block）
-    C expired    已公开、超窗口 → App 移动窗口已经关掉了。
+    C expired    已公开、位置与章号对不上、且超窗口 → App 移动窗口已经关掉了。
                  **但不是无解**：内容改写得动（tools/remap --include-published），
                  把位置 i 改回装第 i 章即可 —— 只是内容层面的修正，位置本身
                  永远动不了。所以 --include-published 跑完后 C 段会清空。
 
-    "排在了该在的位置之后"判据: 该 item 的章号 < 它前面所有位置出现过的最大
-    章号。均匀后移（前面漏章导致整段偏移）不算——那只是缺号，阅读顺序仍单调；
-    真正伤读者的是顺序倒挂（读到第699章之后突然接第480章）。
+    misplaced_pub 已发布段里「位置 ≠ 章号」、且这一章改得动的那一批
+                 （display_status=1；或 7=审核不通过且平台没给「不可修改」
+                 的理由）。它就是 --include-published 会改写的范围——
+                 compute_remap 的判据一样：位置≠章号才改。
+    order_break  读者顺序的断点：第一个「排在更大章号后面」的已发布章的位置，
+                 以及从那儿往后有多少章被它隔断。只用来解释，不用来计数。
+
+    为什么「位置对不上」和「读者看到顺序倒了」必须分开（2026-10-31 实测）：
+    原来这里只按「章号 < 前面出现过的最大章号」判倒挂。可只要**一章**冲到了
+    前面（实测：第5290章卡在位置 480），它后面每一章都比它小——640 章全被判
+    成「顺序断裂」，而其中绝大多数（实测：第481章在481、第482章在482…）
+    位置明明是对的。报告照抄那份清单，用户看到的是「位置都对，怎么还报错」。
+    所以现在：
+      · 要改写的是 misplaced_pub（位置≠章号）；
+      · in_window / expired 从它里面再挑**确实被挤到后面**的那些（均匀偏移
+        不算，见下），in_window 再要求在 3 天窗口内；
+      · order_break 只回答「断在哪儿、后面多少章被隔断」。
+
+    「App 移动」只对**被挤到后面**的章有效：顺序单调的均匀偏移（缺号顺延）
+    把它挪回自己的号位反而会制造新的倒挂，那种不报（实测：位置 1/2/3 装
+    第 1/3/4 章——读者看到的是 1、3、4，不该让人去动它）。
+
     已发布章的 create_time 就是实际发布时刻（平台在发布时改写该字段）。
     """
     now_ts = int(time.time()) if now_ts is None else now_ts
-    pend_bad, in_window, expired = [], [], []
+    pend_bad, in_window, expired, misplaced_pub = [], [], [], []
+    reviewing = []      # 审核中：平台在审，现在动不了
+    rejected = []       # 审核不通过：被平台驳回
+    inverted_pos = []      # 被前面更大章号隔断的已发布章（诊断用）
     running_max = 0
     # 平台给的字段可能缺（JSON 序列化会丢掉 undefined 的键）：下面全部用
     # .get() 拿，缺了就当没有——体检是**只读诊断**，不该因为平台少给一个
@@ -3122,17 +3168,49 @@ def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
         ds = it.get("display_status")
         n = chapter_title_num(title)
         if ds == DISPLAY_PUBLISHED:
-            if n is not None and n < running_max:
-                try:
-                    pub_at = int(it.get("create_time") or 0)
-                except (TypeError, ValueError):
-                    pub_at = 0
-                left_h = (pub_at + window_h * 3600 - now_ts) / 3600
-                row = {"index": pos, "num": n, "title": title,
-                       "pub_at": pub_at, "left_h": left_h}
-                (in_window if left_h > 0 else expired).append(row)
             if n is not None:
+                # 读者看到的顺序：这一章排在比它大的章号后面了吗？
+                inverted = n < running_max
+                if inverted:
+                    inverted_pos.append(pos)
+                if n != pos:
+                    # 位置和章号对不上 —— 这才是要改写/要移动的那一批
+                    try:
+                        pub_at = int(it.get("create_time") or 0)
+                    except (TypeError, ValueError):
+                        pub_at = 0
+                    left_h = (pub_at + window_h * 3600 - now_ts) / 3600
+                    row = {"index": pos, "num": n, "title": title,
+                           "pub_at": pub_at, "left_h": left_h,
+                           "published": True}
+                    misplaced_pub.append(row)
+                    # App 移动只对「被挤到后面」的章有效：顺序单调的均匀偏移
+                    # （缺号顺延）挪了反而更乱，不报。
+                    if inverted:
+                        (in_window if left_h > 0 else expired).append(row)
                 running_max = max(running_max, n)
+        elif ds in (DISPLAY_REVIEWING, DISPLAY_REVIEWING_PUBLISHED):
+            # 审核中：平台不让改，等审完。位置不对的那些审完再跑一次就能改，
+            # 所以单独记下来「有几章白等」——不然用户只看到"要改 32 章"，
+            # 跑完发现有 12 章纹丝不动，却不知道为什么。
+            reviewing.append({
+                "index": pos, "title": title, "status": ds,
+                "reason": (it.get("cant_modify_reason") or "").strip(),
+                "wrong": bool(n is not None and n != pos)})
+        elif ds == DISPLAY_REVIEW_FAILED:
+            _reason = (it.get("cant_modify_reason") or "").strip()
+            rejected.append({
+                "index": pos, "title": title, "status": ds, "reason": _reason,
+                # 平台没给「不可修改」的理由 → 编辑器进得去 → 改得动（实测）
+                "editable": not _reason,
+                "wrong": bool(n is not None and n != pos)})
+            if not _reason and n is not None and n != pos:
+                # 审核不通过、平台又没给「不可修改」的理由 → 改得动（实测）。
+                # 位置≠章号的话，它也是 remap 要改写的那一批；它从没发布过，
+                # App 的移动窗口跟它无关，不进 B 段。
+                misplaced_pub.append({"index": pos, "num": n, "title": title,
+                                      "pub_at": 0, "left_h": -1.0,
+                                      "published": False, "review_failed": True})
         elif (ds == DISPLAY_PENDING and n is not None and n != pos):
             # n is None = 标题里没有「第N章」（楔子/番外/作者的话）。它本来就
             # 不参与主线编号，拿 pos 去比必然不等 —— 判成错位会让 remap 把它
@@ -3142,7 +3220,48 @@ def audit_chapter_positions(items, *, now_ts=None, window_h=MOVE_WINDOW_H):
     # 报废——那会让用户以为体检失败，而其实只是少了一条附加信息。
     # 兜底在 find_review_block 里面（两个调用点原来各写一份一样的）。
     return {"pending_bad": pend_bad, "in_window": in_window,
-            "expired": expired, "review_block": find_review_block(items)}
+            "expired": expired, "misplaced_pub": misplaced_pub,
+            "reviewing": reviewing, "rejected": rejected,
+            "order_break": ({"at": inverted_pos[0], "affected": len(inverted_pos)}
+                            if inverted_pos else None),
+            "review_block": find_review_block(items)}
+
+
+def review_status_lines(rep):
+    """审核状态清单（审核中 / 被驳回）——给人看的几行。GUI 与 CLI 共用这一份。
+
+    为什么要单列：体检原来只报「卡队列」那一种（某一章被驳回、后面一大片
+    卡在审核中）。散着的审核中/被驳回章一个字都不提，作者不知道「有几章
+    现在动不了」「哪几章被平台驳回了」「被驳回的那几章还能不能自己救」
+    （2026-10-31 用户反馈：整书检查时该不该看这些？该看就该说清楚）。
+
+    没有这类章时返回空列表——正常书不该多这一段。
+    """
+    rev = rep.get("reviewing") or []
+    rej = rep.get("rejected") or []
+    if not rev and not rej:
+        return []
+    out = []
+    if rev:
+        _pos = [r["index"] for r in rev]
+        _wrong = sum(1 for r in rev if r.get("wrong"))
+        out.append(f"审核中 {len(rev)} 章（位置 {min(_pos)}-{max(_pos)}）："
+                   f"平台正在审，现在动不了")
+        if _wrong:
+            out.append(f"  · 其中 {_wrong} 章的位置也不对：等审完再跑一次就能改")
+    if rej:
+        _pos = [r["index"] for r in rej]
+        _ed = [r for r in rej if r.get("editable")]
+        _lock = [r for r in rej if not r.get("editable")]
+        out.append(f"被平台驳回 {len(rej)} 章（位置 {min(_pos)}-{max(_pos)}）："
+                   f"没通过审核")
+        if _ed:
+            out.append(f"  · {len(_ed)} 章改得动（平台没给「不可修改」的理由）"
+                       f"：重排会一并写回正确内容")
+        if _lock:
+            out.append(f"  · {len(_lock)} 章改不动（平台给了「"
+                       f"{_lock[0]['reason'][:16]}」）：只能去番茄后台改")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -5422,12 +5541,18 @@ def _run_tool_cmd(name, args, *, force_readonly=False):
     force_readonly: 只读子命令（audit）用——不让 --daily 把 run 置成 True。
     """
     mod = _load_tool_module(name)
+    # 工具模块内部会读取各项 args 字段；子命令若参数较少（如 audit 只有
+    # --daily/--book-id 等），工具照读不误就会直接抛 AttributeError
+    # ('Namespace' object has no attribute 'include_published' 等）。
+    # 2026-10-31 实测导致 audit --daily 烟雾报警器每晚崩溃。这里补齐默认值，
+    # 保证任何子命令转交时字段完备（见 tests/test_remap_cycles.py 守卫）。
     for field, default in (("run", False), ("only", None), ("range", None),
                            ("limit", None), ("safety_minutes", 60),
                            ("daily", False), ("headless", False),
                            ("show_browser", False), ("use_ai", False),
                            ("audit", False), ("force", False),
                            ("buffer_chapter", None), ("buffer_file", None),
+                           ("no_buffer", False), ("include_published", False),
                            ("book_id", None), ("content_dir", None)):
         if not hasattr(args, field):
             setattr(args, field, default)
@@ -5633,6 +5758,10 @@ def main():
                           "auto=取平台末尾之后的最小未发布章号")
     rmg.add_argument("--buffer-file", metavar="PATH",
                      help="闭环用指定真实文本文件做缓冲（正文按平台口径≥1000字）")
+    rm.add_argument("--no-buffer", action="store_true",
+                    help="不自动解闭环：闭环整环跳过并报出来。"
+                         "默认会自动用本地未发布章节的真实正文解开闭环"
+                         "（换位期间那个位置的读者会短暂看到该章正文）")
     rm.add_argument("--safety-minutes", type=int, default=60,
                     help="跳过多少分钟内就要发布的章（默认 60）")
     rm.add_argument("--daily", action="store_true",

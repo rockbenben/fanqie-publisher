@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-LOG_DIR = Path(__file__).resolve().parent / "logs"   # --daily 的日志落这里
+LOG_DIR = Path(__file__).resolve().parent / "logs"   # 共用无人值守外壳取的日志目录
 sys.path.insert(0, str(ROOT))
 import fanqie_upload as fu  # noqa: E402
 from playwright.async_api import async_playwright  # noqa: E402
@@ -130,11 +130,11 @@ async def open_draft_box(page, book_id):
 
 
 async def delete_drafts(page, book_id, want):
-    """留在草稿箱页面连续删除；用 DOM 行数验证每次删除真的生效。
+    """留在草稿箱页面连续删除；靠首行身份变化验证每次删除真的生效。
 
     早先每删一条都重新导航整页 + 重抓全量草稿列表来"确认总数减少"，
     单条开销 15~20 秒（删除本身只要 1 秒）。删除后表格会就地重渲染，
-    直接看行数变化就够了——整页导航和全量列表只在翻页/收尾时才需要。
+    直接看首行换没换人就够了——整页导航和全量列表只在翻页/收尾时才需要。
     返回 (删掉数, 停止原因)。
     """
     done = 0
@@ -149,7 +149,7 @@ async def delete_drafts(page, book_id, want):
             r = r2
         await page.wait_for_timeout(400)
         await page.evaluate(_CONFIRM_JS)
-        # 等这一行真的消失（行数减少），而不是盲等固定时间
+        # 等首行换成别的草稿（分页表会补行，行数不变），而不是盲等固定时间
         gone = await page.evaluate(_WAIT_ROW_GONE_JS, r.get("id"))
         if not gone:
             return done, (f"删「{r.get('name')}」后首行没变，停止以免空点")
@@ -162,9 +162,10 @@ async def delete_drafts(page, book_id, want):
 async def main_async(args):
     book_id, num2path, headless = fu.tool_startup(args)
     if not book_id:
-        # 返回 True(=需人工)而不是 False：run_unattended 靠返回值决定 exit 3 与
-        # 弹窗。返回 False 会让 --daily 的计划任务每晚"成功"退出 0 却什么都没做，
-        # 而队列会一天天耗到断更才被发现。跟 remap 保持一致。
+        # 返回 True(=需人工)而不是 False：本工具的 main() 直接 asyncio.run，
+        # 这个返回值眼下没人消费；但主 CLI 的 `fanqie_upload.py clean-drafts`
+        # 子命令走的是共用的 run_unattended 外壳，那边靠返回值决定 exit 3 与
+        # 弹窗。跟 remap 保持一致，别让两个入口的语义分叉。
         return True
     local_nums = set(num2path)
     async with async_playwright() as p:

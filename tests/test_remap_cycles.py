@@ -112,7 +112,7 @@ _ring_items_b = [{"index": 1, "title": "第2章 甲"},
 _h_b = rm.build_chapter_holders(_ring_items_b)
 _ring_b = [{"index": 1, "want_num": 1}, {"index": 2, "want_num": 2}]
 _st_b, _dr_b, _cy_b = rm.resolve_write_plan(
-    _ring_b, _h_b, buffer_num=5197)
+    _ring_b, _h_b, buffer_nums=[5197])
 check("缓冲步 + 写2 + 写1；闭环不再跳过",
       [(s["entry"]["index"], s["placeholder"]) for s in _st_b]
       == [(1, True), (2, False), (1, False)]
@@ -123,7 +123,7 @@ _items9 = [x for x in _broken if x["index"] in _cycle9]
 _h9 = rm.build_chapter_holders(_items9)
 _entries9 = [{"index": p, "want_num": p, "now_title": "x"} for p in _cycle9]
 _st9, _d9, _c9 = rm.resolve_write_plan(
-    _entries9, _h9, buffer_num=5197)
+    _entries9, _h9, buffer_nums=[5197])
 check("9 环用真实缓冲: 10 步，首步缓冲 670，末步写回 670",
       len(_st9) == 10 and _st9[0]["placeholder"]
       and _st9[0]["entry"]["index"] == 670
@@ -157,38 +157,66 @@ _ns_file = types.SimpleNamespace(buffer_chapter=None,
 _bp536 = _buf_dir / "chapter-0536.md"
 _bp536.write_text("# 第536章 中段缺号\n\n" + "真实的正文。" * 300,
                   encoding="utf-8")
-_num, _path, _err = rm.resolve_buffer(
-    _ns_auto, {536: str(_bp536), 5197: str(_bp)}, {}, 5196)
+_bufs, _err = rm.resolve_buffers(
+    _ns_auto, {536: str(_bp536), 5197: str(_bp)}, {}, 5196, n_cycles=1)
 check("auto 只从平台末尾之后选（不拿中段缺号 536）",
-      _num == 5197 and _err is None and _path == str(_bp),
-      (_num, _path, _err))
-_num, _path, _err = rm.resolve_buffer(
+      _err is None and len(_bufs) == 1 and _bufs[0]["num"] == 5197
+      and _bufs[0]["path"] == str(_bp), (_bufs, _err))
+_bufs, _err = rm.resolve_buffers(
     types.SimpleNamespace(buffer_chapter="536", buffer_file=None),
-    {536: str(_bp536)}, {}, 5196)
-check("显式选中段缺号: 拒绝", _num is None and "末尾" in (_err or ""),
-      (_num, _err))
-_num, _path, _err = rm.resolve_buffer(_ns_file, {}, {})
-check("文件缓冲: 章号解析/长度通过", _num == 5197 and _err is None,
-      (_num, _err))
-_num, _path, _err = rm.resolve_buffer(
+    {536: str(_bp536)}, {}, 5196, n_cycles=1)
+check("显式选中段缺号: 拒绝", not _bufs and "末尾" in (_err or ""),
+      (_bufs, _err))
+_bufs, _err = rm.resolve_buffers(_ns_file, {}, {})
+check("文件缓冲: 章号解析/长度通过",
+      _err is None and len(_bufs) == 1 and _bufs[0]["num"] == 5197,
+      (_bufs, _err))
+_bufs, _err = rm.resolve_buffers(
     types.SimpleNamespace(buffer_chapter="5197", buffer_file=None),
-    {5197: str(_bp)}, {5197: [670]})
-check("缓冲章号已在平台: 拒绝", _num is None and "已存在" in (_err or ""),
-      (_num, _err))
-_num, _path, _err = rm.resolve_buffer(
+    {5197: str(_bp)}, {5197: [670]}, n_cycles=1)
+check("缓冲章号已在平台: 拒绝", not _bufs and "已存在" in (_err or ""),
+      (_bufs, _err))
+_bufs, _err = rm.resolve_buffers(
     types.SimpleNamespace(buffer_chapter="5198", buffer_file=None),
-    {5198: str(_bp_short)}, {})
-check("缓冲正文不足 1000 字: 拒绝",
-      _num is None and "1000" in (_err or ""), (_num, _err))
-_num, _path, _err = rm.resolve_buffer(_ns_auto, {}, {})
-check("没有未发布章节可用: 拒绝", _num is None and "没有" in (_err or ""),
-      (_num, _err))
-_num, _path, _err = rm.resolve_buffer(
+    {5198: str(_bp_short)}, {}, n_cycles=1)
+check("缓冲正文不足 1000 字: 拒绝", not _bufs and "1000" in (_err or ""),
+      (_bufs, _err))
+_bufs, _err = rm.resolve_buffers(_ns_auto, {}, {}, n_cycles=1)
+check("没有未发布章节可用: 不给缓冲也不报错（闭环跳过，报告里说）",
+      _bufs == [] and _err is None, (_bufs, _err))
+_bufs, _err = rm.resolve_buffers(
     types.SimpleNamespace(buffer_chapter=None,
                           buffer_file=str(_buf_dir / "nope.md")), {}, {})
-check("缓冲文件不存在: 拒绝", _num is None and "不存在" in (_err or ""),
-      (_num, _err))
+check("缓冲文件不存在: 拒绝", not _bufs and "不存在" in (_err or ""),
+      (_bufs, _err))
 
+print("== 自动解闭环: 一个闭环一个缓冲，章号不能重复 ==")
+# 两个闭环要用两份不同的缓冲正文：同一个章号在第一个环换回来之前还占着，
+# 第二个环再写一遍就是重名（平台直接拒）。
+_bp2 = _buf_dir / "chapter-5199.md"
+_bp2.write_text("# 第5199章 第二个缓冲\n\n" + "另一段正文。" * 300,
+                encoding="utf-8")
+_bp3 = _buf_dir / "chapter-5200.md"
+_bp3.write_text("# 第5200章 第三个缓冲\n\n" + "第三段正文。" * 300,
+                encoding="utf-8")
+_bufs2, _err2 = rm.resolve_buffers(
+    types.SimpleNamespace(buffer_chapter=None, buffer_file=None),
+    {5197: str(_bp), 5199: str(_bp2), 5200: str(_bp3)}, {}, 5196, n_cycles=2)
+check("两个闭环配两份缓冲",
+      _err2 is None and len(_bufs2) == 2
+      and [b["num"] for b in _bufs2] == [5197, 5199], (_bufs2, _err2))
+check("两份缓冲的章号不同（重复就是重名）",
+      len({b["num"] for b in _bufs2}) == 2, _bufs2)
+_bufs3, _err3 = rm.resolve_buffers(
+    types.SimpleNamespace(buffer_chapter=None, buffer_file=None),
+    {5197: str(_bp)}, {}, 5196, n_cycles=2)
+check("可用的不够时只给够用的那几个（剩下的闭环跳过）",
+      _err3 is None and len(_bufs3) == 1, (_bufs3, _err3))
+_bufs4, _err4 = rm.resolve_buffers(
+    types.SimpleNamespace(buffer_chapter=None, buffer_file=None),
+    {5197: str(_bp)}, {}, 5196, n_cycles=1, allow_auto=False)
+check("allow_auto=False（--no-buffer / 无人值守）: 一个都不给",
+      _bufs4 == [] and _err4 is None, (_bufs4, _err4))
 print("== 小结构: 环 / 链 / 连锁踢 ==")
 _ring_items = [{"index": 1, "title": "第2章 甲"},
                {"index": 2, "title": "第1章 乙"}]
@@ -437,7 +465,11 @@ _h_c = rm.build_chapter_holders(_ring_items_c)
 _ring_c = [{"index": 1, "want_num": 1, "item_id": "i1", "now_title": "第2章"},
            {"index": 2, "want_num": 2, "item_id": "i2", "now_title": "第3章"}]
 _steps_c = rm.resolve_write_plan(
-    _ring_c, _h_c, buffer_num=5197)[0]
+    _ring_c, _h_c, buffer_nums=[5197])[0]
+# 缓冲正文挂在**步骤**上（一个闭环一个缓冲，各自带各的正文文件）
+for _s in _steps_c:
+    if _s["placeholder"]:
+        _s["buffer_path"] = str(_bp)
 _buf_calls = []
 
 
@@ -462,8 +494,7 @@ fu.parse_md_file = _fake_parse_c
 fu.edit_one_chapter, rm.wait_applied = _fake_edit_c, _fake_wait_c
 try:
     _okc, _failc, _pausedc = asyncio.run(rm.run_remap(
-        _WaitPage(), "b", _steps_c, {1: "dummy1", 2: "dummy2"},
-        buffer_path=str(_bp)))
+        _WaitPage(), "b", _steps_c, {1: "dummy1", 2: "dummy2"}))
 finally:
     fu.parse_md_file = _saved_parse_c
     fu.edit_one_chapter, rm.wait_applied = _saved_edit_c, _saved_wait_c
@@ -494,13 +525,13 @@ check("主 CLI 不再传 break_cycles",
 GUI = (ROOT / "fanqie_gui.py").read_text(encoding="utf-8")
 check("GUI 不再用 --break-cycles", "--break-cycles" not in GUI)
 check("GUI 只有一次确认", "按这个方案重新预览吗" not in GUI)
-check("GUI 确认框说明闭环会跳过", "闭环会跳过" in GUI)
+check("GUI 确认框说明没动的闭环", "闭环没动" in GUI)
 check("GUI 确认框说明审核暂停", "审核没跑完本次会暂停" in GUI)
 check("GUI 完成提示会说暂停", "本次暂停" in GUI)
 check("GUI 不再承诺『自动再走一趟』", "本趟会撞名" not in GUI)
-check("工具源码: 闭环默认跳过，给真实缓冲才解",
-      "闭环默认跳过" in inspect.getsource(rm.resolve_write_plan)
-      and "buffer_num" in inspect.getsource(rm.resolve_write_plan)
+check("工具源码: 闭环默认自动解，给真实缓冲才解得开",
+      "缓冲" in inspect.getsource(rm.resolve_write_plan)
+      and "buffer_nums" in inspect.getsource(rm.resolve_write_plan)
       and not hasattr(rm, "placeholder_content"))
 check("工具在审核没跑完时会暂停，不硬写下一章",
       "本次暂停" in inspect.getsource(rm.run_remap)
@@ -509,11 +540,74 @@ _rm_opts = _opts(str(ROOT / "tools/remap/remap.py"))
 _cli_opts = _opts(str(ROOT / "fanqie_upload.py"), "remap")
 check("工具暴露真实缓冲参数",
       "--buffer-chapter" in _rm_opts and "--buffer-file" in _rm_opts)
+check("工具暴露 --no-buffer（不自动解闭环）",
+      "--no-buffer" in _rm_opts and "--no-buffer" in _cli_opts)
+check("GUI 的『跳过』会传 --no-buffer",
+      "--no-buffer" in GUI)
+check("GUI 的闭环默认是自动解",
+      'buf_mode = tk.StringVar(value="auto")' in GUI)
 check("主 CLI 暴露真实缓冲参数",
       "--buffer-chapter" in _cli_opts and "--buffer-file" in _cli_opts)
 check("GUI 提供闭环缓冲三选一",
       "闭环处理" in GUI and "--buffer-chapter" in GUI
-      and "--buffer-file" in GUI and "用本地未发布章节自动缓冲" in GUI)
+      and "--buffer-file" in GUI and "自动用本地未发布章节缓冲" in GUI)
+
+print("== 汇总: 得说清「没动」的是什么 ==")
+_SRC = inspect.getsource(rm.main_async)
+check("汇总里单列「没动」的章数（只写「成功 N 失败 0」会让人以为全改完了）",
+      "没动" in _SRC)
+check("汇总里说清没动的是闭环", "闭环" in _SRC)
+check("汇总里说清被踢掉的位置也是没动", "踢掉" in _SRC)
+check("默认自动解闭环（由 --no-buffer / 无人值守关掉）",
+      "allow_auto" in _SRC and "no_buffer" in _SRC)
+check("无人值守（--daily）不自动解闭环",
+      'getattr(args, "daily", False)' in _SRC)
+check("闭环被跳过时说清原因（不是只丢一个数字）",
+      "互相占着章号" in _SRC)
+
+print("== 状态提示: 已发布章改完本来就是已发布，不该报「状态变了」 ==")
+# 一批 9 章已发布段改完，平台状态是 1（已发布）——这是**本来就该有的状态**。
+# 早先判据是「不是待发布就算异常」，于是每章都刷一条「状态变成 1」的假提示。
+_notes = []
+assert rm.check_applied({"published": True, "timer": 0},
+                        {"title": "第2章 乙", "display_status": fu.DISPLAY_PUBLISHED},
+                        2, _notes) is None
+check("已发布章状态仍是已发布 → 不提示", _notes == [], _notes)
+_notes2 = []
+assert rm.check_applied({"timer": 0},
+                        {"title": "第2章 乙", "display_status": fu.DISPLAY_PUBLISHED},
+                        2, _notes2) is None
+check("待发布章变成已发布（排期触发）→ 要提示", len(_notes2) == 1, _notes2)
+check("提示里写明状态与预期，别只说「变成」",
+      "应为" in (_notes2[0] if _notes2 else ""), _notes2)
+
+print("== 收尾: 刚改的那段要有回执 ==")
+check("批末复核也复查已公开段（只报未公开段等于没回执）",
+      "复核: 已公开段" in _SRC)
+check("收尾告诉读者目录现在什么样",
+      "reader_view_around" in _SRC)
+check("读者目录那段在共享核心里（GUI/CLI 同一份）",
+      hasattr(fu, "reader_view_around")
+      and "reader_view_around" in inspect.getsource(fu))
+_view = fu.reader_view_around(
+    [{"index": p, "title": f"第{p}章 x"} for p in (668, 669, 670, 671, 672)], 670)
+check("读者视图：按位置列出章号",
+      _view == ["第668章", "第669章", "第670章", "第671章", "第672章"], _view)
+
+print("== 主 CLI 转交子命令: 工具读到的每个 args 字段都得有默认值 ==")
+# 2026-10-31 实测: `python fanqie_upload.py audit` 直接 AttributeError
+# ('Namespace' object has no attribute 'include_published')——audit 子命令
+# 的参数少，工具却照读不误。无人值守的烟雾报警器（audit --daily）每晚
+# 都在崩，而报的是「今天没跑成」，看着像平台挂了。
+_tool_fields = set(re.findall(r"args\.([a-z_]+)", inspect.getsource(rm.main_async)))
+_defaults = set(re.findall(r'\("([a-z_]+)",', inspect.getsource(fu._run_tool_cmd)))
+_missing_args = _tool_fields - _defaults
+check("remap 读到的每个 args 字段，主 CLI 都会补默认值",
+      not _missing_args, sorted(_missing_args))
+check("include_published 在默认字段表里（audit 子命令没这个参数）",
+      "include_published" in _defaults)
+check("no_buffer 在默认字段表里",
+      "no_buffer" in _defaults)
 # 「缓冲章还没换回」的位置号靠 GUI 从工具输出里取。工具写成列表 repr
 # （`[670]`）时正则匹配不上，弹窗就只剩半句、位置丢了还不报错——所以钉形状。
 _BUF_SHAPE = r"位置\s*([\d、]+)\s*临时借用了真实章节"
