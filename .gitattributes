@@ -1,2 +1,23 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# --- release 源码包里不放这些 ---------------------------------------------
+# GitHub 的「Source code (zip/tar.gz)」是按 tag 现生成的那棵树快照，
+# 默认**整个仓库都进去**。下面这些是开发期的东西，用户下载下来用不上：
+#   tests/            44 个回归测试，只有 CI 跑
+#   .github/          CI 配置
+#   AGENTS.md         给 AI 代理的操作约定
+#   CONTRIBUTING.md   参与开发说明
+#   docs/social-preview.*  只服务于仓库页的社交预览图，README 不引用它
+#
+# 只影响 git archive（GitHub 下载的 zip/tar.gz），**不影响 clone**、
+# 不影响 CI、不影响本地仓库。tools/ 不能剔：GUI 是拿 tools/<name>/<name>.py
+# 当子进程/模块加载的，剔了「章节重排」「续排」「清草稿箱」当场就废。
+# docs/images/screenshot.png 也留着：README 首屏就引用它，剔了解压出来
+# 看 README 会是一张裂图。
+/tests/                       export-ignore
+/.github/                     export-ignore
+/AGENTS.md                    export-ignore
+/CONTRIBUTING.md              export-ignore
+/docs/social-preview.png      export-ignore
+/docs/social-preview.html     export-ignore
