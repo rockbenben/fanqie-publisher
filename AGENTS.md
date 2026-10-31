@@ -90,6 +90,11 @@
 # 1. 整目录回归测试（绝大多数零依赖，直接跑）
 for f in tests/test_*.py; do python "$f" || break; done
 
+# 1b. 本地 Python 比 CI 新时补这一步：用最老的解释器再跑一遍，
+#     否则 3.12+ 语法在本地绿、到 CI 的 3.10 才炸（见「几个容易踩的坑」）。
+#     有 uv 的话：uv python install 3.10
+#     uv run --python 3.10 --no-project python -m compileall -q .
+
 # 2. 工具自检（CI 也跑这三条）
 for t in remap keep_ahead clean_drafts; do python "tools/$t/$t.py" --self-check || exit 1; done
 
@@ -132,6 +137,14 @@ Windows CI 上是真跑的。
 - **主 CLI 转交子命令参数时必须备齐默认字段。** 工具模块（如 remap）从 args 读取各项字段，主 CLI 在
   `_run_tool_cmd` 必须补全所有字段默认值（`include_published`、`no_buffer` 等），否则参数较少的子命令
   （如 `audit`）运行时会报 `AttributeError`（由 `tests/test_remap_cycles.py` 守卫）。
+- **本地 Python 比 CI 新，「本地绿」不等于 CI 绿。** CI 矩阵里有 3.10（ubuntu + windows），
+  而本地开发用 3.14/3.15——**3.12+ 才允许的语法在本地跑得通，到 3.10 上直接 SyntaxError**，
+  那个文件 import 不了、子命令彻底跑不起来。2026-10-31 踩过：
+  `f"没有需要改写的章{f"，跳过 {len(skipped)} 个" ...}"`（f-string 里嵌同款双引号，PEP 701）
+  ——本地 3.14 全绿，只有 CI 的 3.10 红。**别用新版语法**（同款引号嵌套的 f-string、
+  `except*`、`match` 以外的 3.11+ 写法）；要拼字符串就用 `+` 或改用别的引号。
+  `tests/test_py310_compat.py` 守着这条（它在当前解释器上把 PEP 701 专用写法揪出来，
+  所以本地就能红，不必等 CI）。
 - **子进程工具输出必须实时流式读取并带心跳。** 重排等长任务在子进程中跑一两个小时，绝对不能用
   `capture_output=True` 一次性阻塞收取，否则长时间无响应用户会以为程序卡死。工具模块定义
   `STEP_PROGRESS_RE`，GUI 与 CLI 共享同一份正则，GUI 流式解析行并推进度条，长步骤用 `with_heartbeat` 输出心跳。

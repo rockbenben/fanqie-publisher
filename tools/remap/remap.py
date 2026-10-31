@@ -628,8 +628,10 @@ def print_plan(items, plan, skipped, num2path):
     else:
         # 空计划不报「需改写 0 个」——那像一张填了零的表，用户得自己判断
         # 「0 是不是好消息」（2026-10-31 用户反馈）。跳过的章照旧要说。
-        print(f"没有需要改写的章{f"，跳过 {len(skipped)} 个" if skipped else ""}",
-              flush=True)
+        # 拼接而不是嵌进 f-string：同款引号嵌套是 PEP 701（Python 3.12+ 才允许），
+        # 3.10 会直接 SyntaxError——本地 3.14 跑得通，CI 的 3.10 矩阵会红。
+        print("没有需要改写的章"
+              + (f"，跳过 {len(skipped)} 个" if skipped else ""), flush=True)
     if n_pub_rw:
         print(f"⚠ 其中 {n_pub_rw} 个是已发布章：内容会被改写、重新过审，"
               f"读者可能收到更新。--run 之前请把这份计划看仔细。", flush=True)
