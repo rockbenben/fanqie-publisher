@@ -131,7 +131,12 @@ def setup_logging(log_file=None, level=logging.INFO):
 
 
 class DailyLimitReached(RuntimeError):
-    """本章提交触发平台"当日发布字数上限"。
+    """本章提交触发平台的「发布字数上限」。
+
+    类名是历史遗留（写它时只见过每日档），实际涵盖**每日**与**每月**两档——
+    2026-11-01 实测改期时平台回的是「提交字数超出每月上限」。两档的下一步
+    完全不同（见 limit_label），所以消息里的档位一律由 limit_reached_msg 说准，
+    别再硬写"当日"。
 
     虽然上限按字数计、非硬墙（2026-06-06 曾见 79-81 失败、82 字数较短仍
     成功），但实践中继续提交后续章节多半重复撞限、还会触发别的拦截，徒增
@@ -251,7 +256,7 @@ def _classify_toasts(messages: list[str], notifications: list[str] = ()):
     """
     for t in (*messages, *notifications):
         if _DAILY_LIMIT_RE.search(t):
-            raise DailyLimitReached(f"当日发布字数已达上限: {t}")
+            raise DailyLimitReached(limit_reached_msg(t))
     for t in messages:
         if _TOAST_ERROR_RE.search(t):
             raise RuntimeError(f"发布失败，页面提示: {t}")
@@ -294,14 +299,15 @@ def _interpret_publish_response(body: str):
 
 
 async def _check_daily_limit(page):
-    """检测平台"当日发布字数上限"toast，若存在则抛出 DailyLimitReached。
+    """检测平台的"发布字数上限"toast，若存在则抛出 DailyLimitReached。
 
+    每日档与每月档都收（平台两种文案都实测过），档位由 limit_reached_msg 说准。
     只扫 toast 元素、不做全页文本匹配，避免误中正文内容。
     """
     toasts = await _visible_toast_texts(page)
     for t in toasts["messages"] + toasts["notifications"]:
         if _DAILY_LIMIT_RE.search(t):
-            raise DailyLimitReached(f"当日发布字数已达上限: {t}")
+            raise DailyLimitReached(limit_reached_msg(t))
 
 
 async def _check_editor_validation(page):
@@ -671,6 +677,26 @@ def log_fail_list(fail_list, *, fix_hint=None):
         logger.info(f"  失败章节号: {compress_chapter_nums(nums)}（{hint}）")
 
 
+def reschedule_fail_hint(fail_list) -> str:
+    """改期失败清单末尾的下一步：按撞的是哪一档额度说。
+
+    每日和每月的下一步完全相反（见 limit_label）：每日=明天额度重置再来；
+    每月=本月剩下的日子一章都挪不动，得等额度重置或把目标月份往后挪。
+    这时候「去平台逐章手改」不管用——手改进同一个月照样被平台拒。
+    """
+    lim = [r for _l, r in (fail_list or []) if _DAILY_LIMIT_RE.search(r or "")]
+    parts = []
+    if any(is_monthly_limit(r) for r in lim):
+        parts.append("撞的是每月字数额度：本月剩下的日子挪不动了"
+                     "（手改进本月同样会被拒），等下月额度重置，"
+                     "或把起始日期挪到下个月再跑")
+    if any(not is_monthly_limit(r) for r in lim):
+        parts.append("撞的是每日字数额度：明天额度重置后再跑一次")
+    if not parts:
+        return "改期没有按章号重跑的入口，去平台按上面的时间逐章手改"
+    return "；".join(parts)
+
+
 def record_unprocessed(fail_list, remaining, reason="每日字数上限，未处理"):
     """中止整批后，把剩余未处理章节如实记入失败清单（不静默丢弃）。
 
@@ -906,7 +932,7 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
                 return
             if iv == "daily_limit":
                 raise DailyLimitReached(
-                    f"当日发布字数已达上限: {verdict_holder.get('message', '')}")
+                    limit_reached_msg(verdict_holder.get("message", "")))
             if iv == "fail":
                 raise RuntimeError(
                     f"发布失败，接口返回: {verdict_holder.get('message', '')}")
@@ -923,7 +949,7 @@ async def _wait_publish_result(page, confirm_btn, *, timeout: int | None = None)
                     return
                 if outcome == "daily_limit":
                     raise DailyLimitReached(
-                        f"当日发布字数已达上限: {verdict_holder.get('message', '')}")
+                        limit_reached_msg(verdict_holder.get("message", "")))
                 if outcome == "fail":
                     raise RuntimeError(
                         f"发布失败，接口返回: {verdict_holder.get('message', '')}")
@@ -3979,6 +4005,18 @@ def limit_label(msg) -> str:
     return "每月字数上限" if is_monthly_limit(msg) else "每日字数上限"
 
 
+def limit_reached_msg(toast_text) -> str:
+    """撞上限时的统一说法：档位（每日/每月）我们说准，平台原文照带。
+
+    2026-11-01 实测：改期时平台回的是「提交字数超出每月上限」，日志与失败清单
+    却一律写「当日发布字数已达上限」——那几处前缀是各自硬写的，只改一处、
+    两个入口就开始说不同的账。这里收成一份，四个抛错点（两个 toast、
+    两个接口 code）都走它。每日档沿用原措辞（用户已经读惯了），每月档才换字。
+    """
+    kind = "每月发布字数" if is_monthly_limit(toast_text) else "当日发布字数"
+    return f"{kind}已达上限: {toast_text}"
+
+
 # 新章确认: 只拉列表第一页（新建章必是最新的），1 个请求就够
 # 必须区分「平台确实没这章」和「这次问不出来」: 接口 429 / code=-100
 # （平台真会返回"服务器开小差了"）时 j.data 为空，若当成"没有"就会判定
@@ -5623,6 +5661,13 @@ def build_schedule_map(chapters, schedule):
     实证，整体提前一天、新→旧处理，每天首槽章（第 12 章）全报"提交字数超出每日
     上限"，改期接口本身并不消耗当日额度。排期整体提前要先把目标日的旧占位搬走，
     即旧→新；推后则反之。
+    另有**每月**一档：额度按目标月的字数算，改期不提交正文，但这一章将来在哪个月
+    发布、字数就记进那个月，所以挪进排满的月会被拒。每月上限**跟着作家等级走，各
+    账号不同**，代码里不预设这个数（2026-11-01 那本号：本月已累计 599,816 字仍收得进、
+    下一章要到 599,890 字就被拒，即它的额度落在 60 万量级），只认平台回的原文。
+    每日档靠换顺序能绕开，每月档不能——某个月要塞的字数超了就是超了，
+    只能把密度降下来或换个目标月份（那本号 9 章/天让 11 月要塞 63 万字、超出自己
+    额度 5%，最后 13 章被拒；12 月同样 279 章却只要 50 万字，全过）。
 
     CLI 与 GUI 原各抄一份这个循环，漏改一边行为就不一样。
     """
@@ -5649,6 +5694,35 @@ def build_schedule_map(chapters, schedule):
         logger.warning(f"排期提前 {earlier} 章、推后 {later} 章，按多数方向处理；"
                        "少数方向可能撞每日上限，重跑一次即可补上")
     return smap, dups, unchanged, ("asc" if earlier > later else "desc")
+
+
+def platform_current_times(src) -> dict[str, tuple[str, str]]:
+    """章节标题 → 它在平台上**现在**的排期时刻。
+
+    改期失败清单要同时说清两件事：这一章现在停在哪（平台现值）、这次想把它
+    改到哪（计划目标）。2026-11-01 实测：清单里只写了计划目标，还把它标成
+    「原定」，用户对着平台一看全是错的日期——平台实况是那批章仍停在 12 月中。
+
+    两种输入都收：平台行（date/time 字符串，改期那条路拿到的）与 items
+    （timer_time 时间戳，体检/修复排期那条路拿到的）。
+    """
+    out = {}
+    for it in src or []:
+        title = (it.get("title") or "").strip()
+        if not title:
+            continue
+        d, t = it.get("date"), it.get("time")
+        if not (d and t):
+            try:
+                ts = int(it.get("timer_time") or 0)
+            except (TypeError, ValueError):
+                ts = 0
+            if ts:
+                dt = datetime.fromtimestamp(ts)
+                d, t = dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
+        if d and t:
+            out[title] = (str(d), str(t))
+    return out
 
 
 async def _flip_page(page, btn) -> bool:
@@ -5713,6 +5787,7 @@ async def reschedule_on_manage_page(
     volume_text: str = "",
     volume_texts: list[str] | None = None,
     order: str = "desc",
+    current_times: dict | None = None,
 ) -> tuple[int, int]:
     """在章节管理页上批量修改待发布章节的定时发布设置。
 
@@ -5722,6 +5797,7 @@ async def reschedule_on_manage_page(
     volume_text:  多卷时选择的卷名（空字符串表示不切换）
     volume_texts: 多卷索引模式时传入所有卷名列表（优先级高于 volume_text）
     order:        'desc' 新→旧（页面顺序）/ 'asc' 旧→新，取 build_schedule_map 算的
+    current_times:{章节标题: (date, time), ...} 平台现值，失败清单里要说清"还在哪"
     返回 (success, failed)。
     """
     total = len(schedule_map)
@@ -5772,7 +5848,7 @@ async def reschedule_on_manage_page(
                 max_retries=max_retries, delay=delay,
                 cancel_check=cancel_check, progress_cb=progress_cb,
                 success_so_far=success, failed_so_far=failed, order=order,
-                fail_list=fail_list)
+                fail_list=fail_list, current_times=current_times)
         except Exception as e:
             # 扫描里的意外（翻页被残留弹窗挡住、浏览器被关…）不能让整批以
             # "修改排期异常"收场——那样剩余章节没人记账。停下，走下面的未处理清单。
@@ -5793,8 +5869,7 @@ async def reschedule_on_manage_page(
     # 而且失败明细会落在"完成!"横幅上面——最该看的东西被结论盖住。
     logger.info("=" * 40)
     logger.info(f"  修改排期完成! 成功: {success}  失败: {failed}")
-    log_fail_list(fail_list,
-                  fix_hint="改期没有按章号重跑的入口，去平台按上面的时间逐章手改")
+    log_fail_list(fail_list, fix_hint=reschedule_fail_hint(fail_list))
     logger.info("=" * 40)
 
     return success, failed
@@ -5815,13 +5890,15 @@ async def _reschedule_current_volume(
     failed_so_far: int = 0,
     order: str = "desc",
     fail_list: list,
+    current_times: dict | None = None,
 ) -> tuple[int, int]:
     """扫描当前卷的所有页面，处理 remaining 中匹配到的章节。
 
     order='asc' 时从最后一页起倒着翻、页内行也倒序，整体就是旧→新。
 
-    会直接从 remaining 中删除已处理的条目；失败的章以 (标题, 原因+原定时间)
-    追加进 fail_list，由调用方连同"未处理"一起汇报。
+    会直接从 remaining 中删除已处理的条目；失败的章以 (标题, 原因+时刻) 追加进
+    fail_list，由调用方连同"未处理"一起汇报。
+    current_times: 章节标题 → 平台现值（失败清单里要说清"还在哪"）。
     返回本轮 (success, failed, aborted)；aborted=True 表示页面已死或残留对话框
     关不掉，调用方不该再换卷继续（换卷是 JS 点击，不会被弹窗挡住）。
     """
@@ -5918,7 +5995,17 @@ async def _reschedule_current_volume(
                     break
 
                 except DailyLimitReached as e:
-                    # 改期不提交字数，上限 toast 多为相邻操作残留；
+                    # 改期提交同样会被平台的**字数额度**拦下：额度按**目标月**的
+                    # 字数算，这一章将来在哪个月发布、字数就记进那个月——挪进一个
+                    # 排满的月就被拒。每月额度跟着作家等级走、各账号不同，所以这里
+                    # 不判断额度的具体数字，只看平台回的那句上限提示。
+                    # 那次 13 章被拒的目标时刻正好是 2026-11 的最后 13 个档位，
+                    # 目标从 12-01 起的 4136 章全过；被拒前 11 月已累计到 599,816
+                    # 字，下一章要到 599,890 字就被拒（那本账号的额度因此在 60 万
+                    # 量级，换个等级就不是这个数）。
+                    # 是平台对**本次提交**的拒绝，不是上一章的残留 toast——成功章在
+                    # 同一个位置出现的是「修改成功」，2026-09-04 的改期也撞过
+                    # 同一套额度（每日档，第3097章被拒、紧邻两章都成功）。
                     # 重试无意义，按失败记录并继续后续章节（不截图）。
                     logger.warning(f"  跳过本章（{e}）")
                     err = str(e)
@@ -5947,10 +6034,17 @@ async def _reschedule_current_volume(
                 failed += 1
                 # 记在 failed += 1 的同一处：清单和「成功+失败」永远对得上，也
                 # 不会跟上面"对话框关不掉"的提前 return 撞车（那条路本章留在
-                # remaining，由调用方记未处理）。原定时间必须带上——改期失败只
-                # 能去平台手改，光有章名不知道该填几点几分。
-                fail_list.append(
-                    (title, f"{err or '未知错误'}（原定 {date_str} {time_str}）"))
+                # remaining，由调用方记未处理）。
+                #
+                # 时刻要写清是哪个时刻：date_str/time_str 是**这次计划要改到**
+                # 的时刻，不是平台上"它现在停在哪"。2026-11-01 实测：清单写
+                # 「原定 2026-11-29 12:01」，平台实况那批章仍停在 12-13~15
+                # ——"原定"两个字把计划说成了现状，用户一看就以为平台数据错了。
+                # 改成"计划改到"，并把平台现值一并带上，两个时刻不打架。
+                cur = (current_times or {}).get(title)
+                when = (f"（平台现为 {cur[0]} {cur[1]}，计划改到 {date_str} {time_str}）"
+                        if cur else f"（计划改到 {date_str} {time_str}）")
+                fail_list.append((title, f"{err or '未知错误'}{when}"))
             del remaining[title]
 
             if progress_cb:
@@ -6309,7 +6403,8 @@ async def cmd_reschedule_cli(args):
                 page, args.book_id, schedule_map,
                 max_retries=cfg.get("max_retries", 2),
                 delay=cfg.get("delay_between_chapters", 3),
-                volume_texts=vol_texts, order=order)
+                volume_texts=vol_texts, order=order,
+                current_times=platform_current_times(all_chapters))
         finally:
             await save_auth(context)
             await close_browser_safely(browser)

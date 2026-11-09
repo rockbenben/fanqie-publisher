@@ -115,4 +115,28 @@ fu.record_unprocessed(fl, [(9, "甲"), (10, "乙")],
 check("清单原因跟着措辞走",
       all(r == "每月字数上限，未处理" for _l, r in fl), str(fl))
 
+# 7) 消息里的档位跟着平台原文走。README 承诺「日志会写明撞的是哪一档」，
+#    而 2026-11-01 实测改期时平台回的是「提交字数超出每月上限」、日志却一律写
+#    「当日发布字数已达上限」——「明天再来」的建议对每月额度是错的。
+check("每月上限的消息说每月",
+      fu.limit_reached_msg("提交字数超出每月上限")
+      == "每月发布字数已达上限: 提交字数超出每月上限")
+check("每日上限的消息沿用原措辞",
+      fu.limit_reached_msg("已到达当日发布字数上限")
+      == "当日发布字数已达上限: 已到达当日发布字数上限")
+check("判不出来时保守当每日",
+      fu.limit_reached_msg("").startswith("当日发布字数"))
+try:
+    fu._classify_toasts(["提交字数超出每月上限"], [])
+    check("toast 分类抛出上限异常", False, "没抛异常")
+except fu.DailyLimitReached as e:
+    check("toast 分类抛出上限异常", True)
+    check("异常消息里的档位是每月", "每月发布字数已达上限" in str(e), str(e))
+
+_SRC = Path(__file__).resolve().parent.parent.joinpath(
+    "fanqie_upload.py").read_text(encoding="utf-8")
+check("上限前缀只有一处写（四个抛错点共用同一份措辞）",
+      _SRC.count('"当日发布字数"') == 1 and _SRC.count('"每月发布字数"') == 1,
+      _SRC.count('"当日发布字数"'))
+
 print(f"\nALL PASSED ({PASS} 断言)")

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""修改排期：失败章要进清单（章名+报错+原定时间），重试间隔要拉开。
+"""修改排期：失败章要进清单（章名+报错+时刻），重试间隔要拉开。
 
 起因 2026-09-04：1698 章改期只报"成功 1697 失败 1"，哪一章、为什么、原定几点
 全得自己去 grep 日志。第2782章连吃三个服务端 toast（网络不好 / 服务器开小差
@@ -24,10 +24,10 @@ import fanqie_upload as fu  # noqa: E402
 FAILED = []
 
 
-def check(label, cond):
+def check(label, cond, detail=""):
     print(("  [PASS] " if cond else "  [FAIL] ") + label)
     if not cond:
-        FAILED.append(label)
+        FAILED.append(f"{label}（{detail}）" if detail else label)
 
 
 class _Cap(logging.Handler):
@@ -179,6 +179,8 @@ TITLES = ["第2781章 被子在洗衣机里", "第2782章 他叫我去后头吃�
 SMAP = {TITLES[0]: ("2027-08-01", "12:00"),
         TITLES[1]: ("2027-08-01", "12:01"),
         TITLES[2]: ("2027-08-01", "20:00")}
+# 平台现值：2026-11-01 实测那批失败章还停在旧位置上，失败清单要能说清这一点
+CURRENT = {TITLES[1]: ("2026-12-13", "20:00")}
 
 
 async def _run_volume(escape_works=True):
@@ -187,7 +189,8 @@ async def _run_volume(escape_works=True):
     fail_list, remaining = [], dict(SMAP)
     try:
         s, f, aborted = await fu._reschedule_current_volume(
-            page, remaining, len(SMAP), delay=0, fail_list=fail_list)
+            page, remaining, len(SMAP), delay=0, fail_list=fail_list,
+            current_times=CURRENT)
     finally:
         fu._wait_publish_result = _REAL_WAIT
     return page, fail_list, remaining, s, f, aborted
@@ -198,20 +201,25 @@ async def _run_outer():
     fu._wait_publish_result = _fake_submit(TITLES[1])
     fu.settle_page = _noop_settle
     try:
-        return await fu.reschedule_on_manage_page(page, "bid", SMAP, delay=0)
+        return await fu.reschedule_on_manage_page(
+            page, "bid", SMAP, delay=0, current_times=CURRENT)
     finally:
         fu._wait_publish_result = _REAL_WAIT
         fu.settle_page = _REAL_SETTLE
 
 
-print("== 失败章进清单：章名 + 报错 + 原定时间 ==")
+print("== 失败章进清单：章名 + 报错 + 时刻 ==")
 page, fl, rem, s, f, aborted = asyncio.run(_run_volume())
 check("成功 2 失败 1", (s, f) == (2, 1))
 check("清单只有一条", len(fl) == 1)
 entry = fl[0] if fl else ("", "")
 check("条目里是失败那一章", entry[0] == TITLES[1])
 check("带上平台报的原话", TOAST in entry[1])
-check("带上原定时间（手改时照它填）", "原定 2027-08-01 12:01" in entry[1])
+check("说清是「计划改到」（不是「原定」）",
+      "计划改到 2027-08-01 12:01" in entry[1], entry[1])
+check("不再用「原定」这个词", "原定" not in entry[1], entry[1])
+check("带上平台现值（这一章现在还停在哪）",
+      "平台现为 2026-12-13 20:00" in entry[1], entry[1])
 check("成功的章不进清单", all(e[0] != TITLES[0] for e in fl))
 check("处理过的章都从 remaining 摘掉（失败的也算处理过）", rem == {})
 check("没中止，后面的章照改", aborted is False)
@@ -239,7 +247,8 @@ check("完成横幅只有一处（CLI/GUI 都不再各抄一份）",
 check("横幅在前、失败清单在后（最该看的落在最后）",
       cap.text.index("修改排期完成") < cap.text.index("失败章节及原因"))
 check("清单打进日志了", "失败章节及原因" in cap.text and TITLES[1] in cap.text)
-check("日志里带原定时间", "原定 2027-08-01 12:01" in cap.text)
+check("日志里带计划时刻", "计划改到 2027-08-01 12:01" in cap.text)
+check("日志里带平台现值", "平台现为 2026-12-13 20:00" in cap.text)
 check("补救文案换成改期专用的（别把人引去「按章节号筛选」重发一遍）",
       "去平台按上面的时间逐章手改" in cap.text and "--chapters" not in cap.text)
 
@@ -247,6 +256,32 @@ print("== log_fail_list: 上传/修改的默认文案不变 ==")
 with _Cap() as cap2:
     fu.log_fail_list([("第9章 x", "错")])
 check("仍是补传文案", "--chapters" in cap2.text)
+
+print("== 补救提示按撞的是哪一档额度说 ==")
+# 2026-11-01 实测：平台回的是「提交字数超出每月上限」，改期清单原来一律写
+# 「当日发布字数已达上限」，「明天再来」的建议对每月额度是错的。
+_m = fu.reschedule_fail_hint(
+    [("第1397章 x", "每月发布字数已达上限: 提交字数超出每月上限")])
+check("每月档说每月", "每月字数额度" in _m, _m)
+check("每月档不提「明天再来」", "明天" not in _m, _m)
+_d = fu.reschedule_fail_hint(
+    [("第79章 x", "当日发布字数已达上限: 已到达当日发布字数上限")])
+check("每日档说每日", "每日字数额度" in _d, _d)
+check("每日档说清明天再来", "明天" in _d, _d)
+_o = fu.reschedule_fail_hint([("第9章 x", "发布失败，页面提示: 服务器开小差了")])
+check("不是额度问题时仍给改期专用的话",
+      "去平台按上面的时间逐章手改" in _o, _o)
+
+print("== 平台现值：平台行与 items 两种来源都认 ==")
+_rows = [{"title": "第1章", "date": "2026-12-13", "time": "20:00"},
+          {"title": "第2章"}]
+check("平台行", fu.platform_current_times(_rows)
+      == {"第1章": ("2026-12-13", "20:00")})
+_items = [{"title": "第3章",
+           "timer_time": 1795000000}]
+_ct = fu.platform_current_times(_items)
+check("items（timer_time）也能换出时刻",
+      len(_ct) == 1 and _ct["第3章"][0].count("-") == 2, _ct)
 
 print()
 if FAILED:

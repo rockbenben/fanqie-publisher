@@ -49,6 +49,7 @@ try:
         run_creation_batch, run_edit_batch,
         extract_chapters_from_page, match_chapters,
         reschedule_on_manage_page, build_schedule_map, detect_volumes, select_volume,
+        platform_current_times,
         settle_page,
         AUTH_FILE, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
         CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL, CONFIG_FILE, GUI_STATE_FILE,
@@ -4679,6 +4680,7 @@ class FanqieGUI:
                         volume_text=vol,
                         volume_texts=all_vol_names,
                         order=order,
+                        current_times=platform_current_times(platform_chapters),
                     )
 
                     await save_auth(context)
@@ -4823,7 +4825,8 @@ class FanqieGUI:
                             progress_cb=lambda done, tot: self._after(
                                 0, self._update_progress, done, tot),
                             volume_texts=vol_names,
-                            order=order)
+                            order=order,
+                            current_times=platform_current_times(items))
                     finally:
                         await save_auth(context)
                         await close_browser_safely(browser)
